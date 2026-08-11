@@ -4,6 +4,7 @@ name: Fuzz (scheduled discovery)
 # the PR path would make the gate flaky). A new crasher persists to
 # TlsLib.Interop/Data/Corpus/regress/ (uploaded as an artifact) and becomes a per-push
 # replay input. The per-push tier (make.yml) is the cheap replay + fixed-seed smoke.
+# Registers and runs from the default branch only (schedule triggers ignore other branches).
 
 on:
   schedule:
