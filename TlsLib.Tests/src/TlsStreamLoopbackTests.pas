@@ -75,6 +75,7 @@ type
     FWrite: TMemoryPipe;
   public
     constructor Create(const ARead, AWrite: TMemoryPipe);
+    destructor Destroy; override;
     function Read(var ABuffer: TBytes; AOffset, AMaxLength: Int32): Int32;
     procedure Write(const ABuffer: TBytes; AOffset, ALength: Int32);
     procedure CloseWrite;
@@ -101,6 +102,7 @@ type
   public
     constructor Create(const AStream: TTlsStream; const ATransport: TMemoryTransport;
       ABehavior: TServerBehavior);
+    destructor Destroy; override;
     property Error: string read FError;
     property NegotiatedVersion: UInt16 read FNegotiatedVersion;
     property Alpn: string read FAlpn;
@@ -242,6 +244,13 @@ begin
   FWrite := AWrite;
 end;
 
+destructor TMemoryTransport.Destroy;
+begin
+  // each transport owns its write pipe; the paired transports free both pipes exactly once
+  FWrite.Free;
+  inherited Destroy;
+end;
+
 function TMemoryTransport.Read(var ABuffer: TBytes; AOffset,
   AMaxLength: Int32): Int32;
 begin
@@ -268,6 +277,14 @@ begin
   FTransport := ATransport;
   FBehavior := ABehavior;
   FreeOnTerminate := False;
+end;
+
+destructor TServerRunner.Destroy;
+begin
+  // stop the thread first (Execute has finished by the WaitFor the callers do), then free
+  // the server stream we own; that releases its engine and its ITlsTransport (the transport)
+  inherited Destroy;
+  FStream.Free;
 end;
 
 procedure TServerRunner.Execute;

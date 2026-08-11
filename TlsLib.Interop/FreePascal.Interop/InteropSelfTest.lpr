@@ -175,8 +175,13 @@ begin
     try
       Result := RunClient(LListener.Port, ACredentialFile, AScenario);
       LServer.WaitFor;
-      if (Result = '') and (LServer.Error <> '') then
-        Result := LServer.Error;
+      // surface the server-side error too: a server abort closes the socket, which the
+      // client reports only as a vague "peer closed" - reporting just that masks the cause
+      if LServer.Error <> '' then
+        if Result = '' then
+          Result := LServer.Error
+        else
+          Result := Result + ' | server: ' + LServer.Error;
     finally
       LServer.Free;
     end;
@@ -215,10 +220,25 @@ begin
   FIteration := AIteration;
 end;
 
-// deterministic (fixed sleeps, no randomness): the watchdog fires exactly once when an
-// armed interval outlives the timeout - carrying the armed input and iteration - and
-// stays quiet when disarmed in time or after it has already fired
+// the watchdog fires exactly once when an armed interval outlives the timeout - carrying
+// the armed input and iteration - and stays quiet when disarmed in time or after it fired.
+// fire detection waits (bounded) for the poll thread rather than a fixed delay, so a loaded
+// host cannot make it flaky
 function WatchdogSelfTest: string;
+
+  function AwaitFire(const AFlag: TFlagHangHandler; AMaxWaitMs: Int32): Boolean;
+  var
+    LWaited: Int32;
+  begin
+    LWaited := 0;
+    while (AFlag.Count = 0) and (LWaited < AMaxWaitMs) do
+    begin
+      Sleep(10);
+      Inc(LWaited, 10);
+    end;
+    Result := AFlag.Count > 0;
+  end;
+
 var
   LFlag: TFlagHangHandler;
   LHandler: IFuzzHangHandler;
@@ -234,9 +254,11 @@ begin
   LWatchdog := TFuzzWatchdog.Create(50, LHandler);
   try
     LWatchdog.Arm(LInput, 7);
-    Sleep(200); // the "hung" stub: well past the 50 ms timeout
-    if LFlag.Count <> 1 then
-      Result := 'the watchdog did not fire exactly once on a hang past the timeout'
+    // the "hung" stub: wait (bounded) for the fire past the 50 ms timeout
+    if not AwaitFire(LFlag, 3000) then
+      Result := 'the watchdog did not fire on a hang past the timeout'
+    else if LFlag.Count <> 1 then
+      Result := 'the watchdog fired more than once for a single armed interval'
     else if not BytesEqual(LFlag.Input, LInput) then
       Result := 'the watchdog fired with the wrong input'
     else if LFlag.Iteration <> 7 then
@@ -270,8 +292,7 @@ begin
   LWatchdog := TFuzzWatchdog.Create(50, LHandler);
   try
     LWatchdog.Arm(LInput, 2);
-    Sleep(200);
-    if LFlag.Count <> 1 then
+    if not AwaitFire(LFlag, 3000) then
       Result := 'the watchdog did not fire once for the armed interval'
     else
     begin

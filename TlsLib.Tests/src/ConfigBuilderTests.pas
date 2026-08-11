@@ -607,8 +607,10 @@ end;
 procedure TTestConfigBuilder.TestWithRevocationSetsHardPosture;
 var
   LConfig: ITlsClientConfig;
+  LBuilder: ITlsConfigBuilder;
 begin
-  LConfig := TTlsConfigBuilder.Create(Provider).Client
+  LBuilder := TTlsConfigBuilder.Create(Provider);
+  LConfig := LBuilder.Client
     .WithCipherSuites(TCipherSuiteRegistry.CreateDefault(Provider))
     .WithSignatureSchemes(TSignatureSchemeRegistry.CreateDefault)
     .WithNamedGroups(TNamedGroups.CreateDefaultRegistry(Provider))
@@ -627,11 +629,13 @@ end;
 procedure TTestConfigBuilder.TestWithCertificatePinningLandsInFrozenConfig;
 var
   LConfig: ITlsClientConfig;
+  LBuilder: ITlsConfigBuilder;
   LPin: TBytes;
 begin
   LPin := DecodeHex(
     '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff');
-  LConfig := TTlsConfigBuilder.Create(Provider).Client
+  LBuilder := TTlsConfigBuilder.Create(Provider);
+  LConfig := LBuilder.Client
     .WithCipherSuites(TCipherSuiteRegistry.CreateDefault(Provider))
     .WithSignatureSchemes(TSignatureSchemeRegistry.CreateDefault)
     .WithNamedGroups(TNamedGroups.CreateDefaultRegistry(Provider))
@@ -648,6 +652,7 @@ end;
 procedure TTestConfigBuilder.TestServerWithOcspStapleLandsInFrozenConfig;
 var
   LConfig: ITlsServerConfig;
+  LBuilder: ITlsConfigBuilder;
   LCredential: TTlsCredential;
   LStaple: TBytes;
 begin
@@ -655,7 +660,8 @@ begin
   LStaple := TBytes.Create($30, $03, $0A, $01, $00);
   LCredential := ServerCredential;
   LCredential.OcspStaple := LStaple;
-  LConfig := TTlsConfigBuilder.Create(Provider).Server
+  LBuilder := TTlsConfigBuilder.Create(Provider);
+  LConfig := LBuilder.Server
     .WithCipherSuites(TCipherSuiteRegistry.CreateDefault(Provider))
     .WithSignatureSchemes(TSignatureSchemeRegistry.CreateDefault)
     .WithNamedGroups(TNamedGroups.CreateDefaultRegistry(Provider))
@@ -670,13 +676,15 @@ end;
 procedure TTestConfigBuilder.TestFieldwiseCredentialClearsPriorStaple;
 var
   LConfig: ITlsServerConfig;
+  LBuilder: ITlsConfigBuilder;
   LStapled: TTlsCredential;
 begin
   // a field-wise WithCredential replaces the whole credential: a staple from a prior
   // WithCredential(record) must not bleed through (last call wins)
   LStapled := ServerCredential;
   LStapled.OcspStaple := TBytes.Create($30, $03, $0A, $01, $00);
-  LConfig := TTlsConfigBuilder.Create(Provider).Server
+  LBuilder := TTlsConfigBuilder.Create(Provider);
+  LConfig := LBuilder.Server
     .WithCipherSuites(TCipherSuiteRegistry.CreateDefault(Provider))
     .WithSignatureSchemes(TSignatureSchemeRegistry.CreateDefault)
     .WithNamedGroups(TNamedGroups.CreateDefaultRegistry(Provider))
