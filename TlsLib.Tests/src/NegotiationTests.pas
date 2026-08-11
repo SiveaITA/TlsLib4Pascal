@@ -131,7 +131,8 @@ var
     LSuite: TTlsCipherSuite;
   begin
     LOrder := TNegotiationPolicy.SuitePreferenceOrder(
-      TFixedAesProvider.Create(Provider, AHasHardwareAes), LCiphers, AProtocol);
+      TFixedAesProvider.Create(Provider, AHasHardwareAes) as ICryptoProvider,
+      LCiphers, AProtocol);
     CheckTrue(System.Length(LOrder) > 0, 'the preference order is non-empty');
     CheckTrue(LCiphers.TryGet(LOrder[0], LSuite), 'the first code resolves to a suite');
     Result := LSuite.Common.Aead;
