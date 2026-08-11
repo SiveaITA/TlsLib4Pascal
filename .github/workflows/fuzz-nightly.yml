@@ -1,0 +1,76 @@
+name: Fuzz (scheduled discovery)
+
+# Scheduled DISCOVERY tier of the parser fuzzer - schedule only, never push/PR (a soak on
+# the PR path would make the gate flaky). A new crasher persists to
+# TlsLib.Interop/Data/Corpus/regress/ (uploaded as an artifact) and becomes a per-push
+# replay input. The per-push tier (make.yml) is the cheap replay + fixed-seed smoke.
+
+on:
+  schedule:
+    # 03:17 UTC daily (off the hour to avoid the scheduler rush)
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Wall-clock soak budget per architecture (seconds)
+        default: "1200"
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FPC_VERSION: 3.2.2
+  LAZARUS_BRANCH: lazarus_4_4
+  LAZARUS_REPO: https://github.com/fpc/Lazarus.git
+  MAKE_BUILD_BACKEND: fpc
+  MAKE_PACKAGE_SCOPE: required
+  MAKE_RUN_BENCHMARK: false
+  MAKE_LAZBUILD_GUI: false
+  CI_DEBUG: '0'
+  FUZZ_DISCOVERY_SECONDS: ${{ github.event.inputs.seconds || '1200' }}
+
+jobs:
+  discovery:
+    name: "Fuzz discovery: ${{ matrix.label }}"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            runner: ubuntu-latest
+            fpc_target: x86_64-linux
+          - label: Linux AArch64
+            runner: ubuntu-24.04-arm
+            fpc_target: aarch64-linux
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Build
+        shell: bash
+        env:
+          FPC_TARGET: ${{ matrix.fpc_target }}
+          FPC_TARBALL_TARGET: ${{ matrix.fpc_target }}
+        run: bash .github/workflows/ci/native-build.sh
+
+      - name: Fuzz discovery soak
+        shell: bash
+        env:
+          FPC_TARGET: ${{ matrix.fpc_target }}
+        run: bash .github/workflows/ci/interop/fuzz-discovery.sh
+
+      # any crasher the soak found was persisted here; capture it so the author can pull
+      # the reproducer and fix it on its own branch. Uploaded even on failure.
+      - name: Upload new regression seeds
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-discovery-regress-${{ matrix.fpc_target }}
+          path: TlsLib.Interop/Data/Corpus/regress/
+          if-no-files-found: ignore

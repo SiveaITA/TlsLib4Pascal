@@ -1,0 +1,5 @@
+# SHA-2 known-answer tests over the ASCII string "abc" (FIPS 180-4).
+sha256_msg=616263
+sha256_digest=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+sha384_msg=616263
+sha384_digest=cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7

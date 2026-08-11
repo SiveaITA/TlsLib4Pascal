@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Dark UI: higher-contrast secured link on near-black teal -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title2 desc2">
+  <title id="title2">TlsLib4Pascal</title>
+  <desc id="desc2">Secured TLS connection mark for dark backgrounds.</desc>
+  <defs>
+    <linearGradient id="bgd" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0a1624"/>
+      <stop offset="100%" stop-color="#050c14"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="26" fill="url(#bgd)"/>
+  <line x1="30" y1="64" x2="98" y2="64" stroke="#cffafe" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="26" cy="64" r="10" fill="#155e75" opacity="0.95"/>
+  <circle cx="102" cy="64" r="10" fill="#155e75" opacity="0.95"/>
+  <path d="M56 60 v-6 a8 8 0 0 1 16 0 v6" fill="none" stroke="#cffafe" stroke-width="4"/>
+  <rect x="50" y="60" width="28" height="22" rx="5" fill="#22d3ee"/>
+  <circle cx="64" cy="69" r="2.6" fill="#020617"/>
+  <rect x="63" y="70.5" width="2" height="6" rx="1" fill="#020617"/>
+</svg>

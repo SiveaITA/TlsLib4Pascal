@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TlsLib4Pascal project mark (not affiliated with Embarcadero).
+  Metaphor: two endpoints joined by a link, secured by a padlock (a protected TLS connection).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">TlsLib4Pascal</title>
+  <desc id="desc">Badge showing two endpoints connected by a link with a padlock, a secured TLS channel.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f4d6e"/>
+      <stop offset="100%" stop-color="#082f45"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="26" fill="url(#bg)"/>
+  <line x1="30" y1="64" x2="98" y2="64" stroke="#e8f4fc" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="26" cy="64" r="10" fill="#3d8fb0" opacity="0.95"/>
+  <circle cx="102" cy="64" r="10" fill="#3d8fb0" opacity="0.95"/>
+  <path d="M56 60 v-6 a8 8 0 0 1 16 0 v6" fill="none" stroke="#e8f4fc" stroke-width="4"/>
+  <rect x="50" y="60" width="28" height="22" rx="5" fill="#38bdf8"/>
+  <circle cx="64" cy="69" r="2.6" fill="#082f45"/>
+  <rect x="63" y="70.5" width="2" height="6" rx="1" fill="#082f45"/>
+</svg>

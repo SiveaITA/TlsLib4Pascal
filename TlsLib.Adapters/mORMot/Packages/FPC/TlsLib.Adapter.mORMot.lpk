@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <Package Version="5">
+    <PathDelim Value="\"/>
+    <Name Value="TlsLib.Adapter.mORMot"/>
+    <Type Value="RunTimeOnly"/>
+    <Author Value="Xor-el (Ugochukwu Mmaduekwe)"/>
+    <CompilerOptions>
+      <Version Value="11"/>
+      <PathDelim Value="\"/>
+      <SearchPaths>
+        <OtherUnitFiles Value="..\..\Adapter"/>
+        <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
+      </SearchPaths>
+    </CompilerOptions>
+    <Description Value="mORMot INetTls adapter for TlsLib4Pascal"/>
+    <License Value="MIT License"/>
+    <Version Major="1"/>
+    <Files Count="1">
+      <Item1>
+        <Filename Value="..\..\Adapter\TlsLibMormotTls.pas"/>
+        <UnitName Value="TlsLibMormotTls"/>
+      </Item1>
+    </Files>
+    <RequiredPkgs Count="4">
+      <Item1>
+        <PackageName Value="TlsLib4PascalPackage"/>
+        <MinVersion Major="1" Valid="True"/>
+      </Item1>
+      <Item2>
+        <PackageName Value="TlsLib.Trust.System"/>
+      </Item2>
+      <Item3>
+        <PackageName Value="mormot2"/>
+      </Item3>
+      <Item4>
+        <PackageName Value="FCL"/>
+      </Item4>
+    </RequiredPkgs>
+    <UsageOptions>
+      <UnitPath Value="$(PkgOutDir)"/>
+    </UsageOptions>
+    <PublishOptions>
+      <Version Value="2"/>
+    </PublishOptions>
+  </Package>
+</CONFIG>

@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <Package Version="5">
+    <PathDelim Value="\"/>
+    <Name Value="TlsLib.Trust.System"/>
+    <Type Value="RunTimeOnly"/>
+    <Author Value="Xor-el (Ugochukwu Mmaduekwe)"/>
+    <CompilerOptions>
+      <Version Value="11"/>
+      <PathDelim Value="\"/>
+      <SearchPaths>
+        <OtherUnitFiles Value="..\..\src"/>
+        <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
+      </SearchPaths>
+    </CompilerOptions>
+    <Description Value="Optional OS system-trust sources (anchors + delegate) for TlsLib4Pascal"/>
+    <License Value="MIT License"/>
+    <Version Major="1"/>
+    <Files Count="10">
+      <Item1>
+        <Filename Value="..\..\src\TlpSystemTrustExceptions.pas"/>
+        <UnitName Value="TlpSystemTrustExceptions"/>
+      </Item1>
+      <Item2>
+        <Filename Value="..\..\src\TlpSystemTrustBase.pas"/>
+        <UnitName Value="TlpSystemTrustBase"/>
+      </Item2>
+      <Item3>
+        <Filename Value="..\..\src\TlpUnixSystemTrust.pas"/>
+        <UnitName Value="TlpUnixSystemTrust"/>
+      </Item3>
+      <Item4>
+        <Filename Value="..\..\src\TlpWindowsSystemTrust.pas"/>
+        <UnitName Value="TlpWindowsSystemTrust"/>
+      </Item4>
+      <Item5>
+        <Filename Value="..\..\src\TlpAppleSystemTrust.pas"/>
+        <UnitName Value="TlpAppleSystemTrust"/>
+      </Item5>
+      <Item6>
+        <Filename Value="..\..\src\TlpOSSystemTrust.pas"/>
+        <UnitName Value="TlpOSSystemTrust"/>
+      </Item6>
+      <Item7>
+        <Filename Value="..\..\src\TlpSystemTrustFacade.pas"/>
+        <UnitName Value="TlpSystemTrustFacade"/>
+      </Item7>
+      <Item8>
+        <Filename Value="..\..\src\TlpFileSystemTrust.pas"/>
+        <UnitName Value="TlpFileSystemTrust"/>
+      </Item8>
+      <Item9>
+        <Filename Value="..\..\src\TlpAndroidSystemTrust.pas"/>
+        <UnitName Value="TlpAndroidSystemTrust"/>
+      </Item9>
+      <Item10>
+        <Filename Value="..\..\src\TlpPosixDynLib.pas"/>
+        <UnitName Value="TlpPosixDynLib"/>
+      </Item10>
+    </Files>
+    <RequiredPkgs Count="2">
+      <Item1>
+        <PackageName Value="TlsLib4PascalPackage"/>
+        <MinVersion Major="1" Valid="True"/>
+      </Item1>
+      <Item2>
+        <PackageName Value="FCL"/>
+      </Item2>
+    </RequiredPkgs>
+    <UsageOptions>
+      <UnitPath Value="$(PkgOutDir)"/>
+    </UsageOptions>
+    <PublishOptions>
+      <Version Value="2"/>
+    </PublishOptions>
+  </Package>
+</CONFIG>

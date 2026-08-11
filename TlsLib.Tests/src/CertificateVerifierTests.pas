@@ -1,0 +1,152 @@
+{ *********************************************************************************** }
+{ *                                 TlsLib Library                                  * }
+{ *                          Author - Ugochukwu Mmaduekwe                           * }
+{ *                  Github Repository <https://github.com/Xor-el>                  * }
+{ *                                                                                 * }
+{ *  Distributed under the MIT software license, see the accompanying file LICENSE  * }
+{ *          or visit http://www.opensource.org/licenses/mit-license.php.           * }
+{ * ******************************************************************************* * }
+
+(* &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&& *)
+
+unit CertificateVerifierTests;
+
+interface
+
+{$IFDEF FPC}
+{$MODE DELPHI}
+{$ENDIF FPC}
+
+uses
+  TlpIClock,
+  TlpClock,
+  SysUtils,
+  Classes,
+{$IFDEF FPC}
+  fpcunit,
+  testregistry,
+{$ELSE}
+  TestFramework,
+{$ENDIF FPC}
+  TlpTlsAlert,
+  TlpICertificateTrust,
+  TlpCertificateVerifier,
+  TlsLibTestBase;
+
+type
+  TTestCertificateVerifier = class(TTlsLibAlgorithmTestCase)
+  private
+    FCerts: TStringList;
+    function Cert(const AName: string): TBytes;
+    function VerifierFor(const ARoot: TBytes; ACheckHostName: Boolean)
+      : ICertificateVerifier;
+  protected
+    procedure SetUp; override;
+    procedure TearDown; override;
+  published
+    procedure TestValidChainTrusted;
+    procedure TestExpiredRejectedAsCertificateExpired;
+    procedure TestUntrustedRootRejectedAsUnknownCa;
+    procedure TestHostNameMismatchRejectedAsBadCertificate;
+    procedure TestEmptyChainRejected;
+    procedure TestHostNameCheckDisabledIgnoresName;
+  end;
+
+implementation
+
+{ TTestCertificateVerifier }
+
+procedure TTestCertificateVerifier.SetUp;
+begin
+  inherited SetUp;
+  FCerts := LoadVectorFields('Certs/EcP256Chain.txt');
+end;
+
+procedure TTestCertificateVerifier.TearDown;
+begin
+  FCerts.Free;
+  inherited TearDown;
+end;
+
+function TTestCertificateVerifier.Cert(const AName: string): TBytes;
+begin
+  Result := DecodeHex(FCerts.Values[AName]);
+end;
+
+function TTestCertificateVerifier.VerifierFor(const ARoot: TBytes;
+  ACheckHostName: Boolean): ICertificateVerifier;
+begin
+  Result := TCertificateVerifier.Create(Provider, TSystemClock.Create as ITlsClock,
+    TTrustAnchorStore.Create(TArray<TBytes>.Create(ARoot)) as ITrustAnchorStore,
+    ACheckHostName) as ICertificateVerifier;
+end;
+
+procedure TTestCertificateVerifier.TestValidChainTrusted;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  CheckTrue(VerifierFor(Cert('root_cert'), True).Verify(
+    TArray<TBytes>.Create(Cert('leaf_cert')), 'localhost', nil, LAlert),
+    'a valid leaf chaining to the trusted root, matching the host, is trusted');
+end;
+
+procedure TTestCertificateVerifier.TestExpiredRejectedAsCertificateExpired;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  CheckFalse(VerifierFor(Cert('root_cert'), True).Verify(
+    TArray<TBytes>.Create(Cert('expired_cert')), 'localhost', nil, LAlert),
+    'an expired certificate is rejected');
+  CheckEquals(Ord(TTlsAlertDescription.CertificateExpired), Ord(LAlert),
+    'the alert is certificate_expired');
+end;
+
+procedure TTestCertificateVerifier.TestUntrustedRootRejectedAsUnknownCa;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  // the leaf is genuine but the store trusts only an unrelated root
+  CheckFalse(VerifierFor(Cert('root2_cert'), True).Verify(
+    TArray<TBytes>.Create(Cert('leaf_cert')), 'localhost', nil, LAlert),
+    'a chain that does not reach a trusted anchor is rejected');
+  CheckEquals(Ord(TTlsAlertDescription.UnknownCa), Ord(LAlert),
+    'the alert is unknown_ca');
+end;
+
+procedure TTestCertificateVerifier.TestHostNameMismatchRejectedAsBadCertificate;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  CheckFalse(VerifierFor(Cert('root_cert'), True).Verify(
+    TArray<TBytes>.Create(Cert('leaf_cert')), 'other.example', nil, LAlert),
+    'a leaf that is valid but for the wrong host is rejected');
+  CheckEquals(Ord(TTlsAlertDescription.BadCertificate), Ord(LAlert),
+    'the alert is bad_certificate');
+end;
+
+procedure TTestCertificateVerifier.TestEmptyChainRejected;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  CheckFalse(VerifierFor(Cert('root_cert'), True).Verify(nil, 'localhost', nil, LAlert),
+    'an empty certificate chain is rejected');
+end;
+
+procedure TTestCertificateVerifier.TestHostNameCheckDisabledIgnoresName;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  CheckTrue(VerifierFor(Cert('root_cert'), False).Verify(
+    TArray<TBytes>.Create(Cert('leaf_cert')), 'other.example', nil, LAlert),
+    'with host-name checking off, a name mismatch does not reject a trusted chain');
+end;
+
+initialization
+
+{$IFDEF FPC}
+  RegisterTest(TTestCertificateVerifier);
+{$ELSE}
+  RegisterTest(TTestCertificateVerifier.Suite);
+{$ENDIF FPC}
+
+end.

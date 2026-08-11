@@ -1,0 +1,51 @@
+{ *********************************************************************************** }
+{ *                                 TlsLib Library                                  * }
+{ *                          Author - Ugochukwu Mmaduekwe                           * }
+{ *                  Github Repository <https://github.com/Xor-el>                  * }
+{ *                                                                                 * }
+{ *  Distributed under the MIT software license, see the accompanying file LICENSE  * }
+{ *          or visit http://www.opensource.org/licenses/mit-license.php.           * }
+{ * ******************************************************************************* * }
+
+(* &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&& *)
+
+unit TlpIHttpFetcher;
+
+{$I ..\..\Include\TlsLib.inc}
+
+interface
+
+uses
+  SysUtils;
+
+type
+  /// <summary>
+  /// The injected, blocking HTTP byte conduit used only at the driver edge for live
+  /// revocation retrieval (OCSP over HTTP, RFC 6960 A.1; CRL fetch, RFC 5280). The sans-IO
+  /// engine core NEVER references an implementation of this: the core stays network-free,
+  /// and a host supplies a concrete fetcher (built on its own sockets/HTTP stack) that the
+  /// deferred-verdict resolver calls out-of-band.
+  ///
+  /// Both methods are synchronous and MUST NOT raise: a transport error, a non-2xx status,
+  /// a timeout, or an empty body is reported as a False result with AResponse empty. The
+  /// caller treats a False (or an ambiguous body) per its configured revocation posture,
+  /// defaulting to the stricter option - the seam is fail-closed by construction. ATimeoutMs
+  /// bounds the whole exchange; 0 leaves the timeout to the implementation.
+  /// </summary>
+  IHttpFetcher = interface(IInterface)
+    ['{0B7E4A16-5C93-4D28-9F61-3A0C7E5B2D48}']
+    /// <summary>Performs a blocking HTTP GET (used for CRL distribution points). Returns True
+    /// with the response body in AResponse on a 2xx with a body; False (AResponse empty) on
+    /// any failure. Never raises.</summary>
+    function Get(const AUrl: string; ATimeoutMs: Cardinal;
+      out AResponse: TBytes): Boolean;
+    /// <summary>Performs a blocking HTTP POST (used for OCSP requests: AContentType
+    /// application/ocsp-request, ABody the DER request). Returns True with the response body
+    /// on a 2xx with a body; False (AResponse empty) on any failure. Never raises.</summary>
+    function Post(const AUrl, AContentType: string; const ABody: TBytes;
+      ATimeoutMs: Cardinal; out AResponse: TBytes): Boolean;
+  end;
+
+implementation
+
+end.

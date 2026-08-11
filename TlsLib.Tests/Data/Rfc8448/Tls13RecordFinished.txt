@@ -1,0 +1,9 @@
+# RFC 8448 Section 3 "Simple 1-RTT Handshake" - TLS 1.3 record-protection KAT.
+# The client's Finished, sealed with AES-128-GCM under the client write key/iv at
+# sequence 0. plaintext is the Finished handshake message (type 22); the protection
+# appends the inner content-type byte and produces the full "17 03 03 00 35 ..." record.
+key=dbfaa693d1762c5b666af5d950258d01
+iv=5bd3c71b836e0b76bb73265f
+content_type=22
+plaintext=14000020a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61
+record=170303003575ec4dc238cce60b298044a71e219c56cc77b0517fe9b93c7a4bfc44d87f38f80338ac98fc46deb384bd1caeacab6867d726c40546

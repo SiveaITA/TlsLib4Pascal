@@ -1,0 +1,4 @@
+# HMAC-SHA256 known-answer test (RFC 4231, Test Case 1).
+key=0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b
+data=4869205468657265
+mac=b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7

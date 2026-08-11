@@ -1,0 +1,82 @@
+name: Interop harness
+description: >-
+  Compile the interop programs against the already-built packages and run the loopback
+  self-test, the structure-aware parser fuzzer, the openssl s_client/s_server matrix, and
+  the full-suite hard-gate BoGo run. Provisions Go and the pinned BoringSSL peer when the
+  BoGo run is enabled. Shared by every native job (Linux and Windows) so the harness lives
+  in one place, not duplicated per job.
+
+inputs:
+  fpc-target:
+    description: The FPC target triple to compile the interop programs for (e.g. x86_64-linux).
+    required: true
+  artifact-suffix:
+    description: Suffix for the coverage-boundary artifact name (e.g. linux-x64, windows-x64).
+    required: true
+  run-interop:
+    description: Whether to run the interop harness at all.
+    required: false
+    default: 'true'
+  run-bogo:
+    description: Whether to run the hard-gate BoGo suite (also provisions Go + the peer).
+    required: false
+    default: 'false'
+  run-openssl:
+    description: Whether to run the openssl s_client/s_server matrix (skipped where openssl is unavailable).
+    required: false
+    default: 'true'
+  bogo-ref:
+    description: The BoringSSL peer commit to pin the BoGo run against.
+    required: false
+    default: ae49d2681a56ca7b8609f6039a770fda2a8eb550
+  go-version:
+    description: The Go toolchain version for the BoGo runner.
+    required: false
+    default: 'stable'
+
+runs:
+  using: composite
+  steps:
+    # Go and the pinned peer are only needed for the BoGo run.
+    - name: Set up Go (BoGo)
+      if: inputs.run-interop == 'true' && inputs.run-bogo == 'true'
+      uses: actions/setup-go@v7
+      with:
+        go-version: ${{ inputs.go-version }}
+        cache: false
+
+    - name: Fetch BoGo peer
+      if: inputs.run-interop == 'true' && inputs.run-bogo == 'true'
+      shell: bash
+      run: |
+        dest="$RUNNER_TEMP/boringssl"
+        git init -q "$dest"
+        git -C "$dest" remote add origin https://boringssl.googlesource.com/boringssl
+        # fetch EXACTLY the pinned commit (googlesource permits fetch-by-SHA), so a shallow
+        # provision lands on the pinned ref rather than a drifting HEAD a plain
+        # `git clone --depth 1` would leave the run-bogo checkout unable to reach
+        git -C "$dest" fetch --depth 1 origin "${{ inputs.bogo-ref }}"
+        git -C "$dest" checkout -q FETCH_HEAD
+
+    - name: Run interop harness
+      if: inputs.run-interop == 'true'
+      shell: bash
+      env:
+        MAKE_RUN_INTEROP: 'true'
+        MAKE_RUN_BOGO: ${{ inputs.run-bogo }}
+        MAKE_RUN_OPENSSL: ${{ inputs.run-openssl }}
+        BOGO_REF: ${{ inputs.bogo-ref }}
+        FPC_TARGET: ${{ inputs.fpc-target }}
+        BOGO_SRC: ${{ runner.temp }}/boringssl
+        BOGO_LOG_DIR: ${{ runner.temp }}/bogo-boundary
+      run: bash .github/workflows/ci/interop/interop-build.sh
+
+    # Archive the BoGo coverage boundary + raw JSON even on failure (that is when triage
+    # needs it).
+    - name: Upload BoGo coverage boundary
+      if: always() && inputs.run-interop == 'true' && inputs.run-bogo == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: bogo-coverage-boundary-${{ inputs.artifact-suffix }}
+        path: ${{ runner.temp }}/bogo-boundary
+        if-no-files-found: ignore

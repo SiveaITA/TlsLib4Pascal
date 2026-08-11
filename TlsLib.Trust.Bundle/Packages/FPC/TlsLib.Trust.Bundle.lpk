@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <Package Version="5">
+    <PathDelim Value="\"/>
+    <Name Value="TlsLib.Trust.Bundle"/>
+    <Type Value="RunTimeOnly"/>
+    <Author Value="Xor-el (Ugochukwu Mmaduekwe)"/>
+    <CompilerOptions>
+      <Version Value="11"/>
+      <PathDelim Value="\"/>
+      <SearchPaths>
+        <OtherUnitFiles Value="..\..\src"/>
+        <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
+      </SearchPaths>
+    </CompilerOptions>
+    <Description Value="Optional PEM CA-bundle trust source for TlsLib4Pascal"/>
+    <License Value="MIT License"/>
+    <Version Major="1"/>
+    <Files Count="1">
+      <Item1>
+        <Filename Value="..\..\src\TlpBundleTrust.pas"/>
+        <UnitName Value="TlpBundleTrust"/>
+      </Item1>
+    </Files>
+    <RequiredPkgs Count="2">
+      <Item1>
+        <PackageName Value="TlsLib4PascalPackage"/>
+        <MinVersion Major="1" Valid="True"/>
+      </Item1>
+      <Item2>
+        <PackageName Value="FCL"/>
+      </Item2>
+    </RequiredPkgs>
+    <UsageOptions>
+      <UnitPath Value="$(PkgOutDir)"/>
+    </UsageOptions>
+    <PublishOptions>
+      <Version Value="2"/>
+    </PublishOptions>
+  </Package>
+</CONFIG>

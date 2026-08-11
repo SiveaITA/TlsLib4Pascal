@@ -1,0 +1,10 @@
+# TLS 1.2 AES-128-GCM record inputs (RFC 5246 + RFC 5288 framing).
+# There is no published independent TLS-1.2 record vector here; the fixture builds
+# the expected record from these inputs with a separate in-test reference framing
+# over the AEAD that ProviderTests already KATs (McGrew TC4), then requires
+# TTls12RecordProtection.Protect to be byte-identical, and round-trips it.
+# seq = 0, so the explicit nonce is the 8-byte big-endian sequence 0.
+key=000102030405060708090a0b0c0d0e0f
+salt=cafebabe
+content_type=23
+plaintext=48656c6c6f2c20544c5320312e3221

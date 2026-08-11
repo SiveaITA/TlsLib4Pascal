@@ -1,0 +1,144 @@
+package TlsLib4PascalPackage;
+
+{$WARNINGS OFF}
+{$HINTS OFF}
+{$IFDEF IMPLICITBUILDING This IFDEF should not be used by users}
+{$ALIGN 8}
+{$ASSERTIONS ON}
+{$BOOLEVAL OFF}
+{$DEBUGINFO OFF}
+{$EXTENDEDSYNTAX ON}
+{$IMPORTEDDATA ON}
+{$IOCHECKS ON}
+{$LOCALSYMBOLS OFF}
+{$LONGSTRINGS ON}
+{$OPENSTRINGS ON}
+{$OPTIMIZATION ON}
+{$OVERFLOWCHECKS OFF}
+{$RANGECHECKS OFF}
+{$REFERENCEINFO OFF}
+{$SAFEDIVIDE OFF}
+{$STACKFRAMES OFF}
+{$TYPEDADDRESS OFF}
+{$VARSTRINGCHECKS ON}
+{$WRITEABLECONST OFF}
+{$MINENUMSIZE 1}
+{$IMAGEBASE $400000}
+{$DEFINE RELEASE}
+{$ENDIF IMPLICITBUILDING}
+{$RUNONLY}
+{$IMPLICITBUILD ON}
+
+requires
+  rtl,
+  HashLib4PascalPackage,
+  SimpleBaseLib4PascalPackage,
+  CryptoLib4PascalPackage;
+
+contains
+  TlpTlsAlert in '..\..\Common\TlpTlsAlert.pas',
+  TlpTlsContentType in '..\..\Common\TlpTlsContentType.pas',
+  TlpTlsVersion in '..\..\Common\TlpTlsVersion.pas',
+  TlpTlsLibExceptions in '..\..\Common\TlpTlsLibExceptions.pas',
+  TlpTlsError in '..\..\Common\TlpTlsError.pas',
+  TlpISecretBuffer in '..\..\Interfaces\Security\TlpISecretBuffer.pas',
+  TlpSecureMemory in '..\..\Security\TlpSecureMemory.pas',
+  TlpSecretBuffer in '..\..\Security\TlpSecretBuffer.pas',
+  TlpWireReader in '..\..\Codec\TlpWireReader.pas',
+  TlpWireVectorMarker in '..\..\Codec\TlpWireVectorMarker.pas',
+  TlpIWireWriter in '..\..\Interfaces\Codec\TlpIWireWriter.pas',
+  TlpWireWriter in '..\..\Codec\TlpWireWriter.pas',
+  TlpCryptoAlgorithms in '..\..\Crypto\TlpCryptoAlgorithms.pas',
+  TlpICryptoProvider in '..\..\Interfaces\Crypto\TlpICryptoProvider.pas',
+  TlpISigningKey in '..\..\Interfaces\Crypto\TlpISigningKey.pas',
+  TlpDefaultCryptoProvider in '..\..\Crypto\TlpDefaultCryptoProvider.pas',
+  TlpINamedGroup in '..\..\Interfaces\Crypto\TlpINamedGroup.pas',
+  TlpNamedGroups in '..\..\Crypto\TlpNamedGroups.pas',
+  TlpArrayUtilities in '..\..\Common\TlpArrayUtilities.pas',
+  TlpCodeKeyedRegistry in '..\..\Common\TlpCodeKeyedRegistry.pas',
+  TlpBitOperations in '..\..\Common\TlpBitOperations.pas',
+  TlpBinaryPrimitives in '..\..\Common\TlpBinaryPrimitives.pas',
+  TlpEnumUtilities in '..\..\Common\TlpEnumUtilities.pas',
+  TlpRecordHeader in '..\..\Record\TlpRecordHeader.pas',
+  TlpIRecordProtection in '..\..\Interfaces\Record\TlpIRecordProtection.pas',
+  TlpRecordProtection in '..\..\Record\TlpRecordProtection.pas',
+  TlpRecordLayer in '..\..\Record\TlpRecordLayer.pas',
+  TlpTlsAlertProtocol in '..\..\Common\TlpTlsAlertProtocol.pas',
+  TlpAlertMapping in '..\..\Common\TlpAlertMapping.pas',
+  TlpITlsEngine in '..\..\Interfaces\Engine\TlpITlsEngine.pas',
+  TlpITlsEventSink in '..\..\Interfaces\Engine\TlpITlsEventSink.pas',
+  TlpTlsEngineEvents in '..\..\Engine\TlpTlsEngineEvents.pas',
+  TlpTlsEngine in '..\..\Engine\TlpTlsEngine.pas',
+  TlpHkdfLabel in '..\..\KeySchedule\TlpHkdfLabel.pas',
+  TlpIKeySchedule in '..\..\Interfaces\KeySchedule\TlpIKeySchedule.pas',
+  TlpTrafficKeys in '..\..\KeySchedule\TlpTrafficKeys.pas',
+  TlpTls13KeySchedule in '..\..\KeySchedule\TlpTls13KeySchedule.pas',
+  TlpTls12KeySchedule in '..\..\KeySchedule\TlpTls12KeySchedule.pas',
+  TlpRecordProtectionFactory in '..\..\Record\TlpRecordProtectionFactory.pas',
+  TlpHandshakeMessage in '..\..\Handshake\TlpHandshakeMessage.pas',
+  TlpITranscriptHash in '..\..\Interfaces\Handshake\TlpITranscriptHash.pas',
+  TlpIHandshakeChannel in '..\..\Interfaces\Handshake\TlpIHandshakeChannel.pas',
+  TlpTranscriptHash in '..\..\Handshake\TlpTranscriptHash.pas',
+  TlpHandshakeMessages in '..\..\Handshake\TlpHandshakeMessages.pas',
+  TlpHandshakeEffect in '..\..\Handshake\TlpHandshakeEffect.pas',
+  TlpIHandshakeMachine in '..\..\Interfaces\Handshake\TlpIHandshakeMachine.pas',
+  TlpHandshakeChannel in '..\..\Handshake\TlpHandshakeChannel.pas',
+  TlpHandshakeDriver in '..\..\Handshake\TlpHandshakeDriver.pas',
+  TlpTls13HandshakeBase in '..\..\Handshake\TlpTls13HandshakeBase.pas',
+  TlpHandshakeMachineBase in '..\..\Handshake\TlpHandshakeMachineBase.pas',
+  TlpTls12ServerStateMachine in '..\..\Handshake\TlpTls12ServerStateMachine.pas',
+  TlpTls12ClientStateMachine in '..\..\Handshake\TlpTls12ClientStateMachine.pas',
+  TlpVersionDispatchMachine in '..\..\Handshake\TlpVersionDispatchMachine.pas',
+  TlpHelloRetryCookie in '..\..\Handshake\TlpHelloRetryCookie.pas',
+  TlpCertificateCompression in '..\..\CertCompression\TlpCertificateCompression.pas',
+  TlpCertificateLimits in '..\..\Trust\TlpCertificateLimits.pas',
+  TlpTrustPolicy in '..\..\Trust\TlpTrustPolicy.pas',
+  TlpICertificateCompression in '..\..\Interfaces\CertCompression\TlpICertificateCompression.pas',
+  TlpICertificateCompressionCache in '..\..\Interfaces\CertCompression\TlpICertificateCompressionCache.pas',
+  TlpZlibCertificateCompression in '..\..\CertCompression\TlpZlibCertificateCompression.pas',
+  TlpInMemoryCertificateCompressionCache in '..\..\CertCompression\TlpInMemoryCertificateCompressionCache.pas',
+  TlpTls13ClientStateMachine in '..\..\Handshake\TlpTls13ClientStateMachine.pas',
+  TlpTls13ServerStateMachine in '..\..\Handshake\TlpTls13ServerStateMachine.pas',
+  TlpHandshakeConductor in '..\..\Handshake\TlpHandshakeConductor.pas',
+  TlpCertificateVerify in '..\..\Handshake\TlpCertificateVerify.pas',
+  TlpICertificateTrust in '..\..\Interfaces\Trust\TlpICertificateTrust.pas',
+  TlpEndpointIdentity in '..\..\Trust\TlpEndpointIdentity.pas',
+  TlpCertificateVerifier in '..\..\Trust\TlpCertificateVerifier.pas',
+  TlpTlsCredential in '..\..\Handshake\TlpTlsCredential.pas',
+  TlpITlsConfig in '..\..\Interfaces\Engine\TlpITlsConfig.pas',
+  TlpITlsConfigBuilder in '..\..\Interfaces\Engine\TlpITlsConfigBuilder.pas',
+  TlpTlsConfigBuilder in '..\..\Engine\TlpTlsConfigBuilder.pas',
+  TlpTlsPresets in '..\..\Engine\TlpTlsPresets.pas',
+  TlpTlsLib in '..\..\Engine\TlpTlsLib.pas',
+  TlpTlsEngineFactory in '..\..\Engine\TlpTlsEngineFactory.pas',
+  TlpExtensionContext in '..\..\Extensions\TlpExtensionContext.pas',
+  TlpITlsExtension in '..\..\Interfaces\Extensions\TlpITlsExtension.pas',
+  TlpExtensionBlockCodec in '..\..\Extensions\TlpExtensionBlockCodec.pas',
+  TlpCoreExtensions in '..\..\Extensions\TlpCoreExtensions.pas',
+  TlpGrease in '..\..\Extensions\TlpGrease.pas',
+  TlpNegotiationTypes in '..\..\Negotiation\TlpNegotiationTypes.pas',
+  TlpINegotiation in '..\..\Interfaces\Negotiation\TlpINegotiation.pas',
+  TlpCipherSuiteRegistry in '..\..\Negotiation\TlpCipherSuiteRegistry.pas',
+  TlpSignatureSchemeRegistry in '..\..\Negotiation\TlpSignatureSchemeRegistry.pas',
+  TlpNegotiationPolicy in '..\..\Negotiation\TlpNegotiationPolicy.pas',
+  TlpISession in '..\..\Interfaces\Session\TlpISession.pas',
+  TlpSession in '..\..\Session\TlpSession.pas',
+  TlpExternalPskImporter in '..\..\Session\TlpExternalPskImporter.pas',
+  TlpInMemorySessionCache in '..\..\Session\TlpInMemorySessionCache.pas',
+  TlpInMemorySessionStore in '..\..\Session\TlpInMemorySessionStore.pas',
+  TlpSessionTicketKeys in '..\..\Session\TlpSessionTicketKeys.pas',
+  TlpAntiReplay in '..\..\Session\TlpAntiReplay.pas',
+  TlpSessionExtensions in '..\..\Extensions\TlpSessionExtensions.pas',
+  TlpDataEncoding in '..\..\Common\TlpDataEncoding.pas',
+  TlpDateTimeUtilities in '..\..\Common\TlpDateTimeUtilities.pas',
+  TlpIClock in '..\..\Interfaces\Common\TlpIClock.pas',
+  TlpClock in '..\..\Common\TlpClock.pas',
+  TlpSessionTicketStrategy in '..\..\Session\TlpSessionTicketStrategy.pas',
+  TlpITlsTransport in '..\..\Interfaces\Engine\TlpITlsTransport.pas',
+  TlpTlsConnectionInfo in '..\..\Engine\TlpTlsConnectionInfo.pas',
+  TlpTlsStreamPump in '..\..\Engine\TlpTlsStreamPump.pas',
+  TlpTlsStream in '..\..\Engine\TlpTlsStream.pas',
+  TlpIHttpFetcher in '..\..\Interfaces\Trust\TlpIHttpFetcher.pas',
+  TlpLiveRevocation in '..\..\Trust\TlpLiveRevocation.pas';
+
+end.

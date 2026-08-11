@@ -1,0 +1,474 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <Package Version="5">
+    <PathDelim Value="\"/>
+    <Name Value="TlsLib4PascalPackage"/>
+    <Type Value="RunTimeOnly"/>
+    <Author Value="Xor-el (Ugochukwu Mmaduekwe)"/>
+    <CompilerOptions>
+      <Version Value="11"/>
+      <PathDelim Value="\"/>
+      <SearchPaths>
+        <IncludeFiles Value="..\..\Include"/>
+        <OtherUnitFiles Value="..\..\Common;..\..\Interfaces\Common;..\..\Interfaces\Security;..\..\Interfaces\Crypto;..\..\Interfaces\Codec;..\..\Interfaces\Engine;..\..\Interfaces\Record;..\..\Interfaces\KeySchedule;..\..\Interfaces\Handshake;..\..\Interfaces\Extensions;..\..\Interfaces\Negotiation;..\..\Interfaces\Session;..\..\Security;..\..\Codec;..\..\Crypto;..\..\Record;..\..\Engine;..\..\KeySchedule;..\..\Handshake;..\..\Extensions;..\..\Negotiation;..\..\Session;..\..\Trust;..\..\Interfaces\Trust;..\..\CertCompression;..\..\Interfaces\CertCompression"/>
+        <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
+      </SearchPaths>
+      <CodeGeneration>
+        <Optimizations>
+          <OptimizationLevel Value="3"/>
+        </Optimizations>
+      </CodeGeneration>
+      <Other>
+        <ConfigFile>
+          <CustomConfigFile Value="True"/>
+          <ConfigFilePath Value="..\..\..\..\BuildConfig\FPC\TlsLibFPCMessages.cfg"/>
+        </ConfigFile>
+      </Other>
+    </CompilerOptions>
+    <Description Value="Opinionated yet Modular TLS for Modern Object Pascal"/>
+    <License Value="MIT License"/>
+    <Version Major="1"/>
+    <Files Count="106">
+      <Item1>
+        <Filename Value="..\..\Crypto\TlpCryptoAlgorithms.pas"/>
+        <UnitName Value="TlpCryptoAlgorithms"/>
+      </Item1>
+      <Item2>
+        <Filename Value="..\..\Common\TlpTlsAlert.pas"/>
+        <UnitName Value="TlpTlsAlert"/>
+      </Item2>
+      <Item3>
+        <Filename Value="..\..\Common\TlpTlsLibExceptions.pas"/>
+        <UnitName Value="TlpTlsLibExceptions"/>
+      </Item3>
+      <Item4>
+        <Filename Value="..\..\Common\TlpTlsError.pas"/>
+        <UnitName Value="TlpTlsError"/>
+      </Item4>
+      <Item5>
+        <Filename Value="..\..\Interfaces\Security\TlpISecretBuffer.pas"/>
+        <UnitName Value="TlpISecretBuffer"/>
+      </Item5>
+      <Item6>
+        <Filename Value="..\..\Security\TlpSecureMemory.pas"/>
+        <UnitName Value="TlpSecureMemory"/>
+      </Item6>
+      <Item7>
+        <Filename Value="..\..\Security\TlpSecretBuffer.pas"/>
+        <UnitName Value="TlpSecretBuffer"/>
+      </Item7>
+      <Item8>
+        <Filename Value="..\..\Codec\TlpWireReader.pas"/>
+        <UnitName Value="TlpWireReader"/>
+      </Item8>
+      <Item9>
+        <Filename Value="..\..\Codec\TlpWireWriter.pas"/>
+        <UnitName Value="TlpWireWriter"/>
+      </Item9>
+      <Item10>
+        <Filename Value="..\..\Interfaces\Crypto\TlpICryptoProvider.pas"/>
+        <UnitName Value="TlpICryptoProvider"/>
+      </Item10>
+      <Item11>
+        <Filename Value="..\..\Crypto\TlpDefaultCryptoProvider.pas"/>
+        <UnitName Value="TlpDefaultCryptoProvider"/>
+      </Item11>
+      <Item12>
+        <Filename Value="..\..\Interfaces\Crypto\TlpINamedGroup.pas"/>
+        <UnitName Value="TlpINamedGroup"/>
+      </Item12>
+      <Item13>
+        <Filename Value="..\..\Crypto\TlpNamedGroups.pas"/>
+        <UnitName Value="TlpNamedGroups"/>
+      </Item13>
+      <Item14>
+        <Filename Value="..\..\Common\TlpTlsContentType.pas"/>
+        <UnitName Value="TlpTlsContentType"/>
+      </Item14>
+      <Item15>
+        <Filename Value="..\..\Common\TlpTlsVersion.pas"/>
+        <UnitName Value="TlpTlsVersion"/>
+      </Item15>
+      <Item16>
+        <Filename Value="..\..\Record\TlpRecordHeader.pas"/>
+        <UnitName Value="TlpRecordHeader"/>
+      </Item16>
+      <Item17>
+        <Filename Value="..\..\Common\TlpArrayUtilities.pas"/>
+        <UnitName Value="TlpArrayUtilities"/>
+      </Item17>
+      <Item18>
+        <Filename Value="..\..\Interfaces\Record\TlpIRecordProtection.pas"/>
+        <UnitName Value="TlpIRecordProtection"/>
+      </Item18>
+      <Item19>
+        <Filename Value="..\..\Record\TlpRecordProtection.pas"/>
+        <UnitName Value="TlpRecordProtection"/>
+      </Item19>
+      <Item20>
+        <Filename Value="..\..\Record\TlpRecordLayer.pas"/>
+        <UnitName Value="TlpRecordLayer"/>
+      </Item20>
+      <Item21>
+        <Filename Value="..\..\Common\TlpTlsAlertProtocol.pas"/>
+        <UnitName Value="TlpTlsAlertProtocol"/>
+      </Item21>
+      <Item22>
+        <Filename Value="..\..\Interfaces\Engine\TlpITlsEngine.pas"/>
+        <UnitName Value="TlpITlsEngine"/>
+      </Item22>
+      <Item23>
+        <Filename Value="..\..\Interfaces\Engine\TlpITlsEventSink.pas"/>
+        <UnitName Value="TlpITlsEventSink"/>
+      </Item23>
+      <Item24>
+        <Filename Value="..\..\Engine\TlpTlsEngineEvents.pas"/>
+        <UnitName Value="TlpTlsEngineEvents"/>
+      </Item24>
+      <Item25>
+        <Filename Value="..\..\Engine\TlpTlsEngine.pas"/>
+        <UnitName Value="TlpTlsEngine"/>
+      </Item25>
+      <Item26>
+        <Filename Value="..\..\KeySchedule\TlpHkdfLabel.pas"/>
+        <UnitName Value="TlpHkdfLabel"/>
+      </Item26>
+      <Item27>
+        <Filename Value="..\..\Interfaces\KeySchedule\TlpIKeySchedule.pas"/>
+        <UnitName Value="TlpIKeySchedule"/>
+      </Item27>
+      <Item28>
+        <Filename Value="..\..\KeySchedule\TlpTrafficKeys.pas"/>
+        <UnitName Value="TlpTrafficKeys"/>
+      </Item28>
+      <Item29>
+        <Filename Value="..\..\KeySchedule\TlpTls13KeySchedule.pas"/>
+        <UnitName Value="TlpTls13KeySchedule"/>
+      </Item29>
+      <Item30>
+        <Filename Value="..\..\KeySchedule\TlpTls12KeySchedule.pas"/>
+        <UnitName Value="TlpTls12KeySchedule"/>
+      </Item30>
+      <Item31>
+        <Filename Value="..\..\Record\TlpRecordProtectionFactory.pas"/>
+        <UnitName Value="TlpRecordProtectionFactory"/>
+      </Item31>
+      <Item32>
+        <Filename Value="..\..\Interfaces\Handshake\TlpITranscriptHash.pas"/>
+        <UnitName Value="TlpITranscriptHash"/>
+      </Item32>
+      <Item33>
+        <Filename Value="..\..\Interfaces\Handshake\TlpIHandshakeChannel.pas"/>
+        <UnitName Value="TlpIHandshakeChannel"/>
+      </Item33>
+      <Item34>
+        <Filename Value="..\..\Handshake\TlpHandshakeMessage.pas"/>
+        <UnitName Value="TlpHandshakeMessage"/>
+      </Item34>
+      <Item35>
+        <Filename Value="..\..\Handshake\TlpTranscriptHash.pas"/>
+        <UnitName Value="TlpTranscriptHash"/>
+      </Item35>
+      <Item36>
+        <Filename Value="..\..\Handshake\TlpHandshakeMessages.pas"/>
+        <UnitName Value="TlpHandshakeMessages"/>
+      </Item36>
+      <Item37>
+        <Filename Value="..\..\Extensions\TlpExtensionContext.pas"/>
+        <UnitName Value="TlpExtensionContext"/>
+      </Item37>
+      <Item38>
+        <Filename Value="..\..\Interfaces\Extensions\TlpITlsExtension.pas"/>
+        <UnitName Value="TlpITlsExtension"/>
+      </Item38>
+      <Item39>
+        <Filename Value="..\..\Extensions\TlpExtensionBlockCodec.pas"/>
+        <UnitName Value="TlpExtensionBlockCodec"/>
+      </Item39>
+      <Item40>
+        <Filename Value="..\..\Extensions\TlpCoreExtensions.pas"/>
+        <UnitName Value="TlpCoreExtensions"/>
+      </Item40>
+      <Item41>
+        <Filename Value="..\..\Negotiation\TlpNegotiationTypes.pas"/>
+        <UnitName Value="TlpNegotiationTypes"/>
+      </Item41>
+      <Item42>
+        <Filename Value="..\..\Interfaces\Negotiation\TlpINegotiation.pas"/>
+        <UnitName Value="TlpINegotiation"/>
+      </Item42>
+      <Item43>
+        <Filename Value="..\..\Negotiation\TlpCipherSuiteRegistry.pas"/>
+        <UnitName Value="TlpCipherSuiteRegistry"/>
+      </Item43>
+      <Item44>
+        <Filename Value="..\..\Negotiation\TlpSignatureSchemeRegistry.pas"/>
+        <UnitName Value="TlpSignatureSchemeRegistry"/>
+      </Item44>
+      <Item45>
+        <Filename Value="..\..\Negotiation\TlpNegotiationPolicy.pas"/>
+        <UnitName Value="TlpNegotiationPolicy"/>
+      </Item45>
+      <Item46>
+        <Filename Value="..\..\Handshake\TlpHandshakeEffect.pas"/>
+        <UnitName Value="TlpHandshakeEffect"/>
+      </Item46>
+      <Item47>
+        <Filename Value="..\..\Interfaces\Handshake\TlpIHandshakeMachine.pas"/>
+        <UnitName Value="TlpIHandshakeMachine"/>
+      </Item47>
+      <Item48>
+        <Filename Value="..\..\Handshake\TlpHandshakeChannel.pas"/>
+        <UnitName Value="TlpHandshakeChannel"/>
+      </Item48>
+      <Item49>
+        <Filename Value="..\..\Handshake\TlpHandshakeDriver.pas"/>
+        <UnitName Value="TlpHandshakeDriver"/>
+      </Item49>
+      <Item50>
+        <Filename Value="..\..\Handshake\TlpTls13ClientStateMachine.pas"/>
+        <UnitName Value="TlpTls13ClientStateMachine"/>
+      </Item50>
+      <Item51>
+        <Filename Value="..\..\Handshake\TlpTls13ServerStateMachine.pas"/>
+        <UnitName Value="TlpTls13ServerStateMachine"/>
+      </Item51>
+      <Item52>
+        <Filename Value="..\..\Handshake\TlpHandshakeConductor.pas"/>
+        <UnitName Value="TlpHandshakeConductor"/>
+      </Item52>
+      <Item53>
+        <Filename Value="..\..\Handshake\TlpCertificateVerify.pas"/>
+        <UnitName Value="TlpCertificateVerify"/>
+      </Item53>
+      <Item54>
+        <Filename Value="..\..\Interfaces\Trust\TlpICertificateTrust.pas"/>
+        <UnitName Value="TlpICertificateTrust"/>
+      </Item54>
+      <Item55>
+        <Filename Value="..\..\Trust\TlpEndpointIdentity.pas"/>
+        <UnitName Value="TlpEndpointIdentity"/>
+      </Item55>
+      <Item56>
+        <Filename Value="..\..\Trust\TlpCertificateVerifier.pas"/>
+        <UnitName Value="TlpCertificateVerifier"/>
+      </Item56>
+      <Item57>
+        <Filename Value="..\..\Handshake\TlpTlsCredential.pas"/>
+        <UnitName Value="TlpTlsCredential"/>
+      </Item57>
+      <Item58>
+        <Filename Value="..\..\Interfaces\Engine\TlpITlsConfig.pas"/>
+        <UnitName Value="TlpITlsConfig"/>
+      </Item58>
+      <Item59>
+        <Filename Value="..\..\Engine\TlpTlsConfigBuilder.pas"/>
+        <UnitName Value="TlpTlsConfigBuilder"/>
+      </Item59>
+      <Item60>
+        <Filename Value="..\..\Engine\TlpTlsPresets.pas"/>
+        <UnitName Value="TlpTlsPresets"/>
+      </Item60>
+      <Item61>
+        <Filename Value="..\..\Include\TlsLib.inc"/>
+        <Type Value="Include"/>
+      </Item61>
+      <Item62>
+        <Filename Value="..\..\Include\TlsLibFPC.inc"/>
+        <Type Value="Include"/>
+      </Item62>
+      <Item63>
+        <Filename Value="..\..\Engine\TlpTlsLib.pas"/>
+        <UnitName Value="TlpTlsLib"/>
+      </Item63>
+      <Item64>
+        <Filename Value="..\..\Engine\TlpTlsEngineFactory.pas"/>
+        <UnitName Value="TlpTlsEngineFactory"/>
+      </Item64>
+      <Item65>
+        <Filename Value="..\..\Common\TlpAlertMapping.pas"/>
+        <UnitName Value="TlpAlertMapping"/>
+      </Item65>
+      <Item66>
+        <Filename Value="..\..\Handshake\TlpTls13HandshakeBase.pas"/>
+        <UnitName Value="TlpTls13HandshakeBase"/>
+      </Item66>
+      <Item67>
+        <Filename Value="..\..\Codec\TlpWireVectorMarker.pas"/>
+        <UnitName Value="TlpWireVectorMarker"/>
+      </Item67>
+      <Item68>
+        <Filename Value="..\..\Interfaces\Codec\TlpIWireWriter.pas"/>
+        <UnitName Value="TlpIWireWriter"/>
+      </Item68>
+      <Item69>
+        <Filename Value="..\..\Common\TlpCodeKeyedRegistry.pas"/>
+        <UnitName Value="TlpCodeKeyedRegistry"/>
+      </Item69>
+      <Item70>
+        <Filename Value="..\..\Common\TlpBitOperations.pas"/>
+        <UnitName Value="TlpBitOperations"/>
+      </Item70>
+      <Item71>
+        <Filename Value="..\..\Common\TlpBinaryPrimitives.pas"/>
+        <UnitName Value="TlpBinaryPrimitives"/>
+      </Item71>
+      <Item72>
+        <Filename Value="..\..\Common\TlpEnumUtilities.pas"/>
+        <UnitName Value="TlpEnumUtilities"/>
+      </Item72>
+      <Item73>
+        <Filename Value="..\..\Handshake\TlpHelloRetryCookie.pas"/>
+        <UnitName Value="TlpHelloRetryCookie"/>
+      </Item73>
+      <Item74>
+        <Filename Value="..\..\Extensions\TlpGrease.pas"/>
+        <UnitName Value="TlpGrease"/>
+      </Item74>
+      <Item75>
+        <Filename Value="..\..\CertCompression\TlpCertificateCompression.pas"/>
+        <UnitName Value="TlpCertificateCompression"/>
+      </Item75>
+      <Item76>
+        <Filename Value="..\..\Trust\TlpCertificateLimits.pas"/>
+        <UnitName Value="TlpCertificateLimits"/>
+      </Item76>
+      <Item77>
+        <Filename Value="..\..\Interfaces\CertCompression\TlpICertificateCompression.pas"/>
+        <UnitName Value="TlpICertificateCompression"/>
+      </Item77>
+      <Item78>
+        <Filename Value="..\..\CertCompression\TlpZlibCertificateCompression.pas"/>
+        <UnitName Value="TlpZlibCertificateCompression"/>
+      </Item78>
+      <Item79>
+        <Filename Value="..\..\Interfaces\Engine\TlpITlsConfigBuilder.pas"/>
+        <UnitName Value="TlpITlsConfigBuilder"/>
+      </Item79>
+      <Item80>
+        <Filename Value="..\..\Interfaces\Crypto\TlpISigningKey.pas"/>
+        <UnitName Value="TlpISigningKey"/>
+      </Item80>
+      <Item81>
+        <Filename Value="..\..\Handshake\TlpHandshakeMachineBase.pas"/>
+        <UnitName Value="TlpHandshakeMachineBase"/>
+      </Item81>
+      <Item82>
+        <Filename Value="..\..\Handshake\TlpTls12ServerStateMachine.pas"/>
+        <UnitName Value="TlpTls12ServerStateMachine"/>
+      </Item82>
+      <Item83>
+        <Filename Value="..\..\Handshake\TlpTls12ClientStateMachine.pas"/>
+        <UnitName Value="TlpTls12ClientStateMachine"/>
+      </Item83>
+      <Item84>
+        <Filename Value="..\..\Handshake\TlpVersionDispatchMachine.pas"/>
+        <UnitName Value="TlpVersionDispatchMachine"/>
+      </Item84>
+      <Item85>
+        <Filename Value="..\..\Interfaces\Session\TlpISession.pas"/>
+        <UnitName Value="TlpISession"/>
+      </Item85>
+      <Item86>
+        <Filename Value="..\..\Session\TlpSession.pas"/>
+        <UnitName Value="TlpSession"/>
+      </Item86>
+      <Item87>
+        <Filename Value="..\..\Session\TlpInMemorySessionCache.pas"/>
+        <UnitName Value="TlpInMemorySessionCache"/>
+      </Item87>
+      <Item88>
+        <Filename Value="..\..\Session\TlpInMemorySessionStore.pas"/>
+        <UnitName Value="TlpInMemorySessionStore"/>
+      </Item88>
+      <Item89>
+        <Filename Value="..\..\Session\TlpSessionTicketKeys.pas"/>
+        <UnitName Value="TlpSessionTicketKeys"/>
+      </Item89>
+      <Item90>
+        <Filename Value="..\..\Session\TlpAntiReplay.pas"/>
+        <UnitName Value="TlpAntiReplay"/>
+      </Item90>
+      <Item91>
+        <Filename Value="..\..\Extensions\TlpSessionExtensions.pas"/>
+        <UnitName Value="TlpSessionExtensions"/>
+      </Item91>
+      <Item92>
+        <Filename Value="..\..\Common\TlpDataEncoding.pas"/>
+        <UnitName Value="TlpDataEncoding"/>
+      </Item92>
+      <Item93>
+        <Filename Value="..\..\Common\TlpDateTimeUtilities.pas"/>
+        <UnitName Value="TlpDateTimeUtilities"/>
+      </Item93>
+      <Item94>
+        <Filename Value="..\..\Session\TlpSessionTicketStrategy.pas"/>
+        <UnitName Value="TlpSessionTicketStrategy"/>
+      </Item94>
+      <Item95>
+        <Filename Value="..\..\Trust\TlpTrustPolicy.pas"/>
+        <UnitName Value="TlpTrustPolicy"/>
+      </Item95>
+      <Item96>
+        <Filename Value="..\..\Interfaces\Engine\TlpITlsTransport.pas"/>
+        <UnitName Value="TlpITlsTransport"/>
+      </Item96>
+      <Item97>
+        <Filename Value="..\..\Engine\TlpTlsConnectionInfo.pas"/>
+        <UnitName Value="TlpTlsConnectionInfo"/>
+      </Item97>
+      <Item98>
+        <Filename Value="..\..\Engine\TlpTlsStreamPump.pas"/>
+        <UnitName Value="TlpTlsStreamPump"/>
+      </Item98>
+      <Item99>
+        <Filename Value="..\..\Engine\TlpTlsStream.pas"/>
+        <UnitName Value="TlpTlsStream"/>
+      </Item99>
+      <Item100>
+        <Filename Value="..\..\Interfaces\Trust\TlpIHttpFetcher.pas"/>
+        <UnitName Value="TlpIHttpFetcher"/>
+      </Item100>
+      <Item101>
+        <Filename Value="..\..\Trust\TlpLiveRevocation.pas"/>
+        <UnitName Value="TlpLiveRevocation"/>
+      </Item101>
+      <Item102>
+        <Filename Value="..\..\Session\TlpExternalPskImporter.pas"/>
+        <UnitName Value="TlpExternalPskImporter"/>
+      </Item102>
+      <Item103>
+        <Filename Value="..\..\Interfaces\Common\TlpIClock.pas"/>
+        <UnitName Value="TlpIClock"/>
+      </Item103>
+      <Item104>
+        <Filename Value="..\..\Common\TlpClock.pas"/>
+        <UnitName Value="TlpClock"/>
+      </Item104>
+      <Item105>
+        <Filename Value="..\..\Interfaces\CertCompression\TlpICertificateCompressionCache.pas"/>
+        <UnitName Value="TlpICertificateCompressionCache"/>
+      </Item105>
+      <Item106>
+        <Filename Value="..\..\CertCompression\TlpInMemoryCertificateCompressionCache.pas"/>
+        <UnitName Value="TlpInMemoryCertificateCompressionCache"/>
+      </Item106>
+    </Files>
+    <CompatibilityMode Value="True"/>
+    <RequiredPkgs Count="2">
+      <Item1>
+        <PackageName Value="CryptoLib4PascalPackage"/>
+        <MinVersion Major="3" Minor="3" Valid="True"/>
+      </Item1>
+      <Item2>
+        <PackageName Value="FCL"/>
+      </Item2>
+    </RequiredPkgs>
+    <UsageOptions>
+      <UnitPath Value="$(PkgOutDir)"/>
+    </UsageOptions>
+    <PublishOptions>
+      <Version Value="2"/>
+    </PublishOptions>
+  </Package>
+</CONFIG>
