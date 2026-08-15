@@ -92,8 +92,12 @@ type
   strict private
   var
     FSocket: TNetSocket;
+    FReadTimeoutMs: Int32; // > 0 bounds a read (the handshake phase); 0 = block (app data)
   public
     constructor Create(ASocket: TNetSocket);
+    /// <summary>Bounds each Read to AMs ms (0 = block); the Read uses WaitFor, not SO_RCVTIMEO
+    /// (which Recv maps to nrRetry, spinning the read loop).</summary>
+    procedure SetReadTimeout(AMs: Int32);
     function Read(var ABuffer: TBytes; AOffset, AMaxLength: Int32): Int32;
     procedure Write(const ABuffer: TBytes; AOffset, ALength: Int32);
   end;
@@ -141,6 +145,13 @@ type
     function Receive(Buffer: pointer; var Length: integer): TNetResult;
     function ReceivePending: integer;
     function Send(Buffer: pointer; var Length: integer): TNetResult;
+    // beyond INetTls: cast the INetTls to TTlsLibNetTls to read these post-handshake
+    /// <summary>The negotiated named group (key_share curve) wire codepoint once the handshake
+    /// completes (0 if none).</summary>
+    function NegotiatedGroup: UInt16;
+    /// <summary>The SNI server_name for this connection: the host a client requested (server side)
+    /// or the host we sent (client side); empty when none.</summary>
+    function PeerServerName: string;
   end;
 
 /// <summary>The factory to point mORMot's global at: `NewNetTls := @NewTlsLib4PascalTls;`.</summary>
@@ -225,6 +236,11 @@ begin
   FSocket := ASocket;
 end;
 
+procedure TMormotSocketTransport.SetReadTimeout(AMs: Int32);
+begin
+  FReadTimeoutMs := AMs;
+end;
+
 function TMormotSocketTransport.Read(var ABuffer: TBytes; AOffset,
   AMaxLength: Int32): Int32;
 var
@@ -232,6 +248,11 @@ var
   LRes: TNetResult;
 begin
   repeat
+    // bounded during the handshake; distinct from a peer close (nrClosed / 0 below)
+    if (FReadTimeoutMs > 0) and
+      (not (neRead in FSocket.WaitFor(FReadTimeoutMs, [neRead]))) then
+      raise ETlsHandshakeTimeout.Create(TTlsAlertDescription.InternalError,
+        Format('the peer sent no handshake data within %d ms', [FReadTimeoutMs]));
     LLen := AMaxLength;
     LRes := FSocket.Recv(@ABuffer[AOffset], LLen);
     case LRes of
@@ -503,14 +524,25 @@ end;
 
 procedure TTlsLibNetTls.DriveHandshake(ASocket: TNetSocket;
   const AEngine: ITlsEngine; AIsClient: Boolean; const AHost: string);
+const
+  DefaultHandshakeReadTimeoutMs = 30000; // no readable user timeout at the INetTls seam
+var
+  LTransport: TMormotSocketTransport;
 begin
   FEngine := AEngine;
   FServerName := AHost;
-  FTransport := TMormotSocketTransport.Create(ASocket) as ITlsTransport;
+  LTransport := TMormotSocketTransport.Create(ASocket);
+  // bound the handshake read (the transport uses WaitFor - see SetReadTimeout)
+  LTransport.SetReadTimeout(DefaultHandshakeReadTimeoutMs);
+  FTransport := LTransport as ITlsTransport;
   FStream := TTlsStream.Create(FTransport, FEngine, AIsClient, AHost);
   if AIsClient and Assigned(GVerdictResolver) then
     FStream.SetCertificateVerdictResolver(GVerdictResolver);
-  FStream.Handshake;
+  try
+    FStream.Handshake;
+  finally
+    LTransport.SetReadTimeout(0); // handshake done: application reads block normally
+  end;
 end;
 
 procedure TTlsLibNetTls.AfterConnection(Socket: TNetSocket;
@@ -559,6 +591,22 @@ begin
     Result := 'TLSv1.3'
   else if LVersion.WireValue = TlsWireVersionTls12 then
     Result := 'TLSv1.2'
+  else
+    Result := '';
+end;
+
+function TTlsLibNetTls.NegotiatedGroup: UInt16;
+begin
+  if FEngine <> nil then
+    Result := FEngine.NegotiatedGroup
+  else
+    Result := 0;
+end;
+
+function TTlsLibNetTls.PeerServerName: string;
+begin
+  if FEngine <> nil then
+    Result := FEngine.PeerServerName
   else
     Result := '';
 end;

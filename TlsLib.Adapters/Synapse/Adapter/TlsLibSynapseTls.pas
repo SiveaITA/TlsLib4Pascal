@@ -71,15 +71,19 @@ procedure SetTlsLibSynapseVerdictResolver(const AResolver: TTlsVerdictResolver;
 procedure FlushTlsLibSynapseConfigCache;
 
 type
-  /// <summary>An ITlsTransport over a raw Synapse socket handle: raw ciphertext moves through
-  /// synsock Recv/Send, bypassing TTCPBlockSocket's SSL-aware buffered methods (which would
-  /// otherwise recurse back into this plugin once SSLEnabled is set).</summary>
+  /// <summary>An ITlsTransport over a Synapse block socket: raw ciphertext moves through synsock
+  /// Recv/Send on the socket handle, bypassing TTCPBlockSocket's SSL-aware buffered methods
+  /// (which would otherwise recurse back into this plugin once SSLEnabled is set).</summary>
   TSynapseSocketTransport = class sealed(TInterfacedObject, ITlsTransport)
   strict private
   var
-    FHandle: TSocket;
+    FSocket: TTCPBlockSocket;
+    FReadTimeoutMs: Int32; // > 0 bounds a read (the handshake phase); 0 = block (app data)
   public
-    constructor Create(AHandle: TSocket);
+    constructor Create(const ASocket: TTCPBlockSocket);
+    /// <summary>Bounds each Read to AMs ms (0 = block); uses CanRead so no socket option
+    /// (which Synapse cannot read back to restore) is touched.</summary>
+    procedure SetReadTimeout(AMs: Int32);
     function Read(var ABuffer: TBytes; AOffset, AMaxLength: Int32): Int32;
     procedure Write(const ABuffer: TBytes; AOffset, ALength: Int32);
   end;
@@ -137,6 +141,12 @@ type
     /// <summary>The negotiated cipher-suite wire codepoint once the handshake completes (0 if none).
     /// Synapse's TCustomSSL has no such accessor, so cast Sock.SSL to TSSLTlsLib to read it.</summary>
     function NegotiatedCipherSuite: UInt16;
+    /// <summary>The negotiated named group (key_share curve) wire codepoint once the handshake
+    /// completes (0 if none). Cast Sock.SSL to TSSLTlsLib to read it.</summary>
+    function NegotiatedGroup: UInt16;
+    /// <summary>The SNI server_name for this connection: the host a client requested (server side)
+    /// or the host we sent (client side); empty when none. Cast Sock.SSL to TSSLTlsLib to read it.</summary>
+    function PeerServerName: string;
     // native peer-certificate accessors an OnVerifyCert handler reads (no OpenSSL type)
     function GetPeerSubject: string; override;
     function GetPeerIssuer: string; override;
@@ -210,16 +220,25 @@ end;
 
 { TSynapseSocketTransport }
 
-constructor TSynapseSocketTransport.Create(AHandle: TSocket);
+constructor TSynapseSocketTransport.Create(const ASocket: TTCPBlockSocket);
 begin
   inherited Create;
-  FHandle := AHandle;
+  FSocket := ASocket;
+end;
+
+procedure TSynapseSocketTransport.SetReadTimeout(AMs: Int32);
+begin
+  FReadTimeoutMs := AMs;
 end;
 
 function TSynapseSocketTransport.Read(var ABuffer: TBytes; AOffset,
   AMaxLength: Int32): Int32;
 begin
-  Result := synsock.Recv(FHandle, @ABuffer[AOffset], AMaxLength, MSG_NOSIGNAL);
+  // bounded during the handshake; distinct from a peer close (which returns 0 below)
+  if (FReadTimeoutMs > 0) and (not FSocket.CanRead(FReadTimeoutMs)) then
+    raise ETlsHandshakeTimeout.Create(TTlsAlertDescription.InternalError,
+      Format('the peer sent no handshake data within %d ms', [FReadTimeoutMs]));
+  Result := synsock.Recv(FSocket.Socket, @ABuffer[AOffset], AMaxLength, MSG_NOSIGNAL);
   if Result <= 0 then
     Result := 0; // <0 error or 0 orderly close: surface as EOF to the pump
 end;
@@ -233,7 +252,7 @@ begin
   LRemain := ALength;
   while LRemain > 0 do
   begin
-    LN := synsock.Send(FHandle, @ABuffer[LOff], LRemain, MSG_NOSIGNAL);
+    LN := synsock.Send(FSocket.Socket, @ABuffer[LOff], LRemain, MSG_NOSIGNAL);
     if LN <= 0 then
       raise ETlsStreamError.Create(TTlsAlertDescription.InternalError,
         'Synapse socket send returned no progress');
@@ -453,6 +472,10 @@ end;
 
 function TSSLTlsLib.DriveHandshake(AIsClient: Boolean;
   const AHost: string): Boolean;
+const
+  DefaultHandshakeReadTimeoutMs = 30000; // no user read timeout in Synapse's SSL layer
+var
+  LTransport: TSynapseSocketTransport;
 begin
   Result := False;
   try
@@ -466,11 +489,18 @@ begin
       FEngine := BuildClientEngine
     else
       FEngine := BuildServerEngine;
-    FTransport := TSynapseSocketTransport.Create(FSocket.Socket) as ITlsTransport;
+    LTransport := TSynapseSocketTransport.Create(FSocket);
+    FTransport := LTransport as ITlsTransport;
     FStream := TTlsStream.Create(FTransport, FEngine, AIsClient, AHost);
     if Assigned(GVerdictResolver) then
       FStream.SetCertificateVerdictResolver(GVerdictResolver);
-    FStream.Handshake;
+    // bound the handshake read; cleared afterward so app reads block
+    LTransport.SetReadTimeout(DefaultHandshakeReadTimeoutMs);
+    try
+      FStream.Handshake;
+    finally
+      LTransport.SetReadTimeout(0);
+    end;
     // Synapse's native OnVerifyCert hook (RFC-agnostic, no OpenSSL type): the app inspects
     // the peer via GetPeer* and returns False to reject - fail-closed
     if not RunPeerVerifyHook then
@@ -605,6 +635,22 @@ begin
     Result := FEngine.NegotiatedCipherSuite
   else
     Result := 0;
+end;
+
+function TSSLTlsLib.NegotiatedGroup: UInt16;
+begin
+  if FStream <> nil then
+    Result := FEngine.NegotiatedGroup
+  else
+    Result := 0;
+end;
+
+function TSSLTlsLib.PeerServerName: string;
+begin
+  if FStream <> nil then
+    Result := FEngine.PeerServerName
+  else
+    Result := '';
 end;
 
 function TSSLTlsLib.GetPeerSubject: string;

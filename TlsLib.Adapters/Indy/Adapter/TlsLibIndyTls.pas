@@ -27,6 +27,7 @@ interface
 uses
   Classes,
   SysUtils,
+  SyncObjs,
   IdGlobal,
   IdSSL,
   IdIOHandler,
@@ -82,6 +83,7 @@ type
     FServerConfig: ITlsServerConfig;
     FProvider: ICryptoProvider;
     FSessionResumption: Boolean;
+    FHandshakeTimeoutMs: Integer;
   private
     /// <summary>Raises when a supplied config is set together with cert/trust options a fully-built
     /// config would replace (APropertyName names the config property in the message). The IOHandler
@@ -146,6 +148,11 @@ type
     /// psk_dhe_ke); 0-RTT is never enabled. Default True; set False to force a full handshake
     /// every connection.</summary>
     property SessionResumption: Boolean read FSessionResumption write FSessionResumption default True;
+    /// <summary>The read timeout (ms) bounding the server/client handshake, so a peer that
+    /// connects but sends no data cannot park the connection's thread. Deliberately NOT
+    /// IOHandler.ReadTimeout (that is an app-read deadline). 0 (default) uses the 30 s library
+    /// default; set a positive value to override.</summary>
+    property HandshakeTimeoutMs: Integer read FHandshakeTimeoutMs write FHandshakeTimeoutMs;
   end;
 
   /// <summary>An ITlsTransport over an Indy socket binding: raw ciphertext moves through the
@@ -154,8 +161,11 @@ type
   strict private
   var
     FBinding: TIdSocketHandle;
+    FReadTimeoutMs: Int32; // > 0 bounds a read (the handshake phase); 0 = block (app data)
   public
     constructor Create(ABinding: TIdSocketHandle);
+    /// <summary>Bounds each Read to AMs ms (0 = block); caps the handshake read.</summary>
+    procedure SetReadTimeout(AMs: Int32);
     function Read(var ABuffer: TBytes; AOffset, AMaxLength: Int32): Int32;
     procedure Write(const ABuffer: TBytes; AOffset, ALength: Int32);
   end;
@@ -174,6 +184,7 @@ type
     FEngine: ITlsEngine;
     FClientMemo: ITlsClientConfigMemo;   // reuses the client config across reconnects
     FServerMemo: ITlsServerConfigMemo;   // shared with the listener; server peers reuse one config
+    FHandshakeLock: TCriticalSection;    // serializes the deferred first-touch handshake
     procedure DoHandshake;
     procedure ResetTlsSession;
     function LoadFileBytes(const APath: string): TBytes;
@@ -187,11 +198,16 @@ type
   private
     /// <summary>The listener hands each server peer its shared config memo (same-unit only).</summary>
     procedure AdoptServerMemo(const AMemo: ITlsServerConfigMemo);
+    /// <summary>Marks a just-accepted server peer as TLS-wanted WITHOUT handshaking, so the
+    /// handshake defers off the shared listener thread to this peer's own worker thread at
+    /// first RecvEnc/SendEnc (same-unit only; called from the server IOHandler's Accept).</summary>
+    procedure PrepareServerHandshakeDeferred;
   protected
     procedure InitComponent; override;
     procedure SetPassThrough(const AValue: Boolean); override;
     function RecvEnc(var ABuffer: TIdBytes): Integer; override;
     function SendEnc(const ABuffer: TIdBytes; const AOffset, ALength: Integer): Integer; override;
+    function Readable(AMSec: Integer): Boolean; override;
   public
     destructor Destroy; override;
     function Clone: TIdSSLIOHandlerSocketBase; override;
@@ -202,6 +218,12 @@ type
     function NegotiatedVersion: TTlsVersion;
     /// <summary>The negotiated cipher-suite wire codepoint once the handshake completes (0 if none).</summary>
     function NegotiatedCipherSuite: UInt16;
+    /// <summary>The negotiated named group (key_share curve) wire codepoint once the handshake
+    /// completes (0 if none).</summary>
+    function NegotiatedGroup: UInt16;
+    /// <summary>The SNI server_name for this connection once the handshake completes: the host a
+    /// client requested (server side) or the host we sent (client side); empty when none.</summary>
+    function PeerServerName: string;
     /// <summary>Clears this handler's build-once client config cache, so the next connect rebuilds
     /// from current SSLOptions. Call after rotating the client credential to purge the retired key.</summary>
     procedure FlushConfigCache;
@@ -277,6 +299,7 @@ begin
     FServerConfig := LSrc.FServerConfig;
     FProvider := LSrc.FProvider;
     FSessionResumption := LSrc.FSessionResumption;
+    FHandshakeTimeoutMs := LSrc.FHandshakeTimeoutMs;
   end
   else
     inherited Assign(ASource);
@@ -302,11 +325,20 @@ begin
   FBinding := ABinding;
 end;
 
+procedure TIndySocketTransport.SetReadTimeout(AMs: Int32);
+begin
+  FReadTimeoutMs := AMs;
+end;
+
 function TIndySocketTransport.Read(var ABuffer: TBytes; AOffset,
   AMaxLength: Int32): Int32;
 var
   LTmp: TIdBytes;
 begin
+  // bounded during the handshake; distinct from a peer close (which returns 0 below)
+  if (FReadTimeoutMs > 0) and (not FBinding.Readable(FReadTimeoutMs)) then
+    raise ETlsHandshakeTimeout.Create(TTlsAlertDescription.InternalError,
+      Format('the peer sent no handshake data within %d ms', [FReadTimeoutMs]));
   LTmp := nil;
   SetLength(LTmp, AMaxLength);
   Result := FBinding.Receive(LTmp); // 0 on an orderly close, else the byte count
@@ -344,6 +376,7 @@ procedure TTlsLibIOHandlerSocket.InitComponent;
 begin
   inherited InitComponent;
   FOptions := TTlsLibSSLOptions.Create;
+  FHandshakeLock := TCriticalSection.Create;
   FClientMemo := NewTlsClientConfigMemo;
   // Indy's base defaults PassThrough to True (connect plaintext, upgrade later). We default it to
   // False so assigning this handler to a raw client means "do TLS on connect" without extra setup -
@@ -356,6 +389,7 @@ destructor TTlsLibIOHandlerSocket.Destroy;
 begin
   FStream.Free;
   FOptions.Free;
+  FHandshakeLock.Free;
   inherited Destroy;
 end;
 
@@ -372,6 +406,33 @@ begin
   finally
     LStream.Free;
   end;
+end;
+
+procedure TTlsLibIOHandlerSocket.PrepareServerHandshakeDeferred;
+begin
+  // set the field directly so the handshake is NOT triggered here (SetPassThrough would run
+  // it inline). PassThrough=False makes Indy route reads/writes through RecvEnc/SendEnc, where
+  // the handshake then runs lazily on this connection's worker thread.
+  fPassThrough := False;
+  // AfterAccept (which we no longer call on the listener thread) would have copied the
+  // accepted binding's IP version; restore it so an IPv6-accepted server peer reports correctly
+  if Binding <> nil then
+    IPVersion := Binding.IPVersion;
+end;
+
+function TTlsLibIOHandlerSocket.Readable(AMSec: Integer): Boolean;
+begin
+  // a poll-style server checks Readable before reading; run the deferred handshake here too
+  // (not only in RecvEnc/SendEnc) so the handshake is driven - and a fully-silent peer is
+  // aborted by the handshake read timeout rather than pinning this worker thread. Then surface
+  // engine-buffered plaintext (a record coalesced with the peer's final flight) that a raw
+  // socket select cannot see, before falling back to the base socket-readability check.
+  if (not fPassThrough) and (FStream = nil) and (Binding <> nil) and
+    Binding.HandleAllocated then
+    DoHandshake;
+  if (FStream <> nil) and (FStream.PendingReadBytes > 0) then
+    Exit(True);
+  Result := inherited Readable(AMSec);
 end;
 
 procedure TTlsLibIOHandlerSocket.AdoptServerMemo(const AMemo: ITlsServerConfigMemo);
@@ -561,15 +622,41 @@ begin
 end;
 
 procedure TTlsLibIOHandlerSocket.DoHandshake;
+const
+  DefaultHandshakeReadTimeoutMs = Int32(30000); // when HandshakeTimeoutMs is left 0
+var
+  LTransport: TIndySocketTransport;
+  LTimeoutMs: Int32;
 begin
   if FStream <> nil then
-    Exit; // handshake already run
-  FEngine := BuildEngine(not IsPeer);
-  FTransport := TIndySocketTransport.Create(Binding) as ITlsTransport;
-  FStream := TTlsStream.Create(FTransport, FEngine, not IsPeer, Host);
-  if Assigned(FOptions.VerdictResolver) then
-    FStream.SetCertificateVerdictResolver(FOptions.VerdictResolver);
-  FStream.Handshake;
+    Exit; // fast path: handshake already run
+  // the deferred handshake can be reached concurrently by RecvEnc, SendEnc and Readable (a
+  // broadcaster writing while the worker reads); serialize so it runs exactly once
+  FHandshakeLock.Enter;
+  try
+    if FStream <> nil then
+      Exit;
+    FEngine := BuildEngine(not IsPeer);
+    LTransport := TIndySocketTransport.Create(Binding);
+    // bound the handshake read by the dedicated HandshakeTimeoutMs option, NOT app ReadTimeout
+    // (a short app-read deadline would wrongly abort slow-but-valid handshakes)
+    LTimeoutMs := FOptions.HandshakeTimeoutMs;
+    if LTimeoutMs <= 0 then
+      LTimeoutMs := DefaultHandshakeReadTimeoutMs;
+    LTransport.SetReadTimeout(LTimeoutMs);
+    FTransport := LTransport as ITlsTransport;
+    FStream := TTlsStream.Create(FTransport, FEngine, not IsPeer, Host);
+    if Assigned(FOptions.VerdictResolver) then
+      FStream.SetCertificateVerdictResolver(FOptions.VerdictResolver);
+    try
+      FStream.Handshake;
+    finally
+      // clear the cap even if the handshake raised, so a retried app read is not left bounded
+      LTransport.SetReadTimeout(0); // handshake done: application reads block normally
+    end;
+  finally
+    FHandshakeLock.Leave;
+  end;
 end;
 
 procedure TTlsLibIOHandlerSocket.StartSSL;
@@ -632,6 +719,10 @@ function TTlsLibIOHandlerSocket.RecvEnc(var ABuffer: TIdBytes): Integer;
 var
   LTmp: TBytes;
 begin
+  // a deferred server handshake runs here, on this connection's own worker thread, the first
+  // time the application touches the stream - never on the shared listener thread
+  if FStream = nil then
+    DoHandshake;
   LTmp := nil;
   SetLength(LTmp, 32768);
   Result := FStream.Read(LTmp[0], System.Length(LTmp));
@@ -643,6 +734,8 @@ end;
 function TTlsLibIOHandlerSocket.SendEnc(const ABuffer: TIdBytes;
   const AOffset, ALength: Integer): Integer;
 begin
+  if FStream = nil then
+    DoHandshake;
   FStream.Write(ABuffer[AOffset], ALength);
   Result := ALength;
 end;
@@ -661,6 +754,22 @@ begin
     Result := FStream.ConnectionInfo.CipherSuite
   else
     Result := 0;
+end;
+
+function TTlsLibIOHandlerSocket.NegotiatedGroup: UInt16;
+begin
+  if FStream <> nil then
+    Result := FStream.ConnectionInfo.NamedGroup
+  else
+    Result := 0;
+end;
+
+function TTlsLibIOHandlerSocket.PeerServerName: string;
+begin
+  if FStream <> nil then
+    Result := FStream.ConnectionInfo.ServerName
+  else
+    Result := '';
 end;
 
 procedure TTlsLibIOHandlerSocket.FlushConfigCache;
@@ -710,8 +819,9 @@ begin
           LIO.IsPeer := True;
           LIO.SSLOptions.Assign(FOptions);
           LIO.AdoptServerMemo(FServerMemo); // all peers share the listener's build-once config
-          LIO.PassThrough := False; // a straight TLS server upgrades on accept
-          LIO.AfterAccept;
+          // do NOT handshake here: Accept runs on the single listener thread, so a silent peer
+          // would wedge every connection. Defer it to this peer's worker thread.
+          LIO.PrepareServerHandshakeDeferred;
           Result := LIO;
           LIO := nil;
           Break;
