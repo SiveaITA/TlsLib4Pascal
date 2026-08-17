@@ -8,7 +8,7 @@ unit TlsLib.Adapter.Indy;
 interface
 
 uses
-  TlpIndyTls;
+  TlsLibIndyTls;
 
 implementation
 

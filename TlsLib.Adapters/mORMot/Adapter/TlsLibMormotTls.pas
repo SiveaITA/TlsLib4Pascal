@@ -16,7 +16,7 @@
 /// recompile of mORMot. This unit is the only place our types and mORMot's types meet;
 /// the core library references nothing here.
 /// </summary>
-unit TlpMormotTls;
+unit TlsLibMormotTls;
 
 {$IFDEF FPC}
 {$MODE DELPHI}

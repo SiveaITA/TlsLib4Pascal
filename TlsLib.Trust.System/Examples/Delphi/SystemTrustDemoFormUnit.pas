@@ -63,7 +63,7 @@ uses
   IdHTTP,
   IdStack,
   TlpTlsStreamPump,
-  TlpIndyTls;
+  TlsLibIndyTls;
 
 const
   TimeoutMs = 15000;

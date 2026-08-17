@@ -61,7 +61,7 @@ uses
   IdHTTP,
   IdStack,
   TlpTlsStreamPump,
-  TlpIndyTls;
+  TlsLibIndyTls;
 
 { TIndyRealWorldExample }
 

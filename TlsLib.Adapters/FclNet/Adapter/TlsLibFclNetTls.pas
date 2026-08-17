@@ -16,7 +16,7 @@
 /// initialization block registers TTlsLibSocketHandler as fcl-net's default SSL handler class.
 /// This is the only place our types and fcl-net's types meet. Free Pascal only.
 /// </summary>
-unit TlpFclNetTls;
+unit TlsLibFclNetTls;
 
 {$IFDEF FPC}
 {$MODE DELPHI}

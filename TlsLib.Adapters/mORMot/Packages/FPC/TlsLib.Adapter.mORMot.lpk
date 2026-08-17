@@ -23,8 +23,8 @@
     <Version Major="1"/>
     <Files Count="1">
       <Item1>
-        <Filename Value="..\..\Adapter\TlpMormotTls.pas"/>
-        <UnitName Value="TlpMormotTls"/>
+        <Filename Value="..\..\Adapter\TlsLibMormotTls.pas"/>
+        <UnitName Value="TlsLibMormotTls"/>
       </Item1>
     </Files>
     <RequiredPkgs Count="4">

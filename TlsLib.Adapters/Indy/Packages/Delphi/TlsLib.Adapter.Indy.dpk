@@ -38,6 +38,6 @@ requires
   TlsLib.Trust.System;
 
 contains
-  TlpIndyTls in '..\..\Adapter\TlpIndyTls.pas';
+  TlsLibIndyTls in '..\..\Adapter\TlsLibIndyTls.pas';
 
 end.

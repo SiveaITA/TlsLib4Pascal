@@ -56,7 +56,7 @@ uses
   TlpITlsConfig,
   TlpITlsConfigBuilder,
   TlpTlsPresets,
-  TlpIndyTls;
+  TlsLibIndyTls;
 
 const
   PORTBASE = 28452;

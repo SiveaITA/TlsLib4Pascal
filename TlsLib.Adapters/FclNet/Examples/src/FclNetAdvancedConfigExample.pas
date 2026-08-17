@@ -49,7 +49,7 @@ uses
   TlpITlsConfig,
   TlpITlsConfigBuilder,
   TlpTlsPresets,
-  TlpFclNetTls;
+  TlsLibFclNetTls;
 
 const
   PORT = 28447;
