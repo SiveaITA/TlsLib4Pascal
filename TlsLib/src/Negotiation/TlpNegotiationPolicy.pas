@@ -265,16 +265,11 @@ begin
 end;
 
 class function THelloRetryRequest.IsSentinel(const ARandom: TBytes): Boolean;
-var
-  LI: Int32;
 begin
-  Result := System.Length(ARandom) = System.Length(HelloRetryRequestSentinel);
-  if not Result then
-    Exit;
-  // the random is public data, so a plain compare is fine (like the downgrade sentinel)
-  for LI := 0 to System.High(HelloRetryRequestSentinel) do
-    if ARandom[LI] <> HelloRetryRequestSentinel[LI] then
-      Exit(False);
+  // the random is public data, so a plain compare is fine
+  Result := (System.Length(ARandom) = System.Length(HelloRetryRequestSentinel)) and
+    CompareMem(@ARandom[0], @HelloRetryRequestSentinel[0],
+    System.Length(HelloRetryRequestSentinel));
 end;
 
 { TDowngradeProtection }
@@ -295,17 +290,11 @@ class function TDowngradeProtection.HasSentinel(const AServerRandom: TBytes;
   ANegotiatedVersion: UInt16): Boolean;
 var
   LSentinel: TBytes;
-  LI: Int32;
 begin
-  Result := False;
   LSentinel := SentinelFor(ANegotiatedVersion);
-  if (System.Length(LSentinel) <> 8) or (System.Length(AServerRandom) < 32) then
-    Exit;
   // the sentinel occupies the last 8 of the 32-byte random; public data, plain compare
-  for LI := 0 to 7 do
-    if AServerRandom[24 + LI] <> LSentinel[LI] then
-      Exit;
-  Result := True;
+  Result := (System.Length(LSentinel) = 8) and (System.Length(AServerRandom) >= 32) and
+    CompareMem(@AServerRandom[24], @LSentinel[0], 8);
 end;
 
 class function TDowngradeProtection.IsDowngradeAttack(const AServerRandom: TBytes;
