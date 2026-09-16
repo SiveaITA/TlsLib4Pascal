@@ -32,6 +32,9 @@ uses
   TlpISecretBuffer,
   TlpSecretBuffer,
   TlpCryptoDomainTypes,
+  TlpICryptoProvider,
+  TlpDefaultCryptoProvider,
+  TlpOSCryptoProvider,
   TlpINamedGroup,
   TlpNamedGroups,
   TlpNegotiationTypes,
@@ -48,6 +51,12 @@ type
     /// maps to illegal_parameter (no backend exception may escape the group).</summary>
     procedure CheckDecapIllegalParameter(const AGroup: INamedGroup;
       const APriv: ISecretBuffer; const ABadShare: TBytes; const AMsg: string);
+    // export a fresh key's raw scalar, re-import it, and prove the derived public and
+    // the resulting agreement are identical - the neutral-currency seam HPKE relies on
+    procedure CheckKeyImportRoundTrip(AAlgorithm: TKeyAgreementAlgorithm);
+    // import an UNCLAMPED external X25519 scalar (RFC 7748 6.1 Alice) and prove the derived
+    // public is the RFC's published value - the seam an external HPKE/ECH key crosses
+    procedure CheckUnclampedScalarImport(const AProvider: ICryptoProvider);
   published
     procedure TestX25519Rfc7748Kat;
     procedure TestX25519Agreement;
@@ -64,6 +73,9 @@ type
     procedure TestClassicalRegistryOmitsPostQuantum;
     procedure TestGroupKindClassifiesEcdheKemHybrid;
     procedure TestOnlyEcdheGroupsAreTls12Eligible;
+    procedure TestKeyImportExportRoundTrip;
+    procedure TestX25519ImportUnclampedScalar;
+    procedure TestSystemX25519ImportUnclampedScalar;
   end;
 
 implementation
@@ -121,6 +133,63 @@ end;
 procedure TTestNamedGroups.TestX25519Agreement;
 begin
   CheckAgreement(TNamedGroups.CreateX25519(Provider), 32);
+end;
+
+procedure TTestNamedGroups.CheckKeyImportRoundTrip(
+  AAlgorithm: TKeyAgreementAlgorithm);
+var
+  LKa: IKeyAgreement;
+  LPriv, LScalar, LPriv2, LPeerPriv: ISecretBuffer;
+  LPub, LPub2, LPeerPub: TBytes;
+begin
+  LKa := Provider.Primitives.CreateKeyAgreement(AAlgorithm);
+  LKa.GenerateKeyPair(LPriv, LPub);
+  // export the raw scalar and re-import it; the derived public must match the original
+  LScalar := LKa.ExportPrivateKey(LPriv);
+  LPriv2 := LKa.ImportPrivateKey(LScalar, LPub2);
+  CheckEqualBytes(LKa.Name + ' import derives the same public', LPub, LPub2);
+  // the re-imported key agrees identically with a peer (functionally the same key)
+  LKa.GenerateKeyPair(LPeerPriv, LPeerPub);
+  CheckEqualBytes(LKa.Name + ' re-imported key agrees identically',
+    SecretBytes(LKa.Agree(LPriv, LPeerPub)), SecretBytes(LKa.Agree(LPriv2, LPeerPub)));
+end;
+
+procedure TTestNamedGroups.TestKeyImportExportRoundTrip;
+begin
+  CheckKeyImportRoundTrip(TKeyAgreementAlgorithm.X25519);
+  CheckKeyImportRoundTrip(TKeyAgreementAlgorithm.SECP256R1);
+  CheckKeyImportRoundTrip(TKeyAgreementAlgorithm.SECP384R1);
+  CheckKeyImportRoundTrip(TKeyAgreementAlgorithm.SECP521R1);
+end;
+
+procedure TTestNamedGroups.CheckUnclampedScalarImport(
+  const AProvider: ICryptoProvider);
+const
+  // RFC 7748 6.1: Alice's private scalar is unclamped (low bits set) - the shape of an
+  // external HPKE/ECH key; import must clamp it and derive Alice's published public key
+  ALICE_SK = '77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a';
+  ALICE_PK = '8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a';
+var
+  LKa: IKeyAgreement;
+  LPub: TBytes;
+begin
+  LKa := AProvider.Primitives.CreateKeyAgreement(TKeyAgreementAlgorithm.X25519);
+  LKa.ImportPrivateKey(TSecretBuffer.From(DecodeHex(ALICE_SK)), LPub);
+  CheckEqualBytes('X25519 unclamped import derives the RFC 7748 public',
+    DecodeHex(ALICE_PK), LPub);
+end;
+
+procedure TTestNamedGroups.TestX25519ImportUnclampedScalar;
+begin
+  CheckUnclampedScalarImport(Provider);
+end;
+
+procedure TTestNamedGroups.TestSystemX25519ImportUnclampedScalar;
+begin
+  // the OS-native overlay: exercises the native X25519 import where present, portable
+  // fallback elsewhere, so the KAT holds on every host while guarding the native clamp
+  CheckUnclampedScalarImport(
+    TOSCryptoProvider.Compose(TDefaultCryptoProvider.Create as ICryptoProvider));
 end;
 
 procedure TTestNamedGroups.TestMlKem768Agreement;
