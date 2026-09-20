@@ -89,6 +89,7 @@ type
       const AAdvertised: TArray<UInt16>);
     function VerifyServerCertificate(const AChain: TArray<TBytes>;
       const AServerName: TServerName; const AOcspStaple: TBytes;
+      out AValidatedChain: TArray<TBytes>;
       out AAlert: TTlsAlertDescription): Boolean;
   end;
 
@@ -152,6 +153,7 @@ type
       const AStrengthPolicy: TCertificateStrengthPolicy;
       const AAdvertised: TArray<UInt16>);
     function VerifyClientCertificate(const AChain: TArray<TBytes>;
+      out AValidatedChain: TArray<TBytes>;
       out AAlert: TTlsAlertDescription): Boolean;
   end;
 
@@ -250,8 +252,23 @@ const
   KSecTrustSettingsDomainAdmin = 1;
   KSecTrustSettingsDomainSystem = 2;
 
+  // SecTrustSettings.h SecTrustSettingsResult values
+  KSecTrustSettingsResultInvalid = 0;
+  KSecTrustSettingsResultTrustRoot = 1;
+  KSecTrustSettingsResultTrustAsRoot = 2;
   KSecTrustSettingsResultDeny = 3;
+  KSecTrustSettingsResultUnspecified = 4;
   KCFNumberSInt32Type = 3;
+
+  // ClassifyEntry results: whether a trust-settings entry governs the SSL policy
+  EntryScopeNot = 0;         // scoped to another app / hostname / non-SSL policy: ignore
+  EntryScopeApplicable = 1;  // governs SSL (unscoped, or the Apple SSL policy)
+  EntryScopeUnknown = 2;     // policy set but SSL scoping unresolved: honour a Deny, not a Trust
+
+  // DomainVerdict results for one domain's settings
+  DomainVerdictNoOpinion = 0;
+  DomainVerdictTrust = 1;
+  DomainVerdictDeny = 2;
 
   // SecPolicyCreateRevocation flags (SecPolicy.h): keep the check off the network, and under a
   // Hard posture demand a positive response rather than soft-failing on a missing one
@@ -335,6 +352,8 @@ type
   TSecTrustSettingsCopyTrustSettingsFunc = function(ACertRef: SecCertificateRef;
     ADomain: SecTrustSettingsDomain; var ATrustSettings: CFArrayRef)
     : OSStatus; cdecl;
+  // returns a CFDictionaryRef of a policy's properties (kSecPolicyOid identifies the policy)
+  TSecPolicyCopyPropertiesFunc = function(APolicyRef: SecPolicyRef): Pointer; cdecl;
 {$ENDIF}
 
   /// <summary>
@@ -386,15 +405,46 @@ type
 {$IFDEF TLSLIB_MACOS}
     FSecTrustSettingsCopyCertificates: TSecTrustSettingsCopyCertificatesFunc;
     FSecTrustSettingsCopyTrustSettings: TSecTrustSettingsCopyTrustSettingsFunc;
+    FSecPolicyCopyProperties: TSecPolicyCopyPropertiesFunc;
+    // the trust-settings dictionary keys are CFSTR() macros in SecTrustSettings.h, NOT exported
+    // symbols, so they are CREATED at load with CFStringCreateWithCString - a dlsym would return
+    // nil. Trust-settings dictionaries use content (CFEqual) key comparison, so a created string
+    // with the same characters matches the framework's literal.
     FkSecTrustSettingsResult: CFStringRef;
+    FkSecTrustSettingsPolicy: CFStringRef;
+    FkSecTrustSettingsApplication: CFStringRef;
+    FkSecTrustSettingsPolicyString: CFStringRef;
+    // kSecPolicyOid / kSecPolicyAppleSSL ARE exported data symbols (SecPolicy.h), resolved by dlsym
+    FkSecPolicyOid: CFStringRef;
+    FkSecPolicyAppleSSL: CFStringRef;
+    // tiered readiness: tier 0 (enumerate) gates the harvest; tier 1 (read settings) falls back to
+    // System-origin-only harvesting; tier 2 (SSL policy scoping) is best-effort and never gates
+    FHarvestReady: Boolean;
+    FSettingsReady: Boolean;
+    FSslScopeReady: Boolean;
 {$ENDIF}
     /// <summary>The DER of one certificate via SecCertificateCopyData. Empty on any failure.
     /// Shared macOS/iOS (harvest on macOS, the validated-path read on both).</summary>
     class function CopyCertificateDer(ACertificate: SecCertificateRef)
       : TBytes; static;
 {$IFDEF TLSLIB_MACOS}
-    class function DomainDeniesCertificate(ACertificate: SecCertificateRef;
-      ADomain: SecTrustSettingsDomain): Boolean; static;
+    /// <summary>Classifies a trust-settings dict's scope for TLS server auth: EntryScopeApplicable
+    /// (the entry governs the SSL policy - no policy key, or the Apple SSL policy), EntryScopeNot
+    /// (scoped to another application, a hostname policy string, or a non-SSL policy - ignore),
+    /// or EntryScopeUnknown (a policy is set but SSL scoping cannot be resolved - a Deny is still
+    /// honoured, a Trust is not).</summary>
+    class function ClassifyEntry(ADict: Pointer): Int32; static;
+    /// <summary>The verdict a single domain's trust settings yield for a certificate:
+    /// DomainVerdictDeny, DomainVerdictTrust, or DomainVerdictNoOpinion (no record, or no entry
+    /// that matches the SSL policy). Within a domain a Deny overrides a Trust.</summary>
+    class function DomainVerdict(ACertificate: SecCertificateRef;
+      ADomain: SecTrustSettingsDomain): Int32; static;
+    /// <summary>Whether the OS trusts the certificate as a TLS server-auth anchor, honouring
+    /// settings across domains (User -> Admin -> System, the first domain with a matching entry
+    /// decides). A certificate enumerated from the System domain with no explicit decision is a
+    /// built-in root and stays trusted; a User/Admin certificate needs an explicit SSL grant.</summary>
+    class function AdmitsServerAuth(ACertificate: SecCertificateRef;
+      AOriginDomain: SecTrustSettingsDomain): Boolean; static;
     class procedure HarvestDomain(ADomain: SecTrustSettingsDomain;
       const ADest: TList<TBytes>); static;
 {$ENDIF}
@@ -414,6 +464,7 @@ type
     class function ApplyStrengthPolicy(ATrust: SecTrustRef;
       const AProvider: ICryptoProvider;
       const APolicy: TCertificateStrengthPolicy; const AAdvertised: TArray<UInt16>;
+      out AValidatedChain: TArray<TBytes>;
       out AAlert: TTlsAlertDescription): Boolean; static;
     /// <summary>Unix epoch milliseconds to a CFAbsoluteTime (seconds since the 2001 CF epoch). The
     /// explicit Double casts are load-bearing: single precision loses whole seconds off a current
@@ -436,6 +487,7 @@ type
       const AProvider: ICryptoProvider;
       const AStrengthPolicy: TCertificateStrengthPolicy;
       const AAdvertised: TArray<UInt16>; out AOutcome: TLiveRevocationOutcome;
+      out AValidatedChain: TArray<TBytes>;
       out AAlert: TTlsAlertDescription): Boolean; static;
     /// <summary>The inline cache-only server evaluation (no socket). Live downgrades a configured
     /// Hard to effective-Soft so an indeterminate revocation defers to the async park.</summary>
@@ -445,6 +497,7 @@ type
       const AOcspStaple: TBytes; const AProvider: ICryptoProvider;
       const AStrengthPolicy: TCertificateStrengthPolicy;
       const AAdvertised: TArray<UInt16>;
+      out AValidatedChain: TArray<TBytes>;
       out AAlert: TTlsAlertDescription): Boolean; static;
     /// <summary>Runs the SERVER evaluation LIVE (network on, network-disabled flag dropped,
     /// RequirePositiveResponse always on so an indeterminate surfaces), returning the tri-state for
@@ -466,6 +519,7 @@ type
       const AProvider: ICryptoProvider;
       const AStrengthPolicy: TCertificateStrengthPolicy;
       const AAdvertised: TArray<UInt16>; out AOutcome: TLiveRevocationOutcome;
+      out AValidatedChain: TArray<TBytes>;
       out AAlert: TTlsAlertDescription): Boolean; static;
     /// <summary>The inline cache-only CLIENT evaluation (no socket). Live downgrades a configured
     /// Hard to effective-Soft so an indeterminate revocation defers to the async park.</summary>
@@ -474,6 +528,7 @@ type
       const AProvider: ICryptoProvider;
       const AStrengthPolicy: TCertificateStrengthPolicy;
       const AAdvertised: TArray<UInt16>;
+      out AValidatedChain: TArray<TBytes>;
       out AAlert: TTlsAlertDescription): Boolean; static;
     /// <summary>Runs the CLIENT evaluation LIVE (network on, network-disabled flag dropped,
     /// RequirePositiveResponse always on so an indeterminate surfaces), returning the tri-state for
@@ -486,7 +541,7 @@ type
       out AAlert: TTlsAlertDescription): Boolean; static;
 {$IFDEF TLSLIB_MACOS}
     /// <summary>The raw DER of every keychain-trusted certificate across the
-    /// System, Admin and User domains, minus any marked Deny. Validation and
+    /// System, Admin and User domains, honouring per-domain trust settings. Validation and
     /// de-duplication are the caller's responsibility.</summary>
     class function CopyTrustSettingsCertificates: TArray<TBytes>; static;
 {$ENDIF}
@@ -571,9 +626,27 @@ begin
       TPosixDynLib.Resolve(LHandle, 'SecTrustSettingsCopyCertificates'));
     FSecTrustSettingsCopyTrustSettings := TSecTrustSettingsCopyTrustSettingsFunc(
       TPosixDynLib.Resolve(LHandle, 'SecTrustSettingsCopyTrustSettings'));
-    LSym := TPosixDynLib.Resolve(LHandle, 'kSecTrustSettingsResult');
+    FSecPolicyCopyProperties := TSecPolicyCopyPropertiesFunc(
+      TPosixDynLib.Resolve(LHandle, 'SecPolicyCopyProperties'));
+    // create (do not dlsym) the trust-settings keys - see the field declarations for why
+    if System.Assigned(FCFStringCreateWithCString) then
+    begin
+      FkSecTrustSettingsResult := FCFStringCreateWithCString(nil,
+        'kSecTrustSettingsResult', KCFStringEncodingUTF8);
+      FkSecTrustSettingsPolicy := FCFStringCreateWithCString(nil,
+        'kSecTrustSettingsPolicy', KCFStringEncodingUTF8);
+      FkSecTrustSettingsApplication := FCFStringCreateWithCString(nil,
+        'kSecTrustSettingsApplication', KCFStringEncodingUTF8);
+      FkSecTrustSettingsPolicyString := FCFStringCreateWithCString(nil,
+        'kSecTrustSettingsPolicyString', KCFStringEncodingUTF8);
+    end;
+    // kSecPolicyOid / kSecPolicyAppleSSL are genuine exported data symbols (SecPolicy.h)
+    LSym := TPosixDynLib.Resolve(LHandle, 'kSecPolicyOid');
     if LSym <> nil then
-      FkSecTrustSettingsResult := CFStringRef(PPointer(LSym)^);
+      FkSecPolicyOid := CFStringRef(PPointer(LSym)^);
+    LSym := TPosixDynLib.Resolve(LHandle, 'kSecPolicyAppleSSL');
+    if LSym <> nil then
+      FkSecPolicyAppleSSL := CFStringRef(PPointer(LSym)^);
 {$ENDIF}
   finally
     TPosixDynLib.Close(LHandle);
@@ -592,6 +665,28 @@ begin
   FCanDecodeError := System.Assigned(FCFErrorGetCode) and
     System.Assigned(FCFErrorGetDomain) and System.Assigned(FCFEqual) and
     (FkCFErrorDomainOSStatus <> nil);
+
+{$IFDEF TLSLIB_MACOS}
+  // tier 0: enumerating the store. A miss means the harvest cannot run at all (fail closed).
+  // These are CoreFoundation/Security fundamentals present on every supported macOS.
+  FHarvestReady := System.Assigned(FSecTrustSettingsCopyCertificates) and
+    System.Assigned(FCFArrayGetCount) and
+    System.Assigned(FCFArrayGetValueAtIndex) and System.Assigned(FCFRelease) and
+    System.Assigned(FSecCertificateCopyData) and System.Assigned(FCFDataGetLength) and
+    System.Assigned(FCFDataGetBytePtr);
+  // tier 1: reading and interpreting per-domain settings. A miss falls back to harvesting the
+  // System domain only (a custom CA whose record cannot be read must not become an anchor, while
+  // the built-in roots stay populated) rather than zeroing the harvest.
+  FSettingsReady := FHarvestReady and
+    System.Assigned(FSecTrustSettingsCopyTrustSettings) and
+    System.Assigned(FCFDictionaryGetValue) and System.Assigned(FCFNumberGetValue) and
+    (FkSecTrustSettingsResult <> nil) and (FkSecTrustSettingsPolicy <> nil) and
+    (FkSecTrustSettingsApplication <> nil) and (FkSecTrustSettingsPolicyString <> nil);
+  // tier 2: SSL policy scoping. Best-effort - a miss treats a policy-scoped entry as unscoped
+  // (the prior behaviour), never gating the harvest.
+  FSslScopeReady := System.Assigned(FSecPolicyCopyProperties) and
+    System.Assigned(FCFEqual) and (FkSecPolicyOid <> nil) and (FkSecPolicyAppleSSL <> nil);
+{$ENDIF}
 end;
 
 class function TAppleTrustApi.CopyCertificateDer(
@@ -686,11 +781,13 @@ end;
 
 class function TAppleTrustApi.ApplyStrengthPolicy(ATrust: SecTrustRef;
   const AProvider: ICryptoProvider; const APolicy: TCertificateStrengthPolicy;
-  const AAdvertised: TArray<UInt16>; out AAlert: TTlsAlertDescription): Boolean;
+  const AAdvertised: TArray<UInt16>; out AValidatedChain: TArray<TBytes>;
+  out AAlert: TTlsAlertDescription): Boolean;
 var
   LPath: TArray<TBytes>;
 begin
   Result := False;
+  AValidatedChain := nil;
   if AProvider = nil then
   begin
     AAlert := TTlsAlertDescription.InternalError;
@@ -704,6 +801,10 @@ begin
   // exempt the OS anchor (last path element); leaf and intermediates are checked
   Result := TChainAlgorithmPolicy.Check(AProvider.Certificates, LPath,
     TArray<TBytes>.Create(LPath[High(LPath)]), APolicy, AAdvertised, AAlert);
+  // the OS-built path (leaf-first, ending at the anchor) is the validated chain; ReadTrustPath
+  // copied each certificate's DER, so it outlives the SecTrustRef the caller releases
+  if Result then
+    AValidatedChain := LPath;
 end;
 
 class function TAppleTrustApi.MakeCertArray(const ADers: TArray<TBytes>;
@@ -761,6 +862,7 @@ class function TAppleTrustApi.EvaluateTrust(const AChain: TArray<TBytes>;
   const AProvider: ICryptoProvider;
   const AStrengthPolicy: TCertificateStrengthPolicy;
   const AAdvertised: TArray<UInt16>; out AOutcome: TLiveRevocationOutcome;
+  out AValidatedChain: TArray<TBytes>;
   out AAlert: TTlsAlertDescription): Boolean;
 var
   LStatusCode: Int32;
@@ -779,6 +881,7 @@ var
 begin
   Result := False;
   AOutcome := TLiveRevocationOutcome.Indeterminate;
+  AValidatedChain := nil;
   AAlert := TTlsAlertDescription.BadCertificate;
 
   if Length(AChain) = 0 then
@@ -917,8 +1020,10 @@ begin
 
     if FSecTrustEvaluateWithError(LTrust, @LError) then
     begin
-      // trusted: strength policy over the OS-built path; a pass is a definitive Good
-      if not ApplyStrengthPolicy(LTrust, AProvider, AStrengthPolicy, AAdvertised, AAlert) then
+      // trusted: strength policy over the OS-built path; a pass is a definitive Good. The path
+      // is read here (before the finally releases LTrust) and handed back as the validated chain.
+      if not ApplyStrengthPolicy(LTrust, AProvider, AStrengthPolicy, AAdvertised,
+        AValidatedChain, AAlert) then
         Exit;
       AOutcome := TLiveRevocationOutcome.Good;
       Result := True;
@@ -973,11 +1078,14 @@ class function TAppleTrustApi.EvaluateSslChain(const AChain: TArray<TBytes>;
   const AHostName: string; APosture: TRevocationPosture; AFetch: TSystemTrustFetch;
   const AClock: ITlsClock; const AOcspStaple: TBytes; const AProvider: ICryptoProvider;
   const AStrengthPolicy: TCertificateStrengthPolicy;
-  const AAdvertised: TArray<UInt16>; out AAlert: TTlsAlertDescription): Boolean;
+  const AAdvertised: TArray<UInt16>;
+  out AValidatedChain: TArray<TBytes>;
+  out AAlert: TTlsAlertDescription): Boolean;
 var
   LOutcome: TLiveRevocationOutcome;
   LRequirePositive: Boolean;
 begin
+  AValidatedChain := nil;
   // live defers a configured Hard to the async park: run effective-Soft inline (no positive-
   // response requirement) so an indeterminate revocation accepts here and the handshake parks;
   // configured Hard cache-only keeps requiring a positive response inline
@@ -985,7 +1093,7 @@ begin
     (AFetch = TSystemTrustFetch.CacheOnly);
   if not EvaluateTrust(AChain, AHostName, AOcspStaple, False,
     APosture <> TRevocationPosture.Off, LRequirePositive, AClock, AProvider,
-    AStrengthPolicy, AAdvertised, LOutcome, AAlert) then
+    AStrengthPolicy, AAdvertised, LOutcome, AValidatedChain, AAlert) then
     Exit(False);
   case LOutcome of
     TLiveRevocationOutcome.Revoked:
@@ -1008,11 +1116,14 @@ class function TAppleTrustApi.EvaluateServerLive(const AChain: TArray<TBytes>;
   const AStrengthPolicy: TCertificateStrengthPolicy;
   const AAdvertised: TArray<UInt16>; out AOutcome: TLiveRevocationOutcome;
   out AAlert: TTlsAlertDescription): Boolean;
+var
+  LValidated: TArray<TBytes>;
 begin
   // network on, revocation network-disabled flag dropped, and always RequirePositiveResponse so an
-  // indeterminate surfaces distinctly; the resolver applies the configured posture and any fallback
+  // indeterminate surfaces distinctly; the resolver applies the configured posture and any fallback.
+  // The validated path is not surfaced from the live resolver (it renders a verdict, not a chain).
   Result := EvaluateTrust(AChain, AHostName, AStaple, True, True, True, AClock, AProvider,
-    AStrengthPolicy, AAdvertised, AOutcome, AAlert);
+    AStrengthPolicy, AAdvertised, AOutcome, LValidated, AAlert);
 end;
 
 class function TAppleTrustApi.EvaluateClientTrust(const AChain, AAnchors: TArray<TBytes>;
@@ -1020,6 +1131,7 @@ class function TAppleTrustApi.EvaluateClientTrust(const AChain, AAnchors: TArray
   const AProvider: ICryptoProvider;
   const AStrengthPolicy: TCertificateStrengthPolicy;
   const AAdvertised: TArray<UInt16>; out AOutcome: TLiveRevocationOutcome;
+  out AValidatedChain: TArray<TBytes>;
   out AAlert: TTlsAlertDescription): Boolean;
 var
   LStatusCode: Int32;
@@ -1035,6 +1147,7 @@ var
 begin
   Result := False;
   AOutcome := TLiveRevocationOutcome.Indeterminate;
+  AValidatedChain := nil;
   AAlert := TTlsAlertDescription.BadCertificate;
 
   if Length(AChain) = 0 then
@@ -1178,8 +1291,10 @@ begin
 
     if FSecTrustEvaluateWithError(LTrust, @LError) then
     begin
-      // trusted: strength policy over the OS-built path; a pass is a definitive Good
-      if not ApplyStrengthPolicy(LTrust, AProvider, AStrengthPolicy, AAdvertised, AAlert) then
+      // trusted: strength policy over the OS-built path; a pass is a definitive Good. The path
+      // is read here (before the finally releases LTrust) and handed back as the validated chain.
+      if not ApplyStrengthPolicy(LTrust, AProvider, AStrengthPolicy, AAdvertised,
+        AValidatedChain, AAlert) then
         Exit;
       AOutcome := TLiveRevocationOutcome.Good;
       Result := True;
@@ -1232,18 +1347,22 @@ class function TAppleTrustApi.EvaluateClientChain(const AChain, AAnchors: TArray
   APosture: TRevocationPosture; AFetch: TSystemTrustFetch; const AClock: ITlsClock;
   const AProvider: ICryptoProvider;
   const AStrengthPolicy: TCertificateStrengthPolicy;
-  const AAdvertised: TArray<UInt16>; out AAlert: TTlsAlertDescription): Boolean;
+  const AAdvertised: TArray<UInt16>;
+  out AValidatedChain: TArray<TBytes>;
+  out AAlert: TTlsAlertDescription): Boolean;
 var
   LOutcome: TLiveRevocationOutcome;
   LRequirePositive: Boolean;
 begin
+  AValidatedChain := nil;
   // live defers a configured Hard to the async park: run effective-Soft inline (no positive-
   // response requirement) so an indeterminate revocation accepts here and the handshake parks;
   // configured Hard cache-only keeps requiring a positive response inline
   LRequirePositive := (APosture = TRevocationPosture.Hard) and
     (AFetch = TSystemTrustFetch.CacheOnly);
   if not EvaluateClientTrust(AChain, AAnchors, False, APosture <> TRevocationPosture.Off,
-    LRequirePositive, AClock, AProvider, AStrengthPolicy, AAdvertised, LOutcome, AAlert) then
+    LRequirePositive, AClock, AProvider, AStrengthPolicy, AAdvertised, LOutcome,
+    AValidatedChain, AAlert) then
     Exit(False);
   case LOutcome of
     TLiveRevocationOutcome.Revoked:
@@ -1265,52 +1384,129 @@ class function TAppleTrustApi.EvaluateClientLive(const AChain, AAnchors: TArray<
   const AStrengthPolicy: TCertificateStrengthPolicy;
   const AAdvertised: TArray<UInt16>; out AOutcome: TLiveRevocationOutcome;
   out AAlert: TTlsAlertDescription): Boolean;
+var
+  LValidated: TArray<TBytes>;
 begin
   // network on, revocation network-disabled flag dropped, and always RequirePositiveResponse so an
-  // indeterminate surfaces distinctly; the resolver applies the configured posture and any fallback
+  // indeterminate surfaces distinctly; the resolver applies the configured posture and any fallback.
+  // The validated path is not surfaced from the live resolver (it renders a verdict, not a chain).
   Result := EvaluateClientTrust(AChain, AAnchors, True, True, True, AClock, AProvider,
-    AStrengthPolicy, AAdvertised, AOutcome, AAlert);
+    AStrengthPolicy, AAdvertised, AOutcome, LValidated, AAlert);
 end;
 
 {$IFDEF TLSLIB_MACOS}
 
-class function TAppleTrustApi.DomainDeniesCertificate(
-  ACertificate: SecCertificateRef; ADomain: SecTrustSettingsDomain): Boolean;
+class function TAppleTrustApi.ClassifyEntry(ADict: Pointer): Int32;
+var
+  LPolicy: SecPolicyRef;
+  LProps: Pointer;
+  LOid: Pointer;
+begin
+  if ADict = nil then
+    Exit(EntryScopeNot);
+  // an entry scoped to a specific application, or to a hostname (policy string), is not a general
+  // server-auth grant or deny for a root (SecTrustSettings.h)
+  if FCFDictionaryGetValue(ADict, FkSecTrustSettingsApplication) <> nil then
+    Exit(EntryScopeNot);
+  if FCFDictionaryGetValue(ADict, FkSecTrustSettingsPolicyString) <> nil then
+    Exit(EntryScopeNot);
+  // no policy key means the entry applies to every policy, SSL included
+  LPolicy := FCFDictionaryGetValue(ADict, FkSecTrustSettingsPolicy);
+  if LPolicy = nil then
+    Exit(EntryScopeApplicable);
+  // a policy is set; without the SSL-scoping symbols the scope is unknown (honour a Deny, not a
+  // Trust) rather than failing the harvest
+  if not FSslScopeReady then
+    Exit(EntryScopeUnknown);
+  LProps := FSecPolicyCopyProperties(LPolicy);
+  if LProps = nil then
+    Exit(EntryScopeUnknown);
+  try
+    LOid := FCFDictionaryGetValue(LProps, FkSecPolicyOid);
+    if LOid = nil then
+      Exit(EntryScopeUnknown);
+    if FCFEqual(LOid, FkSecPolicyAppleSSL) then
+      Result := EntryScopeApplicable
+    else
+      Result := EntryScopeNot; // a non-SSL policy (S/MIME, code signing, ...) does not govern TLS
+  finally
+    FCFRelease(LProps);
+  end;
+end;
+
+class function TAppleTrustApi.DomainVerdict(ACertificate: SecCertificateRef;
+  ADomain: SecTrustSettingsDomain): Int32;
 var
   LSettings: CFArrayRef;
   LStatus: OSStatus;
   LI, LCount: CFIndex;
-  LDict: Pointer;
-  LNum: Pointer;
-  LResult: Int32;
+  LDict, LNum: Pointer;
+  LScope, LResult: Int32;
+  LSawTrust: Boolean;
 begin
-  Result := False;
+  Result := DomainVerdictNoOpinion;
   LSettings := nil;
-  LStatus := FSecTrustSettingsCopyTrustSettings(ACertificate, ADomain,
-    LSettings);
-  // No explicit settings in this domain means "no opinion", not deny.
+  LStatus := FSecTrustSettingsCopyTrustSettings(ACertificate, ADomain, LSettings);
+  // errSecItemNotFound (or any non-success) means no record in this domain: no opinion
   if (LStatus <> ErrSecSuccess) or (LSettings = nil) then
     Exit;
   try
     LCount := FCFArrayGetCount(LSettings);
+    // an empty settings array is an unconditional trust-root grant (SecTrustSettings.h)
+    if LCount = 0 then
+      Exit(DomainVerdictTrust);
+    LSawTrust := False;
     for LI := 0 to LCount - 1 do
     begin
       LDict := FCFArrayGetValueAtIndex(LSettings, LI);
-      if LDict = nil then
+      LScope := ClassifyEntry(LDict);
+      if LScope = EntryScopeNot then
         Continue;
       LNum := FCFDictionaryGetValue(LDict, FkSecTrustSettingsResult);
       if LNum = nil then
-        Continue;
-      LResult := 0;
-      if FCFNumberGetValue(LNum, KCFNumberSInt32Type, @LResult) then
-      begin
-        if LResult = KSecTrustSettingsResultDeny then
-          Exit(True);
-      end;
+        LResult := KSecTrustSettingsResultTrustRoot // an absent result defaults to TrustRoot
+      else if not FCFNumberGetValue(LNum, KCFNumberSInt32Type, @LResult) then
+        LResult := KSecTrustSettingsResultInvalid;
+      // a Deny is honoured whether the scope is applicable OR unknown (unresolved scope resolves
+      // toward less trust); a Trust is granted only when the scope is positively applicable
+      if LResult = KSecTrustSettingsResultDeny then
+        Exit(DomainVerdictDeny);
+      if (LScope = EntryScopeApplicable) and
+        ((LResult = KSecTrustSettingsResultTrustRoot) or
+        (LResult = KSecTrustSettingsResultTrustAsRoot)) then
+        LSawTrust := True;
+      // Unspecified / Invalid: no opinion, keep scanning (a later Deny still wins)
     end;
+    if LSawTrust then
+      Result := DomainVerdictTrust;
   finally
     FCFRelease(LSettings);
   end;
+end;
+
+class function TAppleTrustApi.AdmitsServerAuth(ACertificate: SecCertificateRef;
+  AOriginDomain: SecTrustSettingsDomain): Boolean;
+var
+  LVerdict: Int32;
+begin
+  // without the settings-reading symbols, admit only a built-in System root (an unreadable
+  // User/Admin record must not become an anchor)
+  if not FSettingsReady then
+    Exit(AOriginDomain = KSecTrustSettingsDomainSystem);
+  // User -> Admin -> System: the first domain with a matching entry decides, so a user
+  // "Never Trust" (a User-domain Deny) overrides a built-in System root
+  LVerdict := DomainVerdict(ACertificate, KSecTrustSettingsDomainUser);
+  if LVerdict <> DomainVerdictNoOpinion then
+    Exit(LVerdict = DomainVerdictTrust);
+  LVerdict := DomainVerdict(ACertificate, KSecTrustSettingsDomainAdmin);
+  if LVerdict <> DomainVerdictNoOpinion then
+    Exit(LVerdict = DomainVerdictTrust);
+  LVerdict := DomainVerdict(ACertificate, KSecTrustSettingsDomainSystem);
+  if LVerdict <> DomainVerdictNoOpinion then
+    Exit(LVerdict = DomainVerdictTrust);
+  // no matching entry anywhere: a built-in System root is trusted by default (the safety net that
+  // keeps the OS system roots harvested regardless of their settings shape); a User/Admin cert is not
+  Result := AOriginDomain = KSecTrustSettingsDomainSystem;
 end;
 
 class procedure TAppleTrustApi.HarvestDomain(ADomain: SecTrustSettingsDomain;
@@ -1334,7 +1530,7 @@ begin
       LCert := FCFArrayGetValueAtIndex(LCerts, LI);
       if LCert = nil then
         Continue;
-      if DomainDeniesCertificate(LCert, ADomain) then
+      if not AdmitsServerAuth(LCert, ADomain) then
         Continue;
       LDer := CopyCertificateDer(LCert);
       if Length(LDer) > 0 then
@@ -1350,13 +1546,22 @@ var
   LList: TList<TBytes>;
 begin
   Result := nil;
-  if not FReady then
+  // tier 0: without the enumeration symbols the harvest cannot run; TSystemRootSource.Harvest
+  // then raises on the empty result (fail closed)
+  if (not FReady) or (not FHarvestReady) then
     Exit;
   LList := TList<TBytes>.Create;
   try
+    // System first so a built-in root is harvested with its origin; a User/Admin "Never Trust"
+    // still excludes it because AdmitsServerAuth consults every domain regardless of origin.
     HarvestDomain(KSecTrustSettingsDomainSystem, LList);
-    HarvestDomain(KSecTrustSettingsDomainAdmin, LList);
-    HarvestDomain(KSecTrustSettingsDomainUser, LList);
+    // Admin/User records contribute (and can override) only when settings are readable; without
+    // that the System roots alone are harvested rather than admitting unreadable custom records.
+    if FSettingsReady then
+    begin
+      HarvestDomain(KSecTrustSettingsDomainAdmin, LList);
+      HarvestDomain(KSecTrustSettingsDomainUser, LList);
+    end;
     Result := LList.ToArray;
   finally
     LList.Free;
@@ -1407,10 +1612,12 @@ end;
 
 function TAppleDelegateVerifier.VerifyServerCertificate(const AChain: TArray<TBytes>;
   const AServerName: TServerName; const AOcspStaple: TBytes;
+  out AValidatedChain: TArray<TBytes>;
   out AAlert: TTlsAlertDescription): Boolean;
 begin
   Result := TAppleTrustApi.EvaluateSslChain(AChain, AServerName.ToString, FPosture,
-    FFetch, FClock, AOcspStaple, FProvider, FStrengthPolicy, FAdvertised, AAlert);
+    FFetch, FClock, AOcspStaple, FProvider, FStrengthPolicy, FAdvertised,
+    AValidatedChain, AAlert);
 end;
 
 { TAppleLiveRevocationResolver }
@@ -1500,10 +1707,11 @@ begin
 end;
 
 function TAppleClientDelegateVerifier.VerifyClientCertificate(
-  const AChain: TArray<TBytes>; out AAlert: TTlsAlertDescription): Boolean;
+  const AChain: TArray<TBytes>; out AValidatedChain: TArray<TBytes>;
+  out AAlert: TTlsAlertDescription): Boolean;
 begin
   Result := TAppleTrustApi.EvaluateClientChain(AChain, FAnchors, FPosture, FFetch,
-    FClock, FProvider, FStrengthPolicy, FAdvertised, AAlert);
+    FClock, FProvider, FStrengthPolicy, FAdvertised, AValidatedChain, AAlert);
 end;
 
 { TAppleClientVerifierSource }
