@@ -1,6 +1,6 @@
 # Keep the test vectors out of `git archive` source exports.
-/TlsLib.Tests/Data/** export-ignore
-/TlsLib.Tests/Data export-ignore
+#/TlsLib.Tests/Data/** export-ignore
+#/TlsLib.Tests/Data export-ignore
 
 # Pascal sources are CRLF everywhere (house convention), independent of any
 # contributor's core.autocrlf setting, so the working tree stops showing
