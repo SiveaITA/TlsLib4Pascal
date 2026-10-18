@@ -52,10 +52,14 @@ uses
   TlpINegotiation,
   TlpCipherSuiteRegistry,
   TlpICryptoProvider,
+  TlpIPkixProvider,
+  TlpDefaultPkixProvider,
   TlpDefaultCryptoProvider,
   TlpITlsConfig,
   TlpITlsConfigBuilder,
+  TlpCertificateVerifierSource,
   TlpTlsPresets,
+  TlpTlsCredential,
   TlsLibIndyTls;
 
 const
@@ -67,6 +71,7 @@ var
   GVector: string;
   GLeafDer, GKeyDer, GRootDer: TBytes;
   GProvider: ICryptoProvider;
+  GPkix: IPkixProvider;
 
 function LocateVector: string;
 const
@@ -114,30 +119,31 @@ end;
 // so this controls the client's advertised preference
 function OrderedRegistry(const ACodes: array of UInt16): ICipherSuiteRegistry;
 var
-  LAll, LReg: ICipherSuiteRegistry;
+  LAll: ICipherSuiteRegistry;
+  LReg: ICipherSuiteRegistryBuilder;
   LSuite: TTlsCipherSuite;
   LI: Integer;
 begin
   LAll := TCipherSuiteRegistry.CreateDualVersion(GProvider);
-  LReg := TCipherSuiteRegistry.Create;
+  LReg := TCipherSuiteRegistryBuilder.Create as ICipherSuiteRegistryBuilder;
   for LI := System.Low(ACodes) to System.High(ACodes) do
     if LAll.TryGet(ACodes[LI], LSuite) then
       LReg.Add(LSuite);
-  Result := LReg;
+  Result := LReg.Build;
 end;
 
 function BuildServerConfig(APreference: TServerCipherPreference): ITlsServerConfig;
 var
   LServer: ITlsServerConfigBuilder;
 begin
-  LServer := TTlsPresets.Compatible(GProvider).Server;
+  LServer := TTlsPresets.Compatible(GProvider, GPkix).Server;
   LServer.WithSupportedVersions(TArray<UInt16>.Create(TlsWireVersionTls13));
   LServer.WithPreferredGroups(TArray<UInt16>.Create(TNamedGroupCatalog.X25519));
   // the server offers both AES suites; its selection strategy is the knob under test
   LServer.WithCipherSuites(OrderedRegistry([TCipherSuites13.Aes128GcmSha256,
     TCipherSuites13.Aes256GcmSha384]));
   LServer.WithCipherSuitePreference(APreference);
-  LServer.WithCredential(GLeafDer, GKeyDer);
+  LServer.WithCredential(TTlsCredential.Load(GProvider, GPkix, GLeafDer, GKeyDer));
   Result := LServer.Build;
 end;
 
@@ -145,11 +151,11 @@ function BuildClientConfig(const AClientOrder: array of UInt16): ITlsClientConfi
 var
   LClient: ITlsClientConfigBuilder;
 begin
-  LClient := TTlsPresets.Compatible(GProvider).Client;
+  LClient := TTlsPresets.Compatible(GProvider, GPkix).Client;
   LClient.WithSupportedVersions(TArray<UInt16>.Create(TlsWireVersionTls13));
   LClient.WithPreferredGroups(TArray<UInt16>.Create(TNamedGroupCatalog.X25519));
   LClient.WithCipherSuites(OrderedRegistry(AClientOrder)); // the client's advertised order
-  LClient.WithTrustAnchors(GRootDer);
+  LClient.WithServerVerification(TServerVerification.WebPki(GRootDer).Build);
   Result := LClient.Build;
 end;
 
@@ -228,6 +234,7 @@ begin
   GKeyDer := FieldDer('leaf_key');
   GRootDer := FieldDer('root_cert');
   GProvider := TDefaultCryptoProvider.Create as ICryptoProvider;
+  GPkix := TDefaultPkixProvider.Create as IPkixProvider;
   try
     // ClientOrder: the server honors the client's advertised order, so the client's first suite wins
     LClientPref256 := Negotiate(TServerCipherPreference.ClientOrder,

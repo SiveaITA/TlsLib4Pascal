@@ -29,7 +29,8 @@ uses
 
 type
   /// <summary>
-  /// The app-driven, immutable server ECH key store (RFC 9849 sec. 4.5): a fixed set of
+  /// The app-driven, immutable server ECH key store (RFC 9849 sec. 4.1 for the config identifiers;
+  /// rotation guidance is sec. 8.1 / 10.10.5): a fixed set of
   /// config/private-key entries and the retry_configs to advertise on reject. The operator
   /// owns the key set and rotates by building and swapping in a new store (never auto-rotated).
   /// Build one from an RFC 9934 PEM or from an explicit config plus private key.
@@ -49,15 +50,15 @@ type
       const AConfig: TEchConfig): Boolean; static;
     /// <summary>Parses an RFC 9934 ECH PEM (a PKCS#8 PRIVATE KEY block and an ECHCONFIG
     /// block holding an ECHConfigList) into one entry per config, importing the private
-    /// key for each config's KEM through AProvider. Malformed input raises.</summary>
+    /// key for each config's KEM through ACryptoProvider. Malformed input raises.</summary>
     class function EntriesFromPem(const APem: TBytes;
-      const AProvider: ICryptoProvider; AIsRetry: Boolean): TArray<TEchKeyEntry>; static;
+      const ACryptoProvider: ICryptoProvider; AIsRetry: Boolean): TArray<TEchKeyEntry>; static;
     /// <summary>Builds one entry from a config and its prepared HPKE recipient key.</summary>
     class function Entry(const AConfig: TEchConfig;
       const ARecipientKey: IHpkeRecipientKey; AIsRetry: Boolean): TEchKeyEntry; static;
   public
     /// <summary>An immutable store over a fixed set of entries. Rotate keys by building and
-    /// swapping in a new store (RFC 9849 sec. 4.5); the operator owns the key set.</summary>
+    /// swapping in a new store (RFC 9849 sec. 8.1); the operator owns the key set.</summary>
     constructor Create(const AEntries: TArray<TEchKeyEntry>);
     function Entries: TArray<TEchKeyEntry>;
     function RetryConfigs: TBytes;
@@ -65,10 +66,10 @@ type
     /// <summary>
     /// A store built from an RFC 9934 ECH PEM: every config becomes a key the server
     /// decrypts with and advertises as retry_configs. No per-entry expiry (rotate by
-    /// swapping the store); for expiry, build TEchKeyEntry values and use the constructor.
+    /// swapping the store).
     /// </summary>
     class function FromPem(const APem: TBytes;
-      const AProvider: ICryptoProvider): IEchServerKeyStore; static;
+      const ACryptoProvider: ICryptoProvider): IEchServerKeyStore; static;
     /// <summary>
     /// A store built from an explicit ECHConfigList and its HPKE private key (the non-PEM
     /// path): every config becomes a key and a retry_config. No per-entry expiry. Raises if the
@@ -76,7 +77,7 @@ type
     /// </summary>
     class function FromConfig(const AEchConfigList: TBytes;
       const APrivateKey: ISecretBuffer;
-      const AProvider: ICryptoProvider): IEchServerKeyStore; static;
+      const ACryptoProvider: ICryptoProvider): IEchServerKeyStore; static;
   end;
 
 implementation
@@ -89,6 +90,8 @@ resourcestring
     'could never advertise retry_configs on a reject (RFC 9849 sec. 7.1)';
   SEchEntryInvalid = 'an ECH key store entry has a nil private key, an unsupported config ' +
     'version, or no raw config bytes';
+  SEchEntryUnservable = 'an ECH key store entry holds a config no client could use: it needs a ' +
+    'valid public_name, at least one cipher suite, no mandatory extension and no duplicate extension';
   SEchNoUsableSuite = 'an ECH config offers no HPKE suite this provider can instantiate';
   SEchNoServableConfig = 'the ECHConfigList holds no config of a version this library serves';
 
@@ -103,10 +106,19 @@ begin
   // share one gate: a nil key would fault mid-handshake, a foreign version or empty raw config
   // would silently reject every ECH offer
   for LI := 0 to System.High(AEntries) do
+  begin
     if (AEntries[LI].RecipientKey = nil) or
       (AEntries[LI].Config.Version <> TEchConfig.SupportedVersion) or
       (System.Length(AEntries[LI].Config.Raw) = 0) then
       raise EArgumentTlsLibException.CreateRes(@SEchEntryInvalid);
+    // a config no client could use (an unusable public_name, no cipher suite, an unsupported
+    // mandatory extension or a duplicated extension) would be advertised and then skipped by all
+    if not AEntries[LI].Config.IsServable then
+      raise EArgumentTlsLibException.CreateRes(@SEchEntryUnservable);
+    // the key must match its config, or it would fault mid-handshake keyed by config_id
+    if not KeyMatchesConfig(AEntries[LI].RecipientKey, AEntries[LI].Config) then
+      raise EArgumentTlsLibException.CreateRes(@SEchKeyMismatch);
+  end;
   FEntries := System.Copy(AEntries);
   // the store is immutable, so the retry_configs list is fixed for its lifetime: encode once
   FRetryConfigs := ComputeRetryConfigs(FEntries);
@@ -173,7 +185,7 @@ begin
 end;
 
 class function TInMemoryEchKeyStore.EntriesFromPem(const APem: TBytes;
-  const AProvider: ICryptoProvider; AIsRetry: Boolean): TArray<TEchKeyEntry>;
+  const ACryptoProvider: ICryptoProvider; AIsRetry: Boolean): TArray<TEchKeyEntry>;
 var
   LBlocks: TArray<TPemBlock>;
   LPkcs8, LConfigListBytes: TBytes;
@@ -198,14 +210,11 @@ begin
         Continue;
       // a current-version config the server cannot serve (export-only or unknown suite/KEM) is a
       // misconfiguration: it would be advertised as retry_configs yet reject every offer
-      if not LConfigs[LI].TrySelectSuite(AProvider, LSuite) then
+      if not LConfigs[LI].TrySelectSuite(ACryptoProvider, LSuite) then
         raise EArgumentTlsLibException.CreateRes(@SEchNoUsableSuite);
-      LRecipient := AProvider.Hpke.ImportRecipientKey(LConfigs[LI].KemId,
-        AProvider.Hpke.ImportPrivateKey(LConfigs[LI].KemId, LPkcs8));
-      // fail at load if the PEM pairs a private key with a config whose public key it does not
-      // match - otherwise every ECH handshake would silently reject with no diagnosable cause
-      if not KeyMatchesConfig(LRecipient, LConfigs[LI]) then
-        raise EArgumentTlsLibException.CreateRes(@SEchKeyMismatch);
+      LRecipient := ACryptoProvider.Hpke.ImportRecipientKey(LConfigs[LI].KemId,
+        ACryptoProvider.Hpke.ImportPrivateKey(LConfigs[LI].KemId, LPkcs8));
+      // key/config match is enforced in the ctor
       Result[LCount] := Entry(LConfigs[LI], LRecipient, AIsRetry);
       Inc(LCount);
     end;
@@ -219,15 +228,15 @@ begin
 end;
 
 class function TInMemoryEchKeyStore.FromPem(const APem: TBytes;
-  const AProvider: ICryptoProvider): IEchServerKeyStore;
+  const ACryptoProvider: ICryptoProvider): IEchServerKeyStore;
 begin
-  Result := TInMemoryEchKeyStore.Create(EntriesFromPem(APem, AProvider, True))
+  Result := TInMemoryEchKeyStore.Create(EntriesFromPem(APem, ACryptoProvider, True))
     as IEchServerKeyStore;
 end;
 
 class function TInMemoryEchKeyStore.FromConfig(const AEchConfigList: TBytes;
   const APrivateKey: ISecretBuffer;
-  const AProvider: ICryptoProvider): IEchServerKeyStore;
+  const ACryptoProvider: ICryptoProvider): IEchServerKeyStore;
 var
   LConfigs: TArray<TEchConfig>;
   LEntries: TArray<TEchKeyEntry>;
@@ -244,13 +253,10 @@ begin
     if LConfigs[LI].Version <> TEchConfig.SupportedVersion then
       Continue;
     // a current-version config with no provider-usable suite could never serve an offer
-    if not LConfigs[LI].TrySelectSuite(AProvider, LSuite) then
+    if not LConfigs[LI].TrySelectSuite(ACryptoProvider, LSuite) then
       raise EArgumentTlsLibException.CreateRes(@SEchNoUsableSuite);
-    LRecipient := AProvider.Hpke.ImportRecipientKey(LConfigs[LI].KemId, APrivateKey);
-    // reject a private key that does not match the config's public key - the same undiagnosable
-    // silent-reject the PEM path guards against
-    if not KeyMatchesConfig(LRecipient, LConfigs[LI]) then
-      raise EArgumentTlsLibException.CreateRes(@SEchKeyMismatch);
+    LRecipient := ACryptoProvider.Hpke.ImportRecipientKey(LConfigs[LI].KemId, APrivateKey);
+    // key/config match is enforced in the ctor
     LEntries[LCount] := Entry(LConfigs[LI], LRecipient, True);
     Inc(LCount);
   end;

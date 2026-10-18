@@ -18,6 +18,7 @@ interface
 uses
   SysUtils,
   TlpCryptoDomainTypes,
+  TlpTlsLibExceptions,
   TlpISecretBuffer,
   TlpICryptoProvider,
   TlpHkdfLabel,
@@ -33,45 +34,100 @@ type
   /// identity/context into the wire pre_shared_key identity and derived key, bound to a
   /// target KDF hash and target protocol. A single external PSK yields one imported PSK
   /// per target hash; the resulting <see cref="IPreSharedKey" /> carries the imported
-  /// identity (5.1), the derived key (ipskx, 4.1) and the target hash, and uses the
+  /// identity (5.1), the derived key (ipskx, 5.1) and the target hash, and uses the
   /// "imp binder" label. The derivation is keyed on the PSK's provisioned hash while the
   /// target hash sets only the imported KDF id, the output length and the bound hash,
   /// so a single provisioned key imports for every supported KDF.
   /// </summary>
   TExternalPskImporter = class sealed(TObject)
   strict private
-    /// <summary>The RFC 8446 / IANA KDF id for a hash: HKDF-SHA256 = 1, HKDF-SHA384 = 2.</summary>
+  const
+    /// <summary>The KDF hashes a PSK is imported for, so whichever the negotiated cipher's
+    /// hash needs is on offer (RFC 9258): a SHA-256 and a SHA-384 variant.</summary>
+    SupportedKdfHashes: array [0 .. 1] of THashAlgorithm =
+      (THashAlgorithm.SHA_256, THashAlgorithm.SHA_384);
+  strict private
+    /// <summary>The RFC 9258 (IANA TLS KDF Identifiers, sec. 10) id for a hash: HKDF-SHA256 = 1,
+    /// HKDF-SHA384 = 2.</summary>
     class function KdfId(AHash: THashAlgorithm): UInt16; static;
+    /// <summary>The output length in bytes of a supported KDF hash; a table, as the builder holds no
+    /// crypto provider to ask.</summary>
+    class function DigestLength(AHash: THashAlgorithm): Int32; static;
   public
+    /// <summary>The byte length of the pre_shared_key extension body that offers ASpecs for
+    /// ATargetProtocol once per supported KDF hash: both vectors, with each identity's obfuscated age
+    /// and each binder's length byte (RFC 9846 4.3.11). The identities are measured through the encoder.</summary>
+    class function OfferedExtensionLength(const ASpecs: TArray<TExternalPsk>;
+      ATargetProtocol: UInt16): Int64; static;
     /// <summary>The serialized ImportedIdentity (RFC 9258 5.1): the external identity and
     /// context as uint16-length-prefixed opaques, then the target protocol and KDF id.</summary>
     class function ImportedIdentity(const AExternalIdentity, AContext: TBytes;
       ATargetProtocol, ATargetKdf: UInt16): TBytes; static;
+    /// <summary>The external_identity at the head of a serialized ImportedIdentity, as configured
+    /// before the import; an input that is not a well-formed ImportedIdentity is returned as is.</summary>
+    class function ExternalIdentity(const AImportedIdentity: TBytes): TBytes; static;
     /// <summary>Imports ASpec for ATargetProtocol and ATargetHash into a wire PSK.</summary>
-    class function Import(const AProvider: ICryptoProvider; const ASpec: TExternalPsk;
+    class function Import(const ACryptoProvider: ICryptoProvider; const ASpec: TExternalPsk;
       ATargetProtocol: UInt16; ATargetHash: THashAlgorithm): IPreSharedKey; static;
+    /// <summary>Imports every spec once per supported KDF hash for ATargetProtocol, preserving
+    /// spec order with each spec's per-hash variants adjacent (RFC 9258). Empty for no specs.</summary>
+    class function ImportAll(const ACryptoProvider: ICryptoProvider;
+      const ASpecs: TArray<TExternalPsk>; ATargetProtocol: UInt16)
+      : TArray<IPreSharedKey>; static;
   end;
 
 implementation
 
+resourcestring
+  SUnsupportedImporterKdf =
+    'the external PSK importer supports only HKDF-SHA256 and HKDF-SHA384 (RFC 9258)';
+  SEmptyExternalPskIdentity =
+    'the external PSK identity must not be empty (RFC 9258 external_identity<1..2^16-1>)';
+
 const
   KdfHkdfSha256 = UInt16($0001);
   KdfHkdfSha384 = UInt16($0002);
-  KdfHkdfSha512 = UInt16($0003);
   DerivedPskLabel = 'derived psk';
 
 { TExternalPskImporter }
 
 class function TExternalPskImporter.KdfId(AHash: THashAlgorithm): UInt16;
 begin
+  // RFC 9258 10: only HKDF-SHA256 (0x0001) and HKDF-SHA384 (0x0002) are registered KDF ids
   case AHash of
+    THashAlgorithm.SHA_256:
+      Result := KdfHkdfSha256;
     THashAlgorithm.SHA_384:
       Result := KdfHkdfSha384;
-    THashAlgorithm.SHA_512:
-      Result := KdfHkdfSha512;
   else
-    Result := KdfHkdfSha256;
+    raise EArgumentTlsLibException.CreateRes(@SUnsupportedImporterKdf);
   end;
+end;
+
+class function TExternalPskImporter.DigestLength(AHash: THashAlgorithm): Int32;
+begin
+  case AHash of
+    THashAlgorithm.SHA_256:
+      Result := 32;
+    THashAlgorithm.SHA_384:
+      Result := 48;
+  else
+    raise EArgumentTlsLibException.CreateRes(@SUnsupportedImporterKdf);
+  end;
+end;
+
+class function TExternalPskImporter.OfferedExtensionLength(
+  const ASpecs: TArray<TExternalPsk>; ATargetProtocol: UInt16): Int64;
+var
+  LSpec, LHash: Int32;
+begin
+  // two vector lengths, then per variant a PskIdentity (length, identity, age) and a binder
+  Result := 2 + 2;
+  for LSpec := 0 to System.High(ASpecs) do
+    for LHash := 0 to System.High(SupportedKdfHashes) do
+      Result := Result + 2 + System.Length(ImportedIdentity(ASpecs[LSpec].Identity,
+        ASpecs[LSpec].Context, ATargetProtocol, KdfId(SupportedKdfHashes[LHash]))) + 4 + 1 +
+        DigestLength(SupportedKdfHashes[LHash]);
 end;
 
 class function TExternalPskImporter.ImportedIdentity(const AExternalIdentity,
@@ -92,7 +148,21 @@ begin
   Result := LWriter.ToBytes;
 end;
 
-class function TExternalPskImporter.Import(const AProvider: ICryptoProvider;
+class function TExternalPskImporter.ExternalIdentity(const AImportedIdentity: TBytes): TBytes;
+var
+  LLength: Int32;
+begin
+  Result := System.Copy(AImportedIdentity);
+  if System.Length(AImportedIdentity) < 2 then
+    Exit;
+  LLength := (Int32(AImportedIdentity[0]) shl 8) or Int32(AImportedIdentity[1]);
+  // the struct also holds the context, protocol and KDF id after the identity (RFC 9258 5.1)
+  if System.Length(AImportedIdentity) < 2 + LLength + 6 then
+    Exit;
+  Result := System.Copy(AImportedIdentity, 2, LLength);
+end;
+
+class function TExternalPskImporter.Import(const ACryptoProvider: ICryptoProvider;
   const ASpec: TExternalPsk; ATargetProtocol: UInt16;
   ATargetHash: THashAlgorithm): IPreSharedKey;
 var
@@ -102,6 +172,9 @@ var
   LEpsk, LIpsk: ISecretBuffer;
   LOutLen: Int32;
 begin
+  // RFC 9258 5.1: external_identity is opaque<1..2^16-1>, so a zero-length identity is invalid
+  if System.Length(ASpec.Identity) = 0 then
+    raise EArgumentTlsLibException.CreateRes(@SEmptyExternalPskIdentity);
   // RFC 9258 5.1: the imported identity binds the external identity, context, target
   // protocol and target KDF, so the same secret under a different context/KDF/protocol
   // yields a distinct wire identity that will not match.
@@ -109,20 +182,36 @@ begin
     KdfId(ATargetHash));
 
   // the derivation is keyed on the provisioned hash (ASpec.Hash); only the output length
-  // follows the target hash (RFC 9258 4.1)
-  LHash := AProvider.Primitives.CreateHash(ASpec.Hash);
+  // follows the target hash (RFC 9258 5.1)
+  LHash := ACryptoProvider.Primitives.CreateHash(ASpec.Hash);
   LHash.Update(LIdentity, 0, System.Length(LIdentity));
   LIdentityHash := LHash.DoFinal;
 
-  LHkdf := AProvider.Primitives.CreateHkdf(ASpec.Hash);
+  LHkdf := ACryptoProvider.Primitives.CreateHkdf(ASpec.Hash);
   // epskx = HKDF-Extract(0, epsk): an empty salt is HashLen zeros
   LEpsk := LHkdf.Extract(nil, ASpec.Secret);
-  LOutLen := AProvider.Primitives.CreateHash(ATargetHash).HashSize;
+  LOutLen := ACryptoProvider.Primitives.CreateHash(ATargetHash).HashSize;
   // ipskx = HKDF-Expand-Label(epskx, "derived psk", Hash(ImportedIdentity), L)
   LIpsk := THkdfLabel.HkdfExpandLabel(LHkdf, LEpsk, DerivedPskLabel, LIdentityHash,
     LOutLen);
 
   Result := TPreSharedKey.CreateImported(LIdentity, LIpsk, ATargetHash);
+end;
+
+class function TExternalPskImporter.ImportAll(const ACryptoProvider: ICryptoProvider;
+  const ASpecs: TArray<TExternalPsk>; ATargetProtocol: UInt16): TArray<IPreSharedKey>;
+var
+  LSpecIdx, LHashIdx, LOut: Int32;
+begin
+  System.SetLength(Result, System.Length(ASpecs) * System.Length(SupportedKdfHashes));
+  LOut := 0;
+  for LSpecIdx := 0 to System.High(ASpecs) do
+    for LHashIdx := 0 to System.High(SupportedKdfHashes) do
+    begin
+      Result[LOut] := Import(ACryptoProvider, ASpecs[LSpecIdx], ATargetProtocol,
+        SupportedKdfHashes[LHashIdx]);
+      System.Inc(LOut);
+    end;
 end;
 
 end.

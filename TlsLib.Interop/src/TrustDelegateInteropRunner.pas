@@ -26,17 +26,21 @@ uses
   TlpTlsAlert,
   TlpIClock,
   TlpICryptoProvider,
+  TlpIPkixProvider,
   TlpITlsEngine,
   TlpITlsConfigBuilder,
+  TlpCertificateVerifierSource,
   TlpTlsPresets,
   TlpTlsEngineFactory,
   TlpITlsConfig,
+  TlpITrustAnchorStore,
   TlpSystemTrustFacade,
   TlpSystemTrustBase,
   TlpOSLiveRevocation,
   TlpOSSystemTrust,
   InteropSocket,
   InteropEngine,
+  TlsLibTestProviders,
   InteropCredentials,
   InteropPump,
   InteropUtils;
@@ -45,12 +49,20 @@ type
   /// <summary>The one native-trust cell to run, parsed from the command line.</summary>
   TTrustCell = record
     TlsVersion: UInt16;
+    // the OS trust engine decides (os-delegate); Anchors instead feeds the OS root set, and its
+    // distrust set, into our own verifier (os-anchors)
     Delegate: Boolean;
+    Anchors: Boolean;
     Live: Boolean;
     // server-mode (mTLS): our server verifies the peer CLIENT certificate live through the OS
     // delegate, and a client presenter offers the certificate
     IsServer: Boolean;
     RootFile: string;
+    // os-delegate / os-anchors only: a root trusted beside the OS roots
+    HostRootFile: string;
+    // client only: dial this dotted-IPv4 peer instead of the in-process server (--connect ip:port)
+    ConnectHost: string;
+    ConnectPort: Word;
     ServerCertFile: string;
     ServerKeyFile: string;
     StapleFile: string;
@@ -72,8 +84,9 @@ type
   /// <summary>
   /// Runs one native-trust cell over a loopback: our server presents a supplied certificate
   /// chain (optionally stapling an OCSP response) and our client verifies it either through the
-  /// portable PKIX verifier (a fixed root file) or through the OS trust delegate against the
-  /// real machine store. The client asserts a clean handshake or an abort with a given alert,
+  /// portable PKIX verifier (a fixed root file), through the OS trust delegate against the
+  /// real machine store, or through our own verifier over the OS root set and its distrust set
+  /// (os-anchors). The client asserts a clean handshake or an abort with a given alert,
   /// with a settable revocation posture, injected clock (expired-at-verify-time) and expected
   /// hostname. The CI runner brackets the delegate accept path with a machine-store install.
   /// </summary>
@@ -84,8 +97,8 @@ type
     class function ParsePosture(const ASpec: string): TRevocationPosture; static;
     /// <summary>Parses --expect accept | reject | reject:&lt;alertnum&gt; into ACell.</summary>
     class procedure ParseExpect(const ASpec: string; var ACell: TTrustCell); static;
-    class function BuildClientConfig(const AProvider: ICryptoProvider;
-      const ACell: TTrustCell): ITlsClientConfig; static;
+    class function BuildClientConfig(const ACryptoProvider: ICryptoProvider;
+      const APkix: IPkixProvider; const ACell: TTrustCell): ITlsClientConfig; static;
     /// <summary>Maps a handshake outcome to '' (matched --expect) or a failure message. Shared by
     /// the client-verifies-server and server-verifies-client paths.</summary>
     class function MapOutcome(const ACell: TTrustCell;
@@ -93,9 +106,11 @@ type
     /// <summary>The server config for the mTLS cell: an OS client delegate (Live) over ACaFile as the
     /// exclusive client-CA anchor. Built here (not via InteropEngine) so the frozen ITlsServerConfig
     /// is kept for both the engine and the live resolver.</summary>
-    class function BuildServerConfig(const AProvider: ICryptoProvider;
-      const ACell: TTrustCell; const ACaFile: string): ITlsServerConfig; static;
-    class function RunClient(APort: Word; const ACell: TTrustCell): string; static;
+    class function BuildServerConfig(const ACryptoProvider: ICryptoProvider;
+      const APkix: IPkixProvider; const ACell: TTrustCell;
+      const ACaFile: string): ITlsServerConfig; static;
+    class function RunClient(const AHost: string; APort: Word;
+      const ACell: TTrustCell): string; static;
     class function RunCell(const ACell: TTrustCell): string; static;
     class function RunServer(const ACell: TTrustCell): string; static;
   public
@@ -174,7 +189,8 @@ end;
 procedure TTrustServerThread.Execute;
 var
   LSocket: TInteropSocket;
-  LProvider: ICryptoProvider;
+  LCrypto: ICryptoProvider;
+  LPkix: IPkixProvider;
   LOptions: TInteropEngineOptions;
   LEngine: ITlsEngine;
   LResult: TInteropResult;
@@ -183,16 +199,17 @@ begin
   LSocket := nil;
   try
     LSocket := FListener.Accept;
-    LProvider := TInteropEngine.DefaultProvider;
+    LCrypto := TTlsLibTestProviders.Crypto;
+    LPkix := TTlsLibTestProviders.Pkix;
     LOptions := Default(TInteropEngineOptions);
     LOptions.Role := TInteropRole.Server;
     LOptions.SupportedVersions := TArray<UInt16>.Create(FCell.TlsVersion);
     LOptions.HasCredential := True;
-    LOptions.Credential := TInteropCredentials.ServerCredentialFromPem(LProvider,
+    LOptions.Credential := TInteropCredentials.ServerCredentialFromPem(LCrypto, LPkix,
       FCell.ServerCertFile, FCell.ServerKeyFile);
     if FCell.StapleFile <> '' then
       LOptions.OcspStaple := TInteropUtils.ReadAllBytes(FCell.StapleFile);
-    LEngine := TInteropEngine.Build(LProvider, LOptions);
+    LEngine := TInteropEngine.Build(LCrypto, LOptions);
 
     LResult := TInteropPump.DriveHandshake(LEngine, LSocket);
     // a client that rejects the chain aborts the handshake (the reject cells); only an accept
@@ -227,7 +244,8 @@ end;
 
 procedure TClientPresenterThread.Execute;
 var
-  LProvider: ICryptoProvider;
+  LCrypto: ICryptoProvider;
+  LPkix: IPkixProvider;
   LBuilder: ITlsConfigBuilder;
   LClient: ITlsClientConfigBuilder;
   LConfig: ITlsClientConfig;
@@ -237,14 +255,16 @@ var
 begin
   FError := '';
   try
-    LProvider := TInteropEngine.DefaultProvider;
-    LBuilder := TTlsPresets.Compatible(LProvider);
+    LCrypto := TTlsLibTestProviders.Crypto;
+    LPkix := TTlsLibTestProviders.Pkix;
+    LBuilder := TTlsPresets.Compatible(LCrypto, LPkix);
     LClient := LBuilder.Client;
     LClient.WithSupportedVersions(TArray<UInt16>.Create(FCell.TlsVersion));
     // trust the server's own certificate (portable, cache-only - this side is not under test)
-    LClient.WithTrustStore(TInteropCredentials.TrustFromPem(LProvider, FCell.RootFile));
+    LClient.WithServerVerification(TServerVerification.WebPki(
+      TInteropCredentials.TrustFromPem(LPkix, FCell.RootFile)).Build);
     // offer the client certificate the server verifies (leaf-only: the CA is the server's anchor)
-    LClient.WithCredential(TInteropCredentials.ServerCredentialFromPem(LProvider,
+    LClient.WithCredential(TInteropCredentials.ServerCredentialFromPem(LCrypto, LPkix,
       FCell.ClientCertFile, FCell.ClientKeyFile));
     LConfig := LClient.Build;
     LEngine := TTlsEngineFactory.CreateClientEngine(LConfig, FCell.ExpectName);
@@ -312,43 +332,58 @@ begin
   ACell.ExpectAccept := SameText(ASpec, 'accept');
   ACell.HasExpectAlert := False;
   ACell.ExpectAlert := -1;
-  if ACell.ExpectAccept then
+  if ACell.ExpectAccept or SameText(ASpec, 'reject') then
     Exit;
   LColon := Pos(':', ASpec);
-  if LColon > 0 then
+  if (LColon > 0) and SameText(Copy(ASpec, 1, LColon - 1), 'reject') then
   begin
-    ACell.HasExpectAlert := True;
     ACell.ExpectAlert := StrToIntDef(Copy(ASpec, LColon + 1, MaxInt), -1);
+    if (ACell.ExpectAlert >= 0) and (ACell.ExpectAlert <= 255) then
+    begin
+      ACell.HasExpectAlert := True;
+      Exit;
+    end;
   end;
+  raise Exception.Create('--expect takes accept, reject or reject:<alert>, got ''' + ASpec + '''');
 end;
 
 class function TTrustDelegateInteropRunner.BuildClientConfig(
-  const AProvider: ICryptoProvider; const ACell: TTrustCell): ITlsClientConfig;
+  const ACryptoProvider: ICryptoProvider; const APkix: IPkixProvider;
+  const ACell: TTrustCell): ITlsClientConfig;
 const
-  // the async park deadline for the live cells; the OS fetch over loopback settles well within it
+  // the resolver fetch budget for the live cells; the OS fetch over loopback settles well within it
   LiveDeadlineMs = Cardinal(10000);
 var
   LBuilder: ITlsConfigBuilder;
   LClient: ITlsClientConfigBuilder;
+  LHostRoots: ITrustAnchorStore;
 begin
-  LBuilder := TTlsPresets.Compatible(AProvider);
+  LHostRoots := nil;
+  if ACell.HostRootFile <> '' then
+    LHostRoots := TInteropCredentials.TrustFromPem(APkix, ACell.HostRootFile);
+  LBuilder := TTlsPresets.Compatible(ACryptoProvider, APkix);
   LClient := LBuilder.Client;
   LClient.WithSupportedVersions(TArray<UInt16>.Create(ACell.TlsVersion));
   LClient.WithOcspStaplingRequest(True);
-  LClient.WithRevocation(ACell.Posture);
   if ACell.UseClock then
     LClient.WithClock(TFixedClock.Create(ACell.NowMs) as ITlsClock);
-  if ACell.Delegate then
+  if ACell.Anchors then
+    // the OS root set and its distrust set, harvested into our own verifier
+    LClient.WithServerVerification(TSystemTrust.ServerVerification(APkix,
+      TSystemTrustMode.Anchors, LHostRoots).WithRevocation(ACell.Posture).Build)
+  else if ACell.Delegate then
   begin
     // verify the server certificate through the OS trust engine against the real machine store;
     // live arms the async park the OS-native resolver decides in
     if ACell.Live then
-      TSystemTrust.WithSystemTrust(LClient, AProvider, TSystemTrustFetch.Live, LiveDeadlineMs)
+      TSystemTrust.WithLiveSystemTrust(LClient, ACell.Posture, LiveDeadlineMs)
     else
-      TSystemTrust.WithSystemTrust(LClient, AProvider, TSystemTrustMode.Delegate);
+      LClient.WithServerVerification(TSystemTrust.ServerVerification(APkix,
+        TSystemTrustMode.Delegate, LHostRoots).WithRevocation(ACell.Posture).Build);
   end
   else
-    LClient.WithTrustStore(TInteropCredentials.TrustFromPem(AProvider, ACell.RootFile));
+    LClient.WithServerVerification(TServerVerification.WebPki(
+      TInteropCredentials.TrustFromPem(APkix, ACell.RootFile)).WithRevocation(ACell.Posture).Build);
   Result := LClient.Build;
 end;
 
@@ -377,22 +412,24 @@ begin
   end;
 end;
 
-class function TTrustDelegateInteropRunner.RunClient(APort: Word;
-  const ACell: TTrustCell): string;
+class function TTrustDelegateInteropRunner.RunClient(const AHost: string;
+  APort: Word; const ACell: TTrustCell): string;
 var
   LSocket: TInteropSocket;
-  LProvider: ICryptoProvider;
+  LCrypto: ICryptoProvider;
+  LPkix: IPkixProvider;
   LConfig: ITlsClientConfig;
   LEngine: ITlsEngine;
-  LResolver: TOSLiveRevocationResolver;
+  LResolver: TOSLiveRevocationResolverBase;
   LResult: TInteropResult;
   LSent: TBytes;
 begin
   Result := '';
-  LSocket := TInteropSocket.Connect('127.0.0.1', APort);
+  LSocket := TInteropSocket.Connect(AHost, APort);
   try
-    LProvider := TInteropEngine.DefaultProvider;
-    LConfig := BuildClientConfig(LProvider, ACell);
+    LCrypto := TTlsLibTestProviders.Crypto;
+    LPkix := TTlsLibTestProviders.Pkix;
+    LConfig := BuildClientConfig(LCrypto, LPkix, ACell);
     LEngine := TTlsEngineFactory.CreateClientEngine(LConfig, ACell.ExpectName);
     LEngine.StartHandshake;
     if ACell.Live then
@@ -400,7 +437,8 @@ begin
       // the host resolves the async park by re-running the OS engine live (network on)
       LResolver := TOSSystemTrust.LiveRevocationResolver(LConfig);
       try
-        LResult := TInteropPump.DriveHandshake(LEngine, LSocket, LResolver.ResolveVerdict);
+        LResult := TInteropPump.DriveHandshake(LEngine, LSocket,
+          LResolver.ResolveVerdict, True);
       finally
         LResolver.Free;
       end;
@@ -411,6 +449,12 @@ begin
     Result := MapOutcome(ACell, LResult);
     if (Result <> '') or (not ACell.ExpectAccept) then
       Exit;
+    // a real peer does not echo: the verdict is all the connect mode measures
+    if ACell.ConnectHost <> '' then
+    begin
+      TInteropPump.Close(LEngine, LSocket);
+      Exit;
+    end;
     LSent := TEncoding.UTF8.GetBytes('native trust cell application data');
     TInteropPump.WriteAppData(LEngine, LSocket, LSent);
     LResult := TInteropPump.PumpAppData(LEngine, LSocket);
@@ -423,32 +467,30 @@ begin
 end;
 
 class function TTrustDelegateInteropRunner.BuildServerConfig(
-  const AProvider: ICryptoProvider; const ACell: TTrustCell;
-  const ACaFile: string): ITlsServerConfig;
+  const ACryptoProvider: ICryptoProvider; const APkix: IPkixProvider;
+  const ACell: TTrustCell; const ACaFile: string): ITlsServerConfig;
 const
-  // the async park deadline for the live client-cert check; the OS fetch over loopback settles well
-  // within it
+  // the resolver fetch budget for the live client-cert check; the OS fetch over loopback settles
+  // well within it
   LiveDeadlineMs = Cardinal(10000);
 var
   LBuilder: ITlsConfigBuilder;
   LServer: ITlsServerConfigBuilder;
 begin
-  LBuilder := TTlsPresets.Compatible(AProvider);
+  LBuilder := TTlsPresets.Compatible(ACryptoProvider, APkix);
   LServer := LBuilder.Server;
   LServer.WithSupportedVersions(TArray<UInt16>.Create(ACell.TlsVersion));
-  LServer.WithCredential(TInteropCredentials.ServerCredentialFromPem(AProvider,
+  LServer.WithCredential(TInteropCredentials.ServerCredentialFromPem(ACryptoProvider, APkix,
     ACell.ServerCertFile, ACell.ServerKeyFile));
   LServer.WithPeerAuth(TClientAuthMode.Required);
-  // the configured client-CA is the exclusive anchor the OS client delegate roots against
-  LServer.WithTrustStore(TInteropCredentials.TrustFromPem(AProvider, ACaFile));
-  LServer.WithRevocation(ACell.Posture);
-  // arm the async park the OS-native live resolver decides in (Hard client-cert revocation needs it)
-  LServer.WithAsyncCertificateVerdict(True, LiveDeadlineMs);
+  // arm the live-revocation park the OS-native resolver decides in (Hard client-cert needs it)
+  LServer.WithLiveRevocationVerdict(LiveDeadlineMs);
   // a NewSessionTicket would otherwise arrive before the echo and look like a broken round-trip
   LServer.WithResumption(False);
-  // verify the peer CLIENT certificate through the OS trust engine, live (network on) at the park
-  LServer.WithCertificateVerifierSource(
-    TOSSystemTrust.ClientVerifierSource(AProvider, TSystemTrustFetch.Live));
+  // the OS engine verifies the client certificate live at the park, rooted at the client-CA
+  LServer.WithClientVerification(TClientVerification.VerifierSource(
+    TOSSystemTrust.ClientVerifierSource(TSystemTrustFetch.Live),
+    TInteropCredentials.TrustFromPem(APkix, ACaFile)).WithRevocation(ACell.Posture).Build);
   Result := LServer.Build;
 end;
 
@@ -457,15 +499,17 @@ var
   LListener: TInteropListener;
   LPresenterSocket, LServerSocket: TInteropSocket;
   LPresenter: TClientPresenterThread;
-  LProvider: ICryptoProvider;
+  LCrypto: ICryptoProvider;
+  LPkix: IPkixProvider;
   LConfig: ITlsServerConfig;
   LEngine: ITlsEngine;
-  LResolver: TOSLiveRevocationResolver;
+  LResolver: TOSLiveRevocationResolverBase;
   LResult, LEcho: TInteropResult;
   LLiveCaFile: string;
 begin
   Result := '';
-  LProvider := TInteropEngine.DefaultProvider;
+  LCrypto := TTlsLibTestProviders.Crypto;
+  LPkix := TTlsLibTestProviders.Pkix;
   LListener := TInteropListener.Bind('127.0.0.1', 0);
   try
     // the main thread connects the presenter first (so it can never miss the accept), then hands the
@@ -475,7 +519,7 @@ begin
     try
       LServerSocket := LListener.Accept;
       try
-        LConfig := BuildServerConfig(LProvider, ACell, ACell.ClientCaFile);
+        LConfig := BuildServerConfig(LCrypto, LPkix, ACell, ACell.ClientCaFile);
         LEngine := TTlsEngineFactory.CreateServerEngine(LConfig);
         // the live resolver roots against the client-CA of a possibly-different config: for the
         // exclusivity cell that is a foreign CA (--live-client-ca), else the same inline client CA
@@ -483,10 +527,10 @@ begin
         if LLiveCaFile = '' then
           LLiveCaFile := ACell.ClientCaFile;
         LResolver := TOSSystemTrust.LiveRevocationResolver(
-          BuildServerConfig(LProvider, ACell, LLiveCaFile));
+          BuildServerConfig(LCrypto, LPkix, ACell, LLiveCaFile));
         try
           LResult := TInteropPump.DriveHandshake(LEngine, LServerSocket,
-            LResolver.ResolveVerdict);
+            LResolver.ResolveVerdict, False);
           // accept path: echo the presenter's app data so both sides complete cleanly
           if LResult.Status = TInteropStatus.Ok then
           begin
@@ -528,12 +572,14 @@ begin
   // server-mode (mTLS): our server verifies the peer client certificate live through the OS delegate
   if ACell.IsServer then
     Exit(RunServer(ACell));
+  if ACell.ConnectHost <> '' then
+    Exit(RunClient(ACell.ConnectHost, ACell.ConnectPort, ACell));
   Result := '';
   LListener := TInteropListener.Bind('127.0.0.1', 0);
   try
     LServer := TTrustServerThread.Create(LListener, ACell);
     try
-      Result := RunClient(LListener.Port, ACell);
+      Result := RunClient('127.0.0.1', LListener.Port, ACell);
       LServer.WaitFor;
       if LServer.Error <> '' then
         if Result = '' then
@@ -551,7 +597,8 @@ end;
 class function TTrustDelegateInteropRunner.Run: Int32;
 var
   LCell: TTrustCell;
-  LError, LVersionArg: string;
+  LError, LVersionArg, LConnect: string;
+  LColon: Int32;
 begin
   Result := 0;
   try
@@ -562,17 +609,44 @@ begin
       LCell.TlsVersion := TlsWireVersionTls13;
     LCell.IsServer := SameText(ArgValue('--role', 'client'), 'server');
     LCell.Delegate := SameText(ArgValue('--trust-mode', 'portable'), 'os-delegate');
+    LCell.Anchors := SameText(ArgValue('--trust-mode', 'portable'), 'os-anchors');
     // live OS-native revocation implies the OS delegate (the live re-check runs the OS engine)
     LCell.Live := SameText(ArgValue('--revocation-fetch', 'cache'), 'live');
+    if LCell.Live and LCell.Anchors then
+      raise Exception.Create('os-anchors has no live revocation; use os-delegate');
     if LCell.Live then
       LCell.Delegate := True;
     // the server cell always verifies the peer client cert live through the OS delegate
     if LCell.IsServer then
     begin
+      if LCell.Anchors then
+        raise Exception.Create('--role server verifies through the OS delegate, not os-anchors');
       LCell.Delegate := True;
       LCell.Live := True;
     end;
     LCell.RootFile := ArgValue('--root', '');
+    LCell.HostRootFile := ArgValue('--host-root', '');
+    if (LCell.HostRootFile <> '') and (LCell.IsServer or LCell.Live) then
+      raise Exception.Create('--host-root applies to the non-live client OS modes only');
+    if (LCell.HostRootFile <> '') and not (LCell.Delegate or LCell.Anchors) then
+      raise Exception.Create('--host-root needs --trust-mode os-delegate or os-anchors');
+    LConnect := ArgValue('--connect', '');
+    LCell.ConnectHost := '';
+    LCell.ConnectPort := 0;
+    if LConnect <> '' then
+    begin
+      LColon := Pos(':', LConnect);
+      LCell.ConnectHost := Copy(LConnect, 1, LColon - 1);
+      LCell.ConnectPort := Word(StrToIntDef(Copy(LConnect, LColon + 1, MaxInt), 0));
+      if (LColon = 0) or (LCell.ConnectHost = '') or (LCell.ConnectPort = 0) then
+        raise Exception.Create('--connect expects <ipv4>:<port>');
+      if LCell.IsServer or LCell.Live or not (LCell.Delegate or LCell.Anchors) then
+        raise Exception.Create(
+          '--connect applies to the non-live client os-delegate / os-anchors modes only');
+      if HasArg('--server-cert') or HasArg('--server-key') or HasArg('--staple') or
+        HasArg('--now-ms') then
+        raise Exception.Create('--connect dials a real peer: no --server-cert/--server-key/--staple/--now-ms');
+    end;
     LCell.ServerCertFile := ArgValue('--server-cert', '');
     LCell.ServerKeyFile := ArgValue('--server-key', '');
     LCell.StapleFile := ArgValue('--staple', '');
@@ -586,7 +660,8 @@ begin
     LCell.NowMs := UInt64(StrToInt64Def(ArgValue('--now-ms', '0'), 0));
     ParseExpect(ArgValue('--expect', 'accept'), LCell);
 
-    if (LCell.ServerCertFile = '') or (LCell.ServerKeyFile = '') then
+    if (LCell.ConnectHost = '') and
+      ((LCell.ServerCertFile = '') or (LCell.ServerKeyFile = '')) then
       raise Exception.Create('--server-cert and --server-key are required');
     if LCell.IsServer then
     begin
@@ -595,7 +670,7 @@ begin
         raise Exception.Create(
           '--role server requires --root, --client-cert, --client-key and --client-ca');
     end
-    else if (not LCell.Delegate) and (LCell.RootFile = '') then
+    else if (not LCell.Delegate) and (not LCell.Anchors) and (LCell.RootFile = '') then
       raise Exception.Create('portable trust mode requires --root');
 
     LError := RunCell(LCell);

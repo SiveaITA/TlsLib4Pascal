@@ -22,13 +22,17 @@ uses
   TlpTlsAlert,
   TlpTlsLibExceptions,
   TlpWireReader,
+  TlpExtensionVector,
   TlpCoreExtensions,
   TlpNegotiationTypes,
   TlpNegotiationPolicy,
   TlpHandshakeMessage,
   TlpHandshakeMessages,
+  TlpEchConfig,
   TlpHandshakeEffect,
+  TlpHandshakeStage,
   TlpIHandshakeMachine,
+  TlpServerOfferSelection,
   TlpTls13ClientStateMachine,
   TlpTls13ServerStateMachine,
   TlpTls12ClientStateMachine,
@@ -47,45 +51,57 @@ type
     /// sub-machine's effects for that message.</summary>
     function Dispatch(const AMessage: TTlsHandshakeMessage)
       : TArray<THandshakeEffect>; reintroduce; virtual; abstract;
+    /// <summary>The one structural parse of a ClientHello's extension block: Empty for an absent
+    /// field (a legacy 1.2-only shape), otherwise the fully-validated vector. Both readers below
+    /// take this vector, so the outer block is walked once per dispatch.</summary>
+    class function ParseExtensions(const AExtensions: TBytes): TExtensionVector; static;
     /// <summary>Reads the versions listed in a ClientHello's supported_versions
     /// extension (empty when the extension is absent - a legacy 1.2-only client).</summary>
-    class function ClientHelloVersions(const AExtensions: TBytes): TArray<UInt16>; static;
+    class function ClientHelloVersions(const AVector: TExtensionVector): TArray<UInt16>; static;
     /// <summary>Whether the ClientHello carries an encrypted_client_hello extension (RFC
     /// 9849): such a client is doing ECH and is TLS 1.3, even when a minimal ClientHelloOuter
     /// omits supported_versions.</summary>
-    class function HasEncryptedClientHello(const AExtensions: TBytes): Boolean; static;
+    class function HasEncryptedClientHello(const AVector: TExtensionVector): Boolean; static;
   public
     /// <summary>A responder (server dispatcher) by default; the client dispatcher overrides.</summary>
     function Initiates: Boolean; virtual;
+    /// <summary>Forwards the coarse stage from the resolved sub-machine (Handshaking until one
+    /// is chosen).</summary>
+    function Stage: THandshakeStage;
     function Start: TArray<THandshakeEffect>; virtual; abstract;
     function ProcessMessage(const AMessage: TTlsHandshakeMessage)
       : TArray<THandshakeEffect>;
     /// <summary>Forwards a post-handshake KeyUpdate request to the resolved sub-machine.</summary>
-    function RequestKeyUpdate(ARequestPeerUpdate: Boolean): TArray<THandshakeEffect>;
+    function RequestKeyUpdate(ARequest: TKeyUpdateRequest): TArray<THandshakeEffect>;
     function TakePendingKeyUpdate: TArray<THandshakeEffect>;
     /// <summary>Forwards a resume-after-verdict continuation to the resolved sub-machine.</summary>
     function ResumeAfterVerdict: TArray<THandshakeEffect>;
     /// <summary>Forwards an exporter request to the resolved sub-machine.</summary>
+    function ExportKeyingMaterial(const ALabel: string;
+      ALength: Int32): TBytes; overload;
     function ExportKeyingMaterial(const ALabel: string; const AContext: TBytes;
-      AUseContext: Boolean; ALength: Int32): TBytes;
+      ALength: Int32): TBytes; overload;
     function CanExportKeyingMaterial: Boolean;
+    function ExportEarlyKeyingMaterial(const ALabel: string; const AContext: TBytes;
+      ALength: Int32): TBytes;
+    function CanExportEarlyKeyingMaterial: Boolean;
+    /// <summary>Forwards the fatal-alert session invalidation to the resolved sub-machine.</summary>
+    procedure ForgetSessionsOnFatal;
   end;
 
   /// <summary>
   /// The server-side version dispatcher: it starts on the ClientHello, chooses TLS 1.3
   /// when both peers support it and TLS 1.2 otherwise, and builds the matching server
   /// sub-machine. When a 1.3-capable server negotiates 1.2 it tells the 1.2 machine to
-  /// stamp the downgrade sentinel (RFC 8446 4.1.3).
+  /// stamp the downgrade sentinel (RFC 9846 4.2.3).
   /// </summary>
   TServerVersionDispatchMachine = class sealed(TVersionDispatchMachineBase)
   strict private
     FServerSupportsTls13: Boolean;
+    FServerSupportsTls12: Boolean;
     FServerHighestVersion: UInt16;
     FParams13: TServerHandshakeParams;
     FParams12: TServer12HandshakeParams;
-    /// <summary>The numerically greatest wire version in the set (newer TLS versions are
-    /// higher values), or 0 when the set is empty.</summary>
-    class function HighestVersion(const AVersions: TArray<UInt16>): UInt16; static;
   strict protected
     function Dispatch(const AMessage: TTlsHandshakeMessage)
       : TArray<THandshakeEffect>; override;
@@ -125,6 +141,23 @@ type
 
 implementation
 
+resourcestring
+  SEmptySupportedVersions = 'supported_versions names no version (RFC 9846 4.3.1 requires at least one)';
+  SClockRequired = 'a clock is required (the handshake reads time for tickets and freshness)';
+  SFirstMessageNotClientHello = 'the first handshake message is not a ClientHello';
+  SInappropriateFallback =
+    'the client signalled a fallback below the highest version this server supports';
+  SClientBelowTls12 = 'the client offers no version at or above TLS 1.2';
+  STls13CompressionNotNull = 'a TLS 1.3 ClientHello offers a compression method other than null';
+  SNoCommonVersion = 'the client and server share no protocol version';
+  SFirstMessageNotServerHello = 'the first handshake message is not a ServerHello';
+  SSupportedVersionsBelowTls13 =
+    'the ServerHello carries supported_versions selecting a version below TLS 1.3';
+  SServerVersionNotOffered = 'the server selected a protocol version this client did not offer';
+  SPskRequiresTls13 =
+    'the server selected TLS 1.2 but this client requires an external PSK, which is TLS 1.3 only';
+  SEarlyDataOnTls12 = 'the server selected TLS 1.2 although this client offered early data';
+
 { TVersionDispatchMachineBase }
 
 function TVersionDispatchMachineBase.Initiates: Boolean;
@@ -134,6 +167,8 @@ end;
 
 function TVersionDispatchMachineBase.ProcessMessage(
   const AMessage: TTlsHandshakeMessage): TArray<THandshakeEffect>;
+var
+  LEffect: THandshakeEffect;
 begin
   // the inner machine already maps its own in-band failures to Fail effects; only the
   // first-message dispatch (a malformed ClientHello/ServerHello) needs the same mapping
@@ -143,21 +178,29 @@ begin
     try
       Result := Dispatch(AMessage);
     except
-      on E: EPeerInputTlsLibException do
-        Result := TArray<THandshakeEffect>.Create(
-          THandshakeEffects.Fail(TTlsAlertDescription.IllegalParameter));
-      on E: EFatalAlertTlsLibException do
-        Result := TArray<THandshakeEffect>.Create(
-          THandshakeEffects.Fail(E.AlertDescription));
+      on E: Exception do
+        if THandshakeEffects.TryFromException(E, LEffect) then
+          Result := TArray<THandshakeEffect>.Create(LEffect)
+        else
+          raise;
     end;
 end;
 
+function TVersionDispatchMachineBase.Stage: THandshakeStage;
+begin
+  // Handshaking until a sub-machine is resolved; then whatever it reports
+  if FInner <> nil then
+    Result := FInner.Stage
+  else
+    Result := THandshakeStage.Handshaking;
+end;
+
 function TVersionDispatchMachineBase.RequestKeyUpdate(
-  ARequestPeerUpdate: Boolean): TArray<THandshakeEffect>;
+  ARequest: TKeyUpdateRequest): TArray<THandshakeEffect>;
 begin
   // only meaningful once a version was resolved (post-handshake)
   if FInner <> nil then
-    Result := FInner.RequestKeyUpdate(ARequestPeerUpdate)
+    Result := FInner.RequestKeyUpdate(ARequest)
   else
     Result := nil;
 end;
@@ -179,11 +222,20 @@ begin
 end;
 
 function TVersionDispatchMachineBase.ExportKeyingMaterial(const ALabel: string;
-  const AContext: TBytes; AUseContext: Boolean; ALength: Int32): TBytes;
+  ALength: Int32): TBytes;
 begin
   // only meaningful once a version was resolved and its secrets derived
   if FInner <> nil then
-    Result := FInner.ExportKeyingMaterial(ALabel, AContext, AUseContext, ALength)
+    Result := FInner.ExportKeyingMaterial(ALabel, ALength)
+  else
+    Result := nil;
+end;
+
+function TVersionDispatchMachineBase.ExportKeyingMaterial(const ALabel: string;
+  const AContext: TBytes; ALength: Int32): TBytes;
+begin
+  if FInner <> nil then
+    Result := FInner.ExportKeyingMaterial(ALabel, AContext, ALength)
   else
     Result := nil;
 end;
@@ -193,68 +245,69 @@ begin
   Result := (FInner <> nil) and FInner.CanExportKeyingMaterial;
 end;
 
+function TVersionDispatchMachineBase.ExportEarlyKeyingMaterial(const ALabel: string;
+  const AContext: TBytes; ALength: Int32): TBytes;
+begin
+  if FInner <> nil then
+    Result := FInner.ExportEarlyKeyingMaterial(ALabel, AContext, ALength)
+  else
+    Result := nil;
+end;
+
+function TVersionDispatchMachineBase.CanExportEarlyKeyingMaterial: Boolean;
+begin
+  Result := (FInner <> nil) and FInner.CanExportEarlyKeyingMaterial;
+end;
+
+procedure TVersionDispatchMachineBase.ForgetSessionsOnFatal;
+begin
+  if FInner <> nil then
+    FInner.ForgetSessionsOnFatal;
+end;
+
+class function TVersionDispatchMachineBase.ParseExtensions(
+  const AExtensions: TBytes): TExtensionVector;
+begin
+  // an absent extensions field is a legacy ClientHello shape: the empty vector, never parsed
+  // (TExtensionVector.Parse treats an empty field as decode_error). A present field is parsed in
+  // full here - a duplicate type, an over-cap count or trailing bytes are rejected with their
+  // structural alert before the version is chosen, rather than slipping through a tolerant
+  // pre-scan to fail later during the message's own extension pass
+  if System.Length(AExtensions) = 0 then
+    Result := TExtensionVector.Empty
+  else
+    Result := TExtensionVector.Parse(AExtensions);
+end;
+
 class function TVersionDispatchMachineBase.ClientHelloVersions(
-  const AExtensions: TBytes): TArray<UInt16>;
+  const AVector: TExtensionVector): TArray<UInt16>;
 var
-  LReader, LOuter, LData, LVers: TWireReader;
-  LType: UInt16;
+  LEntry: TExtensionEntry;
+  LReader, LVers: TWireReader;
 begin
   Result := nil;
-  // an absent extensions field is a legacy ClientHello shape: no supported_versions to read
-  if System.Length(AExtensions) = 0 then
-    Exit;
-  LReader := TWireReader.Create(AExtensions);
-  LOuter := LReader.OpenVector(2);
-  while not LOuter.EndReached do
+  if AVector.TryFind(TExtensionTypes.SupportedVersions, LEntry) then
   begin
-    LType := LOuter.ReadUInt16;
-    LData := LOuter.OpenVector(2);
-    if LType = TExtensionTypes.SupportedVersions then
-    begin
-      // ClientHello supported_versions: a 1-byte-length list of uint16 versions
-      LVers := LData.OpenVector(1);
-      while not LVers.EndReached do
-        TArrayUtilities.Append<UInt16>(Result, LVers.ReadUInt16);
-      Exit;
-    end;
-    LData.ReadBytes(LData.Remaining);
+    // ClientHello supported_versions: a 1-byte-length list of uint16 versions; an empty list is a
+    // decode error here (RFC 9846 4.3.1), the same verdict the codec reaches on the message pass -
+    // so routing never treats a structurally invalid empty list as "absent" and negotiates legacy
+    LReader := TWireReader.Create(LEntry.Data);
+    LVers := LReader.OpenVector(1);
+    LReader.ExpectEnd;
+    while not LVers.EndReached do
+      TArrayUtilities.Append<UInt16>(Result, LVers.ReadUInt16);
+    if System.Length(Result) = 0 then
+      raise EDecodeErrorTlsLibException.CreateRes(@SEmptySupportedVersions);
   end;
 end;
 
 class function TVersionDispatchMachineBase.HasEncryptedClientHello(
-  const AExtensions: TBytes): Boolean;
-var
-  LReader, LOuter, LData: TWireReader;
-  LType: UInt16;
+  const AVector: TExtensionVector): Boolean;
 begin
-  Result := False;
-  // an absent extensions field is a legacy ClientHello shape: no extensions to find
-  if System.Length(AExtensions) = 0 then
-    Exit;
-  LReader := TWireReader.Create(AExtensions);
-  LOuter := LReader.OpenVector(2);
-  while not LOuter.EndReached do
-  begin
-    LType := LOuter.ReadUInt16;
-    LData := LOuter.OpenVector(2);
-    if LType = TExtensionTypes.EncryptedClientHello then
-      Exit(True);
-    LData.ReadBytes(LData.Remaining);
-  end;
+  Result := AVector.Contains(TExtensionTypes.EncryptedClientHello);
 end;
 
 { TServerVersionDispatchMachine }
-
-class function TServerVersionDispatchMachine.HighestVersion(
-  const AVersions: TArray<UInt16>): UInt16;
-var
-  LVersion: UInt16;
-begin
-  Result := 0;
-  for LVersion in AVersions do
-    if LVersion > Result then
-      Result := LVersion;
-end;
 
 constructor TServerVersionDispatchMachine.Create(
   const AParams13: TServerHandshakeParams;
@@ -262,11 +315,15 @@ constructor TServerVersionDispatchMachine.Create(
   const ASupportedVersions: TArray<UInt16>);
 begin
   inherited Create;
+  if (AParams13.Clock = nil) or (AParams12.Clock = nil) then
+    raise EArgumentTlsLibException.CreateRes(@SClockRequired);
   FParams13 := AParams13;
   FParams12 := AParams12;
   FServerSupportsTls13 := TArrayUtilities.Contains<UInt16>(ASupportedVersions,
     TlsWireVersionTls13);
-  FServerHighestVersion := HighestVersion(ASupportedVersions);
+  FServerSupportsTls12 := TArrayUtilities.Contains<UInt16>(ASupportedVersions,
+    TlsWireVersionTls12);
+  FServerHighestVersion := TTlsVersion.HighestKnown(ASupportedVersions);
 end;
 
 function TServerVersionDispatchMachine.Start: TArray<THandshakeEffect>;
@@ -279,66 +336,81 @@ function TServerVersionDispatchMachine.Dispatch(
   const AMessage: TTlsHandshakeMessage): TArray<THandshakeEffect>;
 var
   LHello: TTlsClientHello;
+  LExtensions: TExtensionVector;
   LClientVersions: TArray<UInt16>;
   LClientSupportsTls13: Boolean;
+  LClientOffers12: Boolean;
   LClientHighest: UInt16;
 begin
+  // the first message must be a ClientHello; judge the type before decoding the body as one, so
+  // another message is unexpected_message rather than a decode_error
+  if AMessage.TypeByte <> TTlsHandshakeType.ClientHello.ToByte then
+    Exit(TArray<THandshakeEffect>.Create(
+      THandshakeEffects.Fail(TTlsAlertDescription.UnexpectedMessage,
+        SFirstMessageNotClientHello)));
   LHello := THandshakeMessages.DecodeClientHello(AMessage.Body);
-  LClientVersions := ClientHelloVersions(LHello.Extensions);
+  // parse the outer extension block once; both the supported_versions read and the ech-presence
+  // check below take this vector rather than re-walking the unauthenticated block
+  LExtensions := ParseExtensions(LHello.Extensions);
+  LClientVersions := ClientHelloVersions(LExtensions);
   // an Encrypted Client Hello whose minimal ClientHelloOuter omits supported_versions is still
-  // a TLS 1.3 client (RFC 9849 sec. 7: the version comes from the decrypted inner) - route it
-  // to the 1.3 machine. An ech alongside an explicit version list does NOT override that list,
-  // so a legacy client GREASE-ing ech while offering only 1.2 still negotiates 1.2.
+  // a TLS 1.3 client - RFC 9849 sec. 6.1 requires the outer to offer 1.3, so this is local routing
+  // for a non-conformant outer - route it
+  // to the 1.3 machine, but only on a server that holds ECH keys: without them nothing could be
+  // decrypted, and a client GREASE-ing ech is not offering it (RFC 9849 sec. 6.2.1). An ech
+  // alongside an explicit version list does NOT override that list, so a legacy client GREASE-ing
+  // ech while offering only 1.2 still negotiates 1.2.
   LClientSupportsTls13 := (TArrayUtilities.Contains<UInt16>(LClientVersions,
     TlsWireVersionTls13)) or ((System.Length(LClientVersions) = 0) and
-    HasEncryptedClientHello(LHello.Extensions));
+    (FParams13.EchPolicy <> nil) and (FParams13.EchPolicy.Role = TEchServerRole.Keyed) and
+    HasEncryptedClientHello(LExtensions));
 
-  // RFC 7507 TLS_FALLBACK_SCSV: a client that retried at a lower version signals it in
-  // cipher_suites. The client's highest version is its supported_versions (a 1.3 client
-  // sets legacy_version 0x0303 but lists 1.3 there); a legacy client without the
-  // extension tops out at 1.2. If the server could have done better, the fallback was
-  // spurious and is refused (RFC 7507 3). This is checked before the version floor so a
-  // spurious fallback reports inappropriate_fallback rather than protocol_version.
-  if TArrayUtilities.Contains<UInt16>(LHello.CipherSuites, TlsFallbackScsv) then
-  begin
-    if System.Length(LClientVersions) = 0 then
-      LClientHighest := TlsWireVersionTls12
-    else
-      LClientHighest := HighestVersion(LClientVersions);
-    if FServerHighestVersion > LClientHighest then
-      Exit(TArray<THandshakeEffect>.Create(
-        THandshakeEffects.Fail(TTlsAlertDescription.InappropriateFallback)));
-  end;
+  // before the version floor, so a spurious fallback is not masked as protocol_version
+  if TServerOfferSelection.IsSpuriousFallback(LHello.CipherSuites, LClientVersions,
+    LHello.LegacyVersion, FServerHighestVersion) then
+    Exit(TArray<THandshakeEffect>.Create(
+      THandshakeEffects.Fail(TTlsAlertDescription.InappropriateFallback,
+        SInappropriateFallback)));
 
-  // a client whose highest offered version is below our floor (TLS 1.2) - a pre-1.2 client,
-  // whose version is the legacy_version when supported_versions is absent - selected nothing
-  // this server supports: protocol_version, rather than a 1.2 handshake it cannot complete
-  if System.Length(LClientVersions) = 0 then
-    LClientHighest := LHello.LegacyVersion
-  else
-    LClientHighest := HighestVersion(LClientVersions);
+  // legacy_version must be 0x0303 when supported_versions is present (RFC 9846 4.2.2); otherwise it
+  // holds the client's version
+  if System.Length(LClientVersions) > 0 then
+    TServerOfferSelection.RejectUnexpectedLegacyVersion(LHello.LegacyVersion);
+
+  // a client below our floor (TLS 1.2) selected nothing this server supports
+  LClientHighest := TTlsVersion.ClientHighest(LClientVersions, LHello.LegacyVersion);
   if LClientHighest < TlsWireVersionTls12 then
     Exit(TArray<THandshakeEffect>.Create(
-      THandshakeEffects.Fail(TTlsAlertDescription.ProtocolVersion)));
+      THandshakeEffects.Fail(TTlsAlertDescription.ProtocolVersion, SClientBelowTls12)));
+
+  // a client with no supported_versions offers 1.2 through its legacy_version (already floored
+  // at 1.2 above); a 1.3 client that lists supported_versions must name 1.2 there to negotiate it
+  LClientOffers12 := (System.Length(LClientVersions) = 0) or
+    (TArrayUtilities.Contains<UInt16>(LClientVersions, TlsWireVersionTls12));
 
   if FServerSupportsTls13 and LClientSupportsTls13 then
   begin
     // a TLS 1.3 ClientHello's legacy_compression_methods is exactly the single null byte;
-    // any additional methods are an illegal_parameter (RFC 8446 4.1.2). A lower version
+    // any additional methods are an illegal_parameter (RFC 9846 4.2.2). A lower version
     // still accepts a longer list, so this is enforced only now that 1.3 is selected - the
     // decode already rejected a list that offers no null method at all.
     if not THandshakeMessages.IsNullOnlyCompression(LHello.CompressionMethods) then
       Exit(TArray<THandshakeEffect>.Create(
-        THandshakeEffects.Fail(TTlsAlertDescription.IllegalParameter)));
+        THandshakeEffects.Fail(TTlsAlertDescription.IllegalParameter,
+          STls13CompressionNotNull)));
     FInner := TTls13ServerStateMachine.Create(FParams13) as IHandshakeMachine;
   end
-  else
+  else if FServerSupportsTls12 and LClientOffers12 then
   begin
     // a 1.3-capable server that negotiates 1.2 stamps the downgrade sentinel so a
-    // 1.3-capable client detects a stripped 1.3 offer (RFC 8446 4.1.3)
+    // 1.3-capable client detects a stripped 1.3 offer (RFC 9846 4.2.3)
     FParams12.EmitDowngradeSentinel := FServerSupportsTls13;
     FInner := TTls12ServerStateMachine.Create(FParams12) as IHandshakeMachine;
-  end;
+  end
+  else
+    // the client and server share no supported protocol version (RFC 9846 4.3.1 / E.2)
+    Exit(TArray<THandshakeEffect>.Create(
+      THandshakeEffects.Fail(TTlsAlertDescription.ProtocolVersion, SNoCommonVersion)));
   Result := FInner.ProcessMessage(AMessage);
 end;
 
@@ -351,11 +423,18 @@ var
   L13: TClientHandshakeParams;
 begin
   inherited Create;
+  if (AParams13.Clock = nil) or (AParams12.Clock = nil) then
+    raise EArgumentTlsLibException.CreateRes(@SClockRequired);
+  // the 1.3 machine's ctor rejects a usable ECH config paired with a 1.2 offer (ECH is 1.3-only,
+  // RFC 9849 sec. 6.1); a GREASE-only policy is allowed and rides through unchanged
   L13 := AParams13;
   L13.AlsoOfferTls12 := True;
   FPrimary13Typed := TTls13ClientStateMachine.Create(L13);
   FPrimary13 := FPrimary13Typed as IHandshakeMachine;
   FParams12 := AParams12;
+  // the unified ClientHello offered record_size_limit from the 1.3 params; the 1.2 hand-off replays
+  // that hello (PresentClientHello), so its own offered limit must match to validate the echo
+  FParams12.RecordSizeLimit := AParams13.RecordSizeLimit;
   FRequirePsk := AParams13.RequirePsk;
 end;
 
@@ -384,6 +463,12 @@ var
   LHello: TTlsServerHello;
   LSelectedVersion: UInt16;
 begin
+  // the first message must be a ServerHello (a HelloRetryRequest is one); judge the type before
+  // decoding the body as one
+  if AMessage.TypeByte <> TTlsHandshakeType.ServerHello.ToByte then
+    Exit(TArray<THandshakeEffect>.Create(
+      THandshakeEffects.Fail(TTlsAlertDescription.UnexpectedMessage,
+        SFirstMessageNotServerHello)));
   LHello := THandshakeMessages.DecodeServerHello(AMessage.Body);
   // a HelloRetryRequest is a 1.3 construct; otherwise the negotiated version is the
   // supported_versions selection, or the legacy_version when the extension is absent
@@ -391,20 +476,25 @@ begin
     LSelectedVersion := TlsWireVersionTls13
   else
   begin
-    LSelectedVersion := THandshakeMessages.ServerHelloSelectedVersion(LHello.Extensions);
-    if LSelectedVersion = 0 then
-      LSelectedVersion := LHello.LegacyVersion
     // supported_versions in a ServerHello is a TLS 1.3 construct: a server that
-    // negotiates 1.2 or below MUST NOT send it (RFC 8446 4.2.1). Present but
-    // selecting a pre-1.3 version is an unpermitted extension, not a 1.2 handshake.
+    // negotiates 1.2 or below MUST NOT send it (RFC 9846 4.3.1). Present but selecting a
+    // pre-1.3 version (0 included) is an unpermitted extension, not a 1.2 handshake
+    // (unsupported_extension, matching the direct 1.3 client; 4.3.1 says illegal_parameter).
+    if not THandshakeMessages.TryGetServerHelloSelectedVersion(LHello.Extensions,
+      LSelectedVersion) then
+      LSelectedVersion := LHello.LegacyVersion
     else if LSelectedVersion < TlsWireVersionTls13 then
       Exit(TArray<THandshakeEffect>.Create(
-        THandshakeEffects.Fail(TTlsAlertDescription.UnsupportedExtension)));
-    // a server that selected a version below our floor (TLS 1.2) chose one this client
-    // does not support: protocol_version, not a downstream handshake failure (RFC 8446 4.2.1)
-    if LSelectedVersion < TlsWireVersionTls12 then
+        THandshakeEffects.Fail(TTlsAlertDescription.UnsupportedExtension,
+          SSupportedVersionsBelowTls13)));
+    // a server that selected a version outside what this client supports (below its TLS 1.2 floor,
+    // or above 1.3 - including a GREASE value) chose one it never offered: protocol_version rather
+    // than a misleading downstream alert (RFC 9846 4.3.1 names illegal_parameter for an unoffered
+    // supported_versions value; protocol_version names the fault and stays)
+    if (LSelectedVersion < TlsWireVersionTls12) or (LSelectedVersion > TlsWireVersionTls13) then
       Exit(TArray<THandshakeEffect>.Create(
-        THandshakeEffects.Fail(TTlsAlertDescription.ProtocolVersion)));
+        THandshakeEffects.Fail(TTlsAlertDescription.ProtocolVersion,
+          SServerVersionNotOffered)));
   end;
 
   if LSelectedVersion = TlsWireVersionTls13 then
@@ -412,15 +502,22 @@ begin
   else
   begin
     // a PSK-only client cannot satisfy its required external PSK over TLS 1.2 (an external
-    // PSK is a TLS 1.3 construct), so a 1.2 selection is protocol_version (RFC 8446 4.2.1)
+    // PSK is a TLS 1.3 construct), so a 1.2 selection is protocol_version (local policy; RFC 9846 E.1)
     if FRequirePsk then
       Exit(TArray<THandshakeEffect>.Create(
-        THandshakeEffects.Fail(TTlsAlertDescription.ProtocolVersion)));
+        THandshakeEffects.Fail(TTlsAlertDescription.ProtocolVersion, SPskRequiresTls13)));
+    // 0-RTT was offered but the server chose 1.2, where early data cannot exist: the response
+    // is inconsistent with the offer (RFC 9846 E.3)
+    if FPrimary13Typed.EarlyDataOffered then
+      Exit(TArray<THandshakeEffect>.Create(
+        THandshakeEffects.Fail(TTlsAlertDescription.IllegalParameter, SEarlyDataOnTls12)));
     FParams12.PresentClientHello := FClientHello;
     // carry any cached 1.2 session the unified ClientHello offered into the 1.2 machine, so
     // it resumes when the server echoes the offered session id (read before releasing the
     // 1.3 machine that holds it)
     FParams12.PresentResumptionSession := FPrimary13Typed.Tls12ResumptionSession;
+    FParams12.PresentResumeValidatedPath := FPrimary13Typed.ResumeValidatedPath;
+    FParams12.EarlyDataReason := FPrimary13Typed.EarlyReasonAtOffer;
     // the actually-sent legacy_session_id (a cached 1.2 id, or the compatibility-mode id when
     // resuming nothing), so the 1.2 machine can catch a server that falsely echoes it
     FParams12.PresentOfferedSessionId := FPrimary13Typed.SentLegacySessionId;

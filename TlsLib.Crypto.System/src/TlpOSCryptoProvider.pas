@@ -28,15 +28,19 @@ type
   /// provider. Dispatch is compile-time, most-specific OS first; each platform's whole
   /// composition lives in its own unit, so this factory only picks one - a platform
   /// with no native facet returns the base unchanged, so the portable provider is
-  /// always the fallback. Only deterministic primitives (key agreement, AEAD, hashes)
-  /// and signing are ever replaced - trust, path validation, revocation and alert
-  /// behavior stay with the base, whose conformance is authoritative.
+  /// always the fallback. Only primitives (randomness, key agreement, KEM, AEAD, hashes, HMAC,
+  /// KDFs), signing and the default HPKE composition over them are replaced - trust, path
+  /// validation, revocation and alert behavior stay with the base, whose conformance is
+  /// authoritative.
   /// </summary>
   TOSCryptoProvider = class sealed(TObject)
   public
     /// <summary>Whether this platform contributes at least one native facet. When
     /// False, <see cref="Compose" /> returns its argument unchanged.</summary>
     class function HasNativeFacets: Boolean; static;
+    /// <summary>The native provider this platform contributes, for logs and test reports; empty
+    /// where there is none.</summary>
+    class function PlatformName: string; static;
     /// <summary>ABase with this platform's native facets overlaid where it has them,
     /// or ABase unchanged otherwise (including where native support is compiled in but
     /// unavailable at runtime). Never nil. The caller supplies the base provider, so this
@@ -56,6 +60,15 @@ begin
   Result := True;
 {$ELSE}
   Result := False;
+{$IFEND}
+end;
+
+class function TOSCryptoProvider.PlatformName: string;
+begin
+{$IF DEFINED(TLSLIB_MSWINDOWS)}
+  Result := 'Windows CNG';
+{$ELSE}
+  Result := '';
 {$IFEND}
 end;
 

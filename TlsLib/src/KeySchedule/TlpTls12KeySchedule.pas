@@ -24,13 +24,16 @@ uses
   TlpSecretBuffer,
   TlpICryptoProvider,
   TlpIKeySchedule,
+  TlpIKeyLog,
+  TlpKeyLog,
   TlpTrafficKeys,
   TlpTlsLibExceptions,
+  TlpExporterArgs,
   TlpSecureMemory;
 
 type
   /// <summary>
-  /// The TLS 1.2 key schedule (RFC 5246 6.3 / RFC 7627): PRF-derived master secret
+  /// The TLS 1.2 key schedule (RFC 5246 8.1 and 6.3 / RFC 7627): PRF-derived master secret
   /// (plain or Extended Master Secret), the key_block split into the AEAD write
   /// keys and implicit-nonce salts that feed the record layer, and the Finished
   /// verify_data. All secrets are ISecretBuffer; intermediate blocks are wiped.
@@ -39,9 +42,7 @@ type
     ITls12KeySchedule)
   strict private
   var
-    FProvider: ICryptoProvider;
     FPrf: ITls12Prf;
-    FHash: THashAlgorithm;
     FKeyLength: Int32;
     FSaltLength: Int32;
     FPreMaster: ISecretBuffer;
@@ -52,16 +53,19 @@ type
     FServerKey: ISecretBuffer;
     FClientSalt: ISecretBuffer;
     FServerSalt: ISecretBuffer;
-    function Prf(const ASecret: ISecretBuffer; const ALabel: string;
-      const ASeed: TBytes; ALength: Int32): TBytes;
-    function SecretSlice(const ABlock: TBytes; AOffset, ALength: Int32): ISecretBuffer;
+    FKeyLog: IKeyLog;
+    FKeyLogRandom: TBytes;
+    FHandshakeSecretsReleased: Boolean;
     procedure DeriveMaster(const ALabel: string; const ASeed: TBytes);
     procedure GuardMaster;
+    procedure GuardNotReleased;
+    function DoExportKeyingMaterial(const ALabel: string; const AContext: TBytes;
+      AUseContext: Boolean; ALength: Int32): TBytes;
   public
     /// <summary>AHash is the PRF hash; AKeyLength the AEAD key size; AAead selects the
     /// implicit-nonce length from the key_block - a 4-byte salt for AES-GCM (RFC 5288) or
     /// the full 12-byte write IV for ChaCha20-Poly1305 (RFC 7905).</summary>
-    constructor Create(const AProvider: ICryptoProvider; AHash: THashAlgorithm;
+    constructor Create(const ACryptoProvider: ICryptoProvider; AHash: THashAlgorithm;
       AKeyLength: Int32; AAead: TAeadAlgorithm);
 
     // IKeySchedule
@@ -70,8 +74,10 @@ type
       const ATranscriptHash: TBytes): TBytes;
     function VerifyFinished(ADirection: TTlsDirection;
       const ATranscriptHash, APeerVerifyData: TBytes): Boolean;
+    function ExportKeyingMaterial(const ALabel: string;
+      ALength: Int32): TBytes; overload;
     function ExportKeyingMaterial(const ALabel: string; const AContext: TBytes;
-      AUseContext: Boolean; ALength: Int32): TBytes;
+      ALength: Int32): TBytes; overload;
 
     // ITls12KeySchedule
     procedure SetPreMasterSecret(const APreMasterSecret: ISecretBuffer);
@@ -81,6 +87,30 @@ type
     procedure DeriveExtendedMasterSecret(const ASessionHash: TBytes);
     procedure DeriveKeyBlock;
     function MasterSecret: ISecretBuffer;
+    procedure ForgetHandshakeSecrets;
+    procedure SetKeyLog(const AKeyLog: IKeyLog; const AClientRandom: TBytes);
+    function CanExport: Boolean;
+  end;
+
+  /// <summary>The premaster secret of a PSK key exchange (RFC 4279 2, RFC 5489 2).</summary>
+  TTls12PskPremaster = class sealed(TObject)
+  public
+    /// <summary>uint16(len Z) || Z || uint16(len PSK) || PSK, where Z is the ECDH shared secret
+    /// (RFC 5489 2 names the ECDHE_PSK form, RFC 4279 2 the framing). Neither secret is
+    /// materialized in a non-wiped intermediate.</summary>
+    class function Build(const AShared, APsk: ISecretBuffer): ISecretBuffer; static;
+  end;
+
+  /// <summary>The digest of a pre-shared key's secret sealed into every session that key
+  /// authenticated, in either protocol version.</summary>
+  TPskSessionBinding = class sealed(TObject)
+  public
+    /// <summary>A short digest of APsk, so a resumption is honoured only while the key that
+    /// authenticated it is still the configured one: rotating the secret under the same identity ends
+    /// the sessions the old secret made. It is a keyed hash of a fixed label, so it reveals nothing
+    /// usable about the secret.</summary>
+    class function Derive(const ACrypto: ICryptoProvider;
+      const APsk: ISecretBuffer): TBytes; static;
   end;
 
 implementation
@@ -92,20 +122,26 @@ const
   // ChaCha20-Poly1305 has no explicit nonce; its whole 12-byte write IV comes from the
   // key_block and is XORed with the sequence number per record (RFC 7905)
   Tls12ChaChaIvLength = Int32(12);
+  PskSessionBindingLength = Int32(16);
 
 resourcestring
+  SPskPremasterOperand = 'a PSK premaster operand must be present and at most 2^16-1 bytes';
   SNoSuchEpoch = 'the TLS 1.2 schedule has only an application-data epoch';
   SMasterNotDerived = 'the master secret has not been derived';
+  SKeyBlockNotDerived = 'the key block is unavailable (not derived, or released after the handshake)';
+  SMasterAlreadyDerived = 'the master secret has already been set or derived';
+  SPreMasterNotSet = 'the pre-master secret must be set before the master secret is derived';
+  SHandshakeSecretsReleased = 'the handshake secrets have been released';
+  SRandomsAfterKeyBlock = 'the client and server randoms must be set before the key block is derived';
+  SExportContextTooLong = 'the TLS 1.2 exporter context must not exceed 65535 bytes';
 
 { TTls12KeySchedule }
 
-constructor TTls12KeySchedule.Create(const AProvider: ICryptoProvider;
+constructor TTls12KeySchedule.Create(const ACryptoProvider: ICryptoProvider;
   AHash: THashAlgorithm; AKeyLength: Int32; AAead: TAeadAlgorithm);
 begin
   inherited Create;
-  FProvider := AProvider;
-  FPrf := AProvider.Primitives.CreateTls12Prf(AHash);
-  FHash := AHash;
+  FPrf := ACryptoProvider.Primitives.CreateTls12Prf(AHash);
   FKeyLength := AKeyLength;
   // ChaCha20-Poly1305 draws a full 12-byte write IV from the key_block (RFC 7905); AES-GCM
   // draws only the 4-byte implicit salt, the 8-byte explicit nonce riding each record
@@ -115,47 +151,54 @@ begin
     FSaltLength := Tls12AeadSaltLength;
 end;
 
-function TTls12KeySchedule.Prf(const ASecret: ISecretBuffer; const ALabel: string;
-  const ASeed: TBytes; ALength: Int32): TBytes;
-begin
-  Result := FPrf.Compute(ASecret, ALabel, ASeed, ALength);
-end;
-
-function TTls12KeySchedule.SecretSlice(const ABlock: TBytes;
-  AOffset, ALength: Int32): ISecretBuffer;
-var
-  LSlice: TBytes;
-begin
-  LSlice := System.Copy(ABlock, AOffset, ALength);
-  try
-    Result := TSecretBuffer.From(LSlice);
-  finally
-    TSecureMemory.WipeBytes(LSlice);
-  end;
-end;
-
 procedure TTls12KeySchedule.GuardMaster;
 begin
   if FMasterSecret = nil then
     raise EInvalidOperationTlsLibException.CreateRes(@SMasterNotDerived);
 end;
 
+procedure TTls12KeySchedule.GuardNotReleased;
+begin
+  if FHandshakeSecretsReleased then
+    raise EInvalidOperationTlsLibException.CreateRes(@SHandshakeSecretsReleased);
+end;
+
+procedure TTls12KeySchedule.SetKeyLog(const AKeyLog: IKeyLog;
+  const AClientRandom: TBytes);
+begin
+  // the log random is held apart from the PRF seed (FClientRandom) so installing or
+  // clearing a sink can never disturb key derivation
+  FKeyLog := AKeyLog;
+  FKeyLogRandom := System.Copy(AClientRandom);
+end;
+
+function TTls12KeySchedule.CanExport: Boolean;
+begin
+  // the master secret is the RFC 5705 exporter secret; the machine still gates on completion
+  Result := FMasterSecret <> nil;
+end;
+
 procedure TTls12KeySchedule.SetRandoms(const AClientRandom, AServerRandom: TBytes);
 begin
+  // the randoms seed both the master secret and the key block; changing them after the master is
+  // derived would desync the two
+  if FMasterSecret <> nil then
+    raise EInvalidOperationTlsLibException.CreateRes(@SRandomsAfterKeyBlock);
   FClientRandom := System.Copy(AClientRandom);
   FServerRandom := System.Copy(AServerRandom);
 end;
 
 procedure TTls12KeySchedule.DeriveMaster(const ALabel: string; const ASeed: TBytes);
-var
-  LMaster: TBytes;
 begin
-  LMaster := Prf(FPreMaster, ALabel, ASeed, Tls12MasterSecretLength);
-  try
-    FMasterSecret := TSecretBuffer.From(LMaster);
-  finally
-    TSecureMemory.WipeBytes(LMaster);
-  end;
+  GuardNotReleased;
+  // a second derivation, or one after SetMasterSecret, would hand the PRF a nil secret
+  if FMasterSecret <> nil then
+    raise EInvalidOperationTlsLibException.CreateRes(@SMasterAlreadyDerived);
+  if FPreMaster = nil then
+    raise EInvalidOperationTlsLibException.CreateRes(@SPreMasterNotSet);
+  FMasterSecret := FPrf.Compute(FPreMaster, ALabel, ASeed, Tls12MasterSecretLength);
+  // the pre-master secret is consumed by this one PRF; release it
+  FPreMaster := nil;
 end;
 
 procedure TTls12KeySchedule.DeriveMasterSecret;
@@ -171,30 +214,46 @@ end;
 
 procedure TTls12KeySchedule.DeriveKeyBlock;
 var
-  LBlock: TBytes;
+  LBlock: ISecretBuffer;
+  LMasterBytes: TBytes;
 begin
+  GuardNotReleased;
   GuardMaster;
+  // every handshake (full or abbreviated) reaches here once with the randoms set, so this is the
+  // single point to report the master secret to the key log - a deliberate secret exposure copied
+  // and wiped only when a sink is present (RFC 9850, CLIENT_RANDOM)
+  if FKeyLog <> nil then
+  begin
+    LMasterBytes := FMasterSecret.ToBytes;
+    try
+      FKeyLog.Log(KeyLogLabelClientRandom, FKeyLogRandom, LMasterBytes);
+    finally
+      TSecureMemory.WipeBytes(LMasterBytes);
+    end;
+  end;
   // AEAD suites have no MAC keys: client_key || server_key || client_salt || server_salt
-  LBlock := Prf(FMasterSecret, 'key expansion',
+  LBlock := FPrf.Compute(FMasterSecret, 'key expansion',
     TArrayUtilities.Concat(FServerRandom, FClientRandom),
     2 * (FKeyLength + FSaltLength));
-  try
-    FClientKey := SecretSlice(LBlock, 0, FKeyLength);
-    FServerKey := SecretSlice(LBlock, FKeyLength, FKeyLength);
-    FClientSalt := SecretSlice(LBlock, 2 * FKeyLength, FSaltLength);
-    FServerSalt := SecretSlice(LBlock, 2 * FKeyLength + FSaltLength, FSaltLength);
-  finally
-    TSecureMemory.WipeBytes(LBlock);
-  end;
+  FClientKey := TSecretBuffer.Slice(LBlock, 0, FKeyLength);
+  FServerKey := TSecretBuffer.Slice(LBlock, FKeyLength, FKeyLength);
+  FClientSalt := TSecretBuffer.Slice(LBlock, 2 * FKeyLength, FSaltLength);
+  FServerSalt := TSecretBuffer.Slice(LBlock, 2 * FKeyLength + FSaltLength, FSaltLength);
 end;
 
 procedure TTls12KeySchedule.SetPreMasterSecret(const APreMasterSecret: ISecretBuffer);
 begin
+  GuardNotReleased;
+  if FMasterSecret <> nil then
+    raise EInvalidOperationTlsLibException.CreateRes(@SMasterAlreadyDerived);
   FPreMaster := APreMasterSecret;
 end;
 
 procedure TTls12KeySchedule.SetMasterSecret(const AMasterSecret: ISecretBuffer);
 begin
+  GuardNotReleased;
+  if FMasterSecret <> nil then
+    raise EInvalidOperationTlsLibException.CreateRes(@SMasterAlreadyDerived);
   // an abbreviated handshake reuses the stored master secret verbatim; DeriveKeyBlock
   // then re-expands the key_block under the fresh client and server randoms
   FMasterSecret := AMasterSecret;
@@ -211,6 +270,8 @@ begin
   GuardMaster;
   if AEpoch <> TTlsEpoch.Application then
     raise EInvalidOperationTlsLibException.CreateRes(@SNoSuchEpoch);
+  if FClientKey = nil then
+    raise EInvalidOperationTlsLibException.CreateRes(@SKeyBlockNotDerived);
   if ADirection = TTlsDirection.ClientWrite then
     Result := TTrafficKeys.Create(FClientKey, FClientSalt)
   else
@@ -228,7 +289,8 @@ begin
     LLabel := 'client finished'
   else
     LLabel := 'server finished';
-  Result := Prf(FMasterSecret, LLabel, ATranscriptHash, Tls12VerifyDataLength);
+  // verify_data is a public wire value (RFC 5246 7.4.9)
+  Result := FPrf.Compute(FMasterSecret, LLabel, ATranscriptHash, Tls12VerifyDataLength).ToBytes;
 end;
 
 function TTls12KeySchedule.VerifyFinished(ADirection: TTlsDirection;
@@ -245,11 +307,24 @@ begin
 end;
 
 function TTls12KeySchedule.ExportKeyingMaterial(const ALabel: string;
+  ALength: Int32): TBytes;
+begin
+  Result := DoExportKeyingMaterial(ALabel, nil, False, ALength);
+end;
+
+function TTls12KeySchedule.ExportKeyingMaterial(const ALabel: string;
+  const AContext: TBytes; ALength: Int32): TBytes;
+begin
+  Result := DoExportKeyingMaterial(ALabel, AContext, True, ALength);
+end;
+
+function TTls12KeySchedule.DoExportKeyingMaterial(const ALabel: string;
   const AContext: TBytes; AUseContext: Boolean; ALength: Int32): TBytes;
 var
   LSeed, LContextLen: TBytes;
 begin
   Result := nil;
+  TExporterArgs.Guard(ALabel, ALength);
   GuardMaster;
   LSeed := TArrayUtilities.Concat(FClientRandom, FServerRandom);
   // a supplied context contributes a 2-byte length + the context bytes to the seed, even
@@ -257,6 +332,8 @@ begin
   // so the two cases must stay distinct (RFC 5705 4)
   if AUseContext then
   begin
+    if System.Length(AContext) > High(UInt16) then
+      raise EArgumentTlsLibException.CreateRes(@SExportContextTooLong);
     LContextLen := nil;
     SetLength(LContextLen, 2);
     TBinaryPrimitives.WriteUInt16BigEndian(LContextLen, 0,
@@ -264,7 +341,58 @@ begin
     LSeed := TArrayUtilities.Concat(LSeed,
       TArrayUtilities.Concat(LContextLen, AContext));
   end;
-  Result := Prf(FMasterSecret, ALabel, LSeed, ALength);
+  // RFC 5705 exported keying material is returned to the caller as public output
+  Result := FPrf.Compute(FMasterSecret, ALabel, LSeed, ALength).ToBytes;
+end;
+
+procedure TTls12KeySchedule.ForgetHandshakeSecrets;
+begin
+  // release the pre-master and the key-block slices once the record layer holds its keys; keep
+  // the master secret (it is the RFC 5705 exporter secret for the connection's lifetime) and the
+  // public randoms (also exporter seeds)
+  FHandshakeSecretsReleased := True;
+  FPreMaster := nil;
+  FClientKey := nil;
+  FServerKey := nil;
+  FClientSalt := nil;
+  FServerSalt := nil;
+  FKeyLog := nil;
+  FKeyLogRandom := nil;
+end;
+
+{ TTls12PskPremaster }
+
+class function TTls12PskPremaster.Build(const AShared, APsk: ISecretBuffer): ISecretBuffer;
+  function Framed(const ASecret: ISecretBuffer): ISecretBuffer;
+  var
+    LLength: TBytes;
+  begin
+    if (ASecret = nil) or (ASecret.Len > High(UInt16)) then
+      raise EArgumentTlsLibException.CreateRes(@SPskPremasterOperand);
+    LLength := nil;
+    SetLength(LLength, 2);
+    TBinaryPrimitives.WriteUInt16BigEndian(LLength, 0, UInt16(ASecret.Len));
+    Result := TSecretBuffer.Concat(LLength, ASecret);
+  end;
+begin
+  Result := TSecretBuffer.Join(Framed(AShared), Framed(APsk));
+end;
+
+{ TPskSessionBinding }
+
+class function TPskSessionBinding.Derive(const ACrypto: ICryptoProvider;
+  const APsk: ISecretBuffer): TBytes;
+var
+  LMac: IHmac;
+  LLabel, LFull: TBytes;
+begin
+  LLabel := TEncoding.ASCII.GetBytes('psk session binding');
+  LMac := ACrypto.Primitives.CreateHmac(THashAlgorithm.SHA_256);
+  LMac.Init(APsk);
+  LMac.Update(LLabel, 0, System.Length(LLabel));
+  LFull := LMac.DoFinal;
+  Result := System.Copy(LFull, 0, PskSessionBindingLength);
+  TSecureMemory.WipeBytes(LFull);
 end;
 
 end.

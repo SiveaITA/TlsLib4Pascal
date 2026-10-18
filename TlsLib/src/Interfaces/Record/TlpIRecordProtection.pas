@@ -46,21 +46,16 @@ type
       out AContentType: TTlsContentType): TBytes;
     /// <summary>Non-plaintext bytes the record body adds (tag, inner type, explicit nonce).</summary>
     function Overhead: Int32;
+    /// <summary>Content-type bytes carried inside the record plaintext: 1 for TLS 1.3's
+    /// TLSInnerPlaintext, 0 for TLS 1.2 and the null epoch. Lets a caller recover the
+    /// RFC 8449 TLSInnerPlaintext length from the wire record length.</summary>
+    function InnerContentTypeLength: Int32;
     /// <summary>The next sequence number that will be used.</summary>
     function SequenceNumber: UInt64;
-    /// <summary>True once the epoch has reached its AEAD usage limit (rekey due).</summary>
+    /// <summary>True once the epoch nears its AEAD usage limit (a small lead before the hard
+    /// bound), so a key update must be sent, or the connection closed, before more application
+    /// data (RFC 9846 5.5).</summary>
     function NeedsKeyUpdate: Boolean;
-  end;
-
-  /// <summary>
-  /// A test-only seam to force the record sequence counter to a chosen value, so
-  /// the usage-limit and wrap invariants can be exercised without sending 2^64
-  /// records. Reach it with Supports(protection, IRecordProtectionTestHook, hook);
-  /// it is never part of the record-layer contract.
-  /// </summary>
-  IRecordProtectionTestHook = interface(IInterface)
-    ['{9B7A6C41-0E2D-4F53-8AA6-16C0B3D8E2F7}']
-    procedure SetSequenceNumber(AValue: UInt64);
   end;
 
 implementation

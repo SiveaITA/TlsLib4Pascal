@@ -31,12 +31,14 @@ uses
   TestFramework,
 {$ENDIF FPC}
 {$IFDEF TLSLIB_MACOS}
-  TlpICryptoProvider,
-  TlpDefaultCryptoProvider,
   TlpICertificateTrust,
+  TlpTrustTypes,
   TlpServerName,
   TlpTrustPolicy,
+  TlpCertificateLimits,
   TlpCertificateStrengthPolicy,
+  TlpIPlatformChainEngine,
+  TlpOSDelegateVerifier,
 {$ENDIF TLSLIB_MACOS}
   TlpTlsAlert,
   TlpAppleSystemTrust,
@@ -90,7 +92,8 @@ var
   LChain: TArray<TBytes>;
   LVerifier: IServerCertificateVerifier;
   LAlert: TTlsAlertDescription;
-  LValidated: TArray<TBytes>;
+  LVerified: TVerifiedChain;
+  LPolicy: TOSDelegatePolicy;
 begin
   // Best-effort: our test root is not in the macOS system store, so SecTrust rejects
   // the chain as untrusted (unknown_ca). We assert only that it IS rejected - a granular
@@ -106,12 +109,22 @@ begin
   end;
   // the untrusted root makes SecTrust reject before the policy runs; a real provider + default
   // policy keep the construction valid regardless
-  LVerifier := TAppleDelegateVerifier.Create(TDefaultCryptoProvider.Create as ICryptoProvider,
-    TRevocationPosture.Soft, TSystemTrustFetch.CacheOnly, nil,
-    TCertificateStrengthPolicy.Defaults, nil) as IServerCertificateVerifier;
+  LPolicy := Default(TOSDelegatePolicy);
+  LPolicy.ChainLimits := TCertificateChainLimits.Defaults;
+  LPolicy.Pkix := Pkix;
+  LPolicy.Clock := nil;
+  LPolicy.Posture := TRevocationPosture.Soft;
+  LPolicy.Fetch := TSystemTrustFetch.CacheOnly;
+  LPolicy.Deferral := TVerdictDeferral.None;
+  LPolicy.StrengthPolicy := TCertificateStrengthPolicy.Defaults;
+  LPolicy.AdvertisedSchemes := nil;
+  LPolicy.Anchors := nil;
+  LPolicy.DeadlineMs := 0;
+  LVerifier := TOSDelegateServerVerifier.Create(
+    TAppleChainEngine.Create as IPlatformChainEngine, LPolicy) as IServerCertificateVerifier;
   LAlert := TTlsAlertDescription.InternalError;
   CheckFalse(LVerifier.VerifyServerCertificate(LChain, TServerName.DnsName('localhost'), nil,
-    LValidated, LAlert),
+    LVerified, LAlert),
     'an untrusted/expired chain must be rejected by the OS delegate');
 end;
 {$ENDIF TLSLIB_MACOS}

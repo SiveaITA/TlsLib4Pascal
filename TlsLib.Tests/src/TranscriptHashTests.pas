@@ -44,15 +44,14 @@ type
     procedure FeedThroughServerFinished(const ATranscript: ITranscriptHash);
   protected
     procedure SetUp; override;
-    procedure TearDown; override;
   published
     procedure TestRfc8448RunningHashes;
     procedure TestDeferredThenActivateReplays;
     procedure TestCloneBranchesIndependently;
     procedure TestCurrentHashDoesNotConsume;
     procedure TestDeferredCurrentHashRaises;
-    procedure TestReplaceWithMessageHashMatchesRfc8448Section5;
-    procedure TestSeedWithMessageHashEqualsReplace;
+    procedure TestSeedWithMessageHashMatchesRfc8448Section5;
+    procedure TestSeedWithMessageHashDiscardsPriorState;
   end;
 
 implementation
@@ -62,13 +61,7 @@ implementation
 procedure TTestTranscriptHash.SetUp;
 begin
   inherited SetUp;
-  FVec := LoadVectorFields('Rfc8448/HandshakeMessages.txt');
-end;
-
-procedure TTestTranscriptHash.TearDown;
-begin
-  FVec.Free;
-  inherited TearDown;
+  FVec := Own<TStringList>(LoadVectorFields('Rfc8448/HandshakeMessages.txt'));
 end;
 
 function TTestTranscriptHash.Msg(const AName: string): TBytes;
@@ -78,7 +71,7 @@ end;
 
 function TTestTranscriptHash.Sha256: IHash;
 begin
-  Result := Provider.Primitives.CreateHash(THashAlgorithm.SHA_256);
+  Result := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256);
 end;
 
 function TTestTranscriptHash.RawSha256(const AData: TBytes): TBytes;
@@ -195,13 +188,13 @@ begin
   CheckTrue(LRaised, 'a deferred transcript has no hash to snapshot');
 end;
 
-procedure TTestTranscriptHash.TestReplaceWithMessageHashMatchesRfc8448Section5;
+procedure TTestTranscriptHash.TestSeedWithMessageHashMatchesRfc8448Section5;
 var
   LHrr: TStringList;
   LTranscript: ITranscriptHash;
   LCh1, LCh1Hash, LExpected: TBytes;
 begin
-  // RFC 8446 4.4.1: on a HelloRetryRequest, ClientHello1 is replaced in the transcript
+  // RFC 9846 4.1: on a HelloRetryRequest, ClientHello1 is replaced in the transcript
   // by Handshake(message_hash, Hash(ClientHello1)). Verify byte-exact against the
   // RFC 8448 Section 5 ClientHello1 by recomputing the wrapper independently.
   LHrr := LoadVectorFields('Rfc8448/HelloRetryRequest.txt');
@@ -213,23 +206,20 @@ begin
   LCh1Hash := RawSha256(LCh1);
   LExpected := RawSha256(MessageHashWrapper(LCh1Hash));
 
-  // feed CH1 into a deferred transcript, then apply the message_hash replacement
   LTranscript := TTranscriptHash.Create;
-  LTranscript.Update(LCh1);
-  LTranscript.Activate(Sha256);
-  LTranscript.ReplaceWithMessageHash(Sha256);
+  LTranscript.SeedWithMessageHash(Sha256, LCh1Hash);
   CheckEqualBytes('transcript after message_hash = SHA256(254 || len || Hash(CH1))',
     LExpected, LTranscript.CurrentHash);
 end;
 
-procedure TTestTranscriptHash.TestSeedWithMessageHashEqualsReplace;
+procedure TTestTranscriptHash.TestSeedWithMessageHashDiscardsPriorState;
 var
   LHrr: TStringList;
-  LReplace, LSeed: ITranscriptHash;
+  LFed, LFresh: ITranscriptHash;
   LCh1, LCh1Hash: TBytes;
 begin
-  // seeding from a known Hash(CH1) (the stateless-cookie rebuild path) must produce the
-  // same transcript as replacing an in-hand CH1
+  // seeding an already-fed/active transcript must discard its prior state, landing on
+  // the same digest as seeding a transcript that was never fed at all
   LHrr := LoadVectorFields('Rfc8448/HelloRetryRequest.txt');
   try
     LCh1 := DecodeHex(LHrr.Values['client_hello_1']);
@@ -238,16 +228,15 @@ begin
   end;
   LCh1Hash := RawSha256(LCh1);
 
-  LReplace := TTranscriptHash.Create;
-  LReplace.Update(LCh1);
-  LReplace.Activate(Sha256);
-  LReplace.ReplaceWithMessageHash(Sha256);
+  LFed := TTranscriptHash.Create;
+  LFed.Update(LCh1);
+  LFed.Activate(Sha256);
+  LFed.SeedWithMessageHash(Sha256, LCh1Hash);
 
-  LSeed := TTranscriptHash.Create;
-  LSeed.SeedWithMessageHash(Sha256, LCh1Hash);
+  LFresh := TTranscriptHash.Create;
+  LFresh.SeedWithMessageHash(Sha256, LCh1Hash);
 
-  CheckEqualBytes('seed-from-hash matches replace-in-hand', LReplace.CurrentHash,
-    LSeed.CurrentHash);
+  CheckEqualBytes('seeding discards prior state', LFresh.CurrentHash, LFed.CurrentHash);
 end;
 
 initialization

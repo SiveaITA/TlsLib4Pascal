@@ -27,6 +27,7 @@ uses
   TestFramework,
 {$ENDIF FPC}
   TlpTlsLibExceptions,
+  TlpTlsAlert,
   TlpNegotiationTypes,
   TlpHandshakeMessage,
   TlpHandshakeMessages,
@@ -39,7 +40,6 @@ type
     function Body(const AName: string): TBytes;
   protected
     procedure SetUp; override;
-    procedure TearDown; override;
   published
     procedure TestClientHelloDecodeAndRoundTrip;
     procedure TestServerHelloDecodeAndRoundTrip;
@@ -50,7 +50,17 @@ type
     procedure TestFinishedRoundTrip;
     procedure TestTruncatedClientHelloIsDecodeError;
     procedure TestOverlongSessionIdIsDecodeError;
+    procedure TestEmptyCertificateDataIsDecodeError;
     procedure TestEmptyOrTrailingNewSessionTicketIsDecodeError;
+    procedure TestEmptyCipherSuitesIsDecodeError;
+    procedure TestEmptyCompressionMethodsIsDecodeError;
+    procedure TestServerHelloNonNullCompressionTls13IsIllegalParameter;
+    procedure TestServerHelloNonNullCompressionTls12IsIllegalParameter;
+    procedure TestSelectedVersionZeroIsReportedAsPresent;
+    procedure TestSelectedVersionIsReportedAsWritten;
+    procedure TestOverlongSelectedVersionIsDecodeError;
+    procedure TestTruncatedSelectedVersionIsDecodeError;
+    procedure TestSelectedVersionAbsentIsReportedAsAbsent;
   end;
 
 implementation
@@ -60,13 +70,7 @@ implementation
 procedure TTestHandshakeMessages.SetUp;
 begin
   inherited SetUp;
-  FVec := LoadVectorFields('Rfc8448/HandshakeMessages.txt');
-end;
-
-procedure TTestHandshakeMessages.TearDown;
-begin
-  FVec.Free;
-  inherited TearDown;
+  FVec := Own<TStringList>(LoadVectorFields('Rfc8448/HandshakeMessages.txt'));
 end;
 
 function TTestHandshakeMessages.Body(const AName: string): TBytes;
@@ -212,6 +216,158 @@ begin
   CheckTrue(LRaised, 'a truncated ClientHello is a decode_error, not an over-read');
 end;
 
+procedure TTestHandshakeMessages.TestEmptyCipherSuitesIsDecodeError;
+var
+  LBody: TBytes;
+  LRaised: Boolean;
+begin
+  // a ClientHello with an empty cipher_suites<2..2^16-2> is a decode_error (RFC 9846 4.2.2):
+  // version + 32-byte random + empty session_id + empty cipher_suites + null compression + no exts
+  LBody := DecodeHex('0303' +
+    '0000000000000000000000000000000000000000000000000000000000000000' +
+    '00' + '0000' + '0100' + '0000');
+  LRaised := False;
+  try
+    THandshakeMessages.DecodeClientHello(LBody);
+  except
+    on E: EDecodeErrorTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'an empty cipher_suites list is a decode_error');
+end;
+
+procedure TTestHandshakeMessages.TestEmptyCompressionMethodsIsDecodeError;
+var
+  LBody: TBytes;
+  LRaised: Boolean;
+begin
+  // a ClientHello with an empty legacy_compression_methods<1..2^8-1> is a decode_error, distinct
+  // from the null-method-missing illegal_parameter (RFC 9846 4.2.2): one AES-128-GCM suite, then
+  // an empty compression vector
+  LBody := DecodeHex('0303' +
+    '0000000000000000000000000000000000000000000000000000000000000000' +
+    '00' + '00021301' + '00' + '0000');
+  LRaised := False;
+  try
+    THandshakeMessages.DecodeClientHello(LBody);
+  except
+    on E: EDecodeErrorTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'an empty legacy_compression_methods vector is a decode_error');
+end;
+
+procedure TTestHandshakeMessages.TestServerHelloNonNullCompressionTls13IsIllegalParameter;
+var
+  LBody: TBytes;
+  LRaised: Boolean;
+begin
+  // legacy_version 0303, zero random, empty session id, TLS_AES_128_GCM_SHA256, compression 1,
+  // then supported_versions selecting TLS 1.3 (RFC 9846 4.2.3)
+  LBody := DecodeHex('0303' +
+    '0000000000000000000000000000000000000000000000000000000000000000' +
+    '00' + '1301' + '01' + '0006' + '002b00020304');
+  LRaised := False;
+  try
+    THandshakeMessages.DecodeServerHello(LBody);
+  except
+    on E: EFatalAlertTlsLibException do
+    begin
+      LRaised := True;
+      CheckTrue(E.AlertDescription = TTlsAlertDescription.IllegalParameter,
+        'a non-null TLS 1.3 ServerHello compression method is illegal_parameter');
+    end;
+  end;
+  CheckTrue(LRaised, 'a non-null TLS 1.3 ServerHello compression method is refused');
+end;
+
+procedure TTestHandshakeMessages.TestServerHelloNonNullCompressionTls12IsIllegalParameter;
+var
+  LBody: TBytes;
+  LRaised: Boolean;
+begin
+  // the same hello without supported_versions is a TLS 1.2 selection (RFC 5246 7.4.1.3)
+  LBody := DecodeHex('0303' +
+    '0000000000000000000000000000000000000000000000000000000000000000' +
+    '00' + 'c02f' + '01');
+  LRaised := False;
+  try
+    THandshakeMessages.DecodeServerHello(LBody);
+  except
+    on E: EFatalAlertTlsLibException do
+    begin
+      LRaised := True;
+      CheckTrue(E.AlertDescription = TTlsAlertDescription.IllegalParameter,
+        'a non-null TLS 1.2 ServerHello compression method is illegal_parameter');
+    end;
+  end;
+  CheckTrue(LRaised, 'a non-null TLS 1.2 ServerHello compression method is refused');
+end;
+
+procedure TTestHandshakeMessages.TestSelectedVersionZeroIsReportedAsPresent;
+var
+  LVersion: UInt16;
+begin
+  // supported_versions = 0x0000 on the wire
+  CheckTrue(THandshakeMessages.TryGetServerHelloSelectedVersion(
+    DecodeHex('0006002b00020000'), LVersion), 'the extension is present');
+  CheckEquals(0, Integer(LVersion), 'the wire value is reported as is');
+end;
+
+procedure TTestHandshakeMessages.TestSelectedVersionIsReportedAsWritten;
+var
+  LVersion: UInt16;
+begin
+  CheckTrue(THandshakeMessages.TryGetServerHelloSelectedVersion(
+    DecodeHex('0006002b00020304'), LVersion), 'a TLS 1.3 selection is present');
+  CheckEquals($0304, Integer(LVersion), 'the TLS 1.3 value is reported as is');
+  CheckTrue(THandshakeMessages.TryGetServerHelloSelectedVersion(
+    DecodeHex('0006002b00020303'), LVersion), 'a TLS 1.2 selection is present');
+  CheckEquals($0303, Integer(LVersion), 'the TLS 1.2 value is reported as is');
+end;
+
+procedure TTestHandshakeMessages.TestOverlongSelectedVersionIsDecodeError;
+var
+  LVersion: UInt16;
+  LRaised: Boolean;
+begin
+  LRaised := False;
+  try
+    THandshakeMessages.TryGetServerHelloSelectedVersion(
+      DecodeHex('0007002b0003030400'), LVersion);
+  except
+    on EDecodeErrorTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a supported_versions body longer than one version is a decode_error');
+end;
+
+procedure TTestHandshakeMessages.TestTruncatedSelectedVersionIsDecodeError;
+var
+  LVersion: UInt16;
+  LRaised: Boolean;
+begin
+  LRaised := False;
+  try
+    THandshakeMessages.TryGetServerHelloSelectedVersion(
+      DecodeHex('0005002b000103'), LVersion);
+  except
+    on EDecodeErrorTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a one-byte supported_versions body is a decode_error');
+end;
+
+procedure TTestHandshakeMessages.TestSelectedVersionAbsentIsReportedAsAbsent;
+var
+  LVersion: UInt16;
+begin
+  CheckFalse(THandshakeMessages.TryGetServerHelloSelectedVersion(nil, LVersion),
+    'an omitted extensions field carries none');
+  CheckFalse(THandshakeMessages.TryGetServerHelloSelectedVersion(
+    DecodeHex('000400100000'), LVersion), 'a block without supported_versions carries none');
+end;
+
 procedure TTestHandshakeMessages.TestOverlongSessionIdIsDecodeError;
 
   function Rejects(const ABody: TBytes): Boolean;
@@ -230,7 +386,7 @@ var
   LServer: TTlsServerHello;
   LRaised: Boolean;
 begin
-  // legacy_session_id / legacy_session_id_echo are <0..32> (RFC 8446 4.1.2/4.1.3): a
+  // legacy_session_id / legacy_session_id_echo are <0..32> (RFC 9846 4.2.2/4.2.3): a
   // 33-byte value must be a decode_error, not silently accepted
   LClient := THandshakeMessages.DecodeClientHello(Body('client_hello'));
   SetLength(LClient.LegacySessionId, 33);
@@ -247,6 +403,34 @@ begin
       LRaised := True;
   end;
   CheckTrue(LRaised, 'a 33-byte ServerHello legacy_session_id_echo is a decode_error');
+end;
+
+procedure TTestHandshakeMessages.TestEmptyCertificateDataIsDecodeError;
+var
+  LRaised13, LRaised12: Boolean;
+begin
+  // cert_data is <1..2^24-1> in 1.3 (RFC 9846 4.5.1) and ASN.1Cert is <1..2^24-1> in 1.2
+  // (RFC 5246 7.4.2): a zero-length entry is malformed, not an empty certificate to be parsed
+  LRaised13 := False;
+  LRaised12 := False;
+  try
+    // empty context, one entry: cert_data length 0, empty extensions
+    THandshakeMessages.DecodeCertificate(DecodeHex('000000050000000000'));
+  except
+    on E: EDecodeErrorTlsLibException do
+      LRaised13 := True;
+  end;
+  try
+    THandshakeMessages.DecodeCertificate12(DecodeHex('000003000000'));
+  except
+    on E: EDecodeErrorTlsLibException do
+      LRaised12 := True;
+  end;
+  CheckTrue(LRaised13, 'a 1.3 entry with an empty certificate is a decode_error');
+  CheckTrue(LRaised12, 'a 1.2 entry with an empty certificate is a decode_error');
+  // the empty LIST remains valid (a client with no certificate)
+  CheckEquals(0, System.Length(THandshakeMessages.DecodeCertificate(
+    DecodeHex('00000000')).Entries), 'an empty 1.3 list decodes to no entries');
 end;
 
 procedure TTestHandshakeMessages.TestEmptyOrTrailingNewSessionTicketIsDecodeError;
@@ -274,7 +458,7 @@ begin
   LGood := THandshakeMessages.EncodeNewSessionTicket(LNst);
   CheckFalse(Rejects(LGood), 'a well-formed NewSessionTicket decodes');
 
-  // empty ticket is opaque ticket<1..2^16-1> -> decode_error (RFC 8446 4.6.1)
+  // empty ticket is opaque ticket<1..2^16-1> -> decode_error (RFC 9846 4.7.1)
   LNst.Ticket := nil;
   CheckTrue(Rejects(THandshakeMessages.EncodeNewSessionTicket(LNst)),
     'an empty NewSessionTicket ticket is a decode_error');

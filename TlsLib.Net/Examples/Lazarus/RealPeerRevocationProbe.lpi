@@ -17,13 +17,16 @@
     <PublishOptions>
       <Version Value="2"/>
     </PublishOptions>
-    <RequiredPackages Count="2">
+    <RequiredPackages Count="3">
       <Item1>
         <PackageName Value="TlsLib4PascalPackage"/>
       </Item1>
       <Item2>
-        <PackageName Value="FCL"/>
+        <PackageName Value="TlsLib.Trust.System"/>
       </Item2>
+      <Item3>
+        <PackageName Value="FCL"/>
+      </Item3>
     </RequiredPackages>
     <Units Count="2">
       <Unit0>
@@ -44,7 +47,7 @@
     </Target>
     <SearchPaths>
       <IncludeFiles Value="$(ProjOutDir)"/>
-      <OtherUnitFiles Value="..\src;..\.."/>
+      <OtherUnitFiles Value="..\src;..\..\src"/>
       <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
     </SearchPaths>
   </CompilerOptions>

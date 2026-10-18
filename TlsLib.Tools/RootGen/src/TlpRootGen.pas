@@ -353,13 +353,13 @@ begin
     AppendLine('interface');
     AppendLine('');
     AppendLine('uses');
-    AppendLine('  TlpICryptoProvider,');
-    AppendLine('  TlpICertificateTrust;');
+    AppendLine('  TlpIPkixProvider,');
+    AppendLine('  TlpITrustAnchorStore;');
     AppendLine('');
     AppendLine('type');
     AppendLine('  ' + LClass + ' = class sealed(TObject)');
     AppendLine('  public');
-    AppendLine('    class function AnchorStore(const AProvider: ICryptoProvider)');
+    AppendLine('    class function AnchorStore(const APkixProvider: IPkixProvider)');
     AppendLine('      : ITrustAnchorStore; static;');
     AppendLine('  end;');
     AppendLine('');
@@ -367,7 +367,7 @@ begin
     AppendLine('');
     AppendLine('uses');
     AppendLine('  SysUtils,');
-    AppendLine('  TlpCertificateVerifier;');
+    AppendLine('  TlpTrustAnchorStore;');
     AppendLine('');
     AppendLine('const');
     AppendLine('  CPemLines: array [0 .. ' + IntToStr(LTotal - 1) +
@@ -391,7 +391,7 @@ begin
     AppendLine('{ ' + LClass + ' }');
     AppendLine('');
     AppendLine('class function ' + LClass +
-      '.AnchorStore(const AProvider: ICryptoProvider): ITrustAnchorStore;');
+      '.AnchorStore(const APkixProvider: IPkixProvider): ITrustAnchorStore;');
     AppendLine('var');
     AppendLine('  LBuilder: TStringBuilder;');
     AppendLine('  LI: Integer;');
@@ -401,7 +401,7 @@ begin
     AppendLine('    for LI := 0 to System.High(CPemLines) do');
     AppendLine('      LBuilder.Append(CPemLines[LI]).Append(#10);');
     AppendLine('    Result := TTrustAnchorStore.Create(');
-    AppendLine('      AProvider.Certificates.LoadChain(');
+    AppendLine('      APkixProvider.Certificates.LoadChain(');
     AppendLine('        TEncoding.ASCII.GetBytes(LBuilder.ToString)))');
     AppendLine('      as ITrustAnchorStore;');
     AppendLine('  finally');

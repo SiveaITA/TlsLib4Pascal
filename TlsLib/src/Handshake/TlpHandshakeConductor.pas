@@ -18,7 +18,9 @@ interface
 uses
   SysUtils,
   TlpTlsAlert,
+  TlpHandshakeMessages,
   TlpHandshakeMessage,
+  TlpHandshakeStage,
   TlpIHandshakeChannel,
   TlpIHandshakeMachine,
   TlpHandshakeEffect,
@@ -40,21 +42,26 @@ type
     // set when the machine parks on a peer-certificate verdict (async): further inbound
     // messages are buffered, not processed, until the verdict resolves the park
     FVerdictPending: Boolean;
-    // set once the handshake completes; gates the flight-boundary excess-data check off for
-    // post-handshake traffic (NewSessionTicket / KeyUpdate legitimately span records)
-    FEstablished: Boolean;
     // count of post-handshake messages (KeyUpdate / NewSessionTicket) received with no
     // intervening application data; bounded to refuse a flood, reset by genuine traffic
     FPostHandshakeMessages: Int32;
     class function HasFail(const AEffects: TArray<THandshakeEffect>): Boolean; static;
-    class function HasAwaitVerdict(
-      const AEffects: TArray<THandshakeEffect>): Boolean; static;
-    class function HasEstablished(
-      const AEffects: TArray<THandshakeEffect>): Boolean; static;
+    /// <summary>Whether the machine has established (Stage = Connected); gates the flight-boundary
+    /// excess-data check off for post-handshake traffic (NewSessionTicket / KeyUpdate span records).</summary>
+    function IsEstablished: Boolean;
     /// <summary>Whether the effects begin a new outbound flight or change the read epoch - a
     /// flight boundary at which the peer's prior flight must have ended on a record boundary.</summary>
     class function HasFlightBoundary(
       const AEffects: TArray<THandshakeEffect>): Boolean; static;
+    /// <summary>Whether the effects install new read keys - a key change at which no further
+    /// handshake byte may follow in the same record, whether mid-handshake or a later KeyUpdate.</summary>
+    class function HasReadKeyChange(
+      const AEffects: TArray<THandshakeEffect>): Boolean; static;
+    /// <summary>Whether buffered handshake bytes remain past a point where the peer's record must
+    /// have ended: a read-key change at any time (RFC 9846 5.1), or, as local policy, a flight
+    /// boundary or completion while still handshaking.</summary>
+    function ExcessAfterBoundary(const AEffects: TArray<THandshakeEffect>;
+      AWasEstablished: Boolean): Boolean;
     /// <summary>Feeds every whole buffered message into the machine, applying its effects,
     /// until the channel drains, a Fail stops it, or the machine parks for a verdict.</summary>
     procedure DrainInbound;
@@ -71,31 +78,49 @@ type
     function AwaitingVerdict: Boolean;
     /// <summary>Resolves a parked peer-certificate verdict: True resumes and drains the
     /// buffered flight (the trust pipeline has already passed); False aborts fail-closed with
-    /// AAlert (default bad_certificate). A no-op when nothing is parked.</summary>
+    /// AAlert. A no-op when nothing is parked.</summary>
     procedure ResolveCertificateVerdict(AAccept: Boolean;
-      AAlert: TTlsAlertDescription = TTlsAlertDescription.BadCertificate);
-    /// <summary>Applies the machine's post-handshake KeyUpdate effects (RFC 8446 4.6.3).</summary>
-    procedure RequestKeyUpdate(ARequestPeerUpdate: Boolean);
+      AAlert: TTlsAlertDescription);
+    /// <summary>Applies the machine's post-handshake KeyUpdate effects (RFC 9846 4.7.3).</summary>
+    procedure RequestKeyUpdate(ARequest: TKeyUpdateRequest);
     /// <summary>Applies any pending coalesced KeyUpdate response (before an app write).</summary>
     procedure FlushPendingKeyUpdate;
-    /// <summary>Notes that application data arrived: genuine traffic resets the consecutive
-    /// post-handshake message flood counter (RFC 8446 4.6.3 permits unbounded KeyUpdates over
-    /// a connection's life, but not an uninterrupted stream of them).</summary>
+    /// <summary>Notes that application data arrived, which resets the post-handshake flood counter.</summary>
     procedure NoteApplicationData;
-    /// <summary>Exported keying material from the active machine's secrets (RFC 8446 7.5 /
+    /// <summary>Exported keying material from the active machine's secrets (RFC 9846 7.5 /
     /// RFC 5705).</summary>
+    function ExportKeyingMaterial(const ALabel: string;
+      ALength: Int32): TBytes; overload;
     function ExportKeyingMaterial(const ALabel: string; const AContext: TBytes;
-      AUseContext: Boolean; ALength: Int32): TBytes;
+      ALength: Int32): TBytes; overload;
     /// <summary>Whether the active machine's exporter secret is available (half-RTT for a
     /// TLS 1.3 server).</summary>
     function CanExportKeyingMaterial: Boolean;
+    /// <summary>Early-data (0-RTT) keying material from the active machine (RFC 9846 7.5).</summary>
+    function ExportEarlyKeyingMaterial(const ALabel: string; const AContext: TBytes;
+      ALength: Int32): TBytes;
+    /// <summary>Whether the active machine's early_exporter_secret is available.</summary>
+    function CanExportEarlyKeyingMaterial: Boolean;
+    /// <summary>Whether a handshake message is partially buffered (spanning records). A
+    /// non-handshake record arriving now would interleave with it (RFC 9846 5.1).</summary>
+    function HasBufferedHandshake: Boolean;
+    /// <summary>Drops the resumable sessions the active machine stored once the connection ended
+    /// in a fatal alert (RFC 5246 7.2.2, RFC 9846 6).</summary>
+    procedure ForgetSessionsOnFatal;
   end;
 
 implementation
 
+resourcestring
+  SPostHandshakeFlood = 'the peer sent too many post-handshake messages without application data';
+  SDataPastFlightBoundary =
+    'the peer sent handshake data past a key change or the end of its flight in the same record';
+  SCertificateVerdictRejected = 'the peer certificate was rejected by the host''s verdict';
+
 const
-  // the number of consecutive post-handshake messages tolerated with no intervening application
-  // data before the stream is refused as a flood (a peer streaming KeyUpdate is a DoS)
+  // the most post-handshake messages accepted in a row with no application data between them; more
+  // are refused as a flood (local DoS policy). KeyUpdates and, for a client that does not resume,
+  // NewSessionTickets both count
   MaxConsecutivePostHandshakeMessages = Int32(32);
 
 { THandshakeConductor }
@@ -126,26 +151,9 @@ begin
       Exit(True);
 end;
 
-class function THandshakeConductor.HasAwaitVerdict(
-  const AEffects: TArray<THandshakeEffect>): Boolean;
-var
-  LEffect: THandshakeEffect;
+function THandshakeConductor.IsEstablished: Boolean;
 begin
-  Result := False;
-  for LEffect in AEffects do
-    if LEffect.Kind = THandshakeEffectKind.AwaitCertificateVerdict then
-      Exit(True);
-end;
-
-class function THandshakeConductor.HasEstablished(
-  const AEffects: TArray<THandshakeEffect>): Boolean;
-var
-  LEffect: THandshakeEffect;
-begin
-  Result := False;
-  for LEffect in AEffects do
-    if LEffect.Kind = THandshakeEffectKind.HandshakeEstablished then
-      Exit(True);
+  Result := FMachine.Stage = THandshakeStage.Connected;
 end;
 
 class function THandshakeConductor.HasFlightBoundary(
@@ -156,7 +164,7 @@ begin
   Result := False;
   for LEffect in AEffects do
     // sending a handshake message means the peer's flight ended and we are responding; a
-    // read-epoch install is a key change. Either way the reassembler must be empty (RFC 8446
+    // read-epoch install is a key change. Either way the reassembler must be empty (RFC 9846
     // 5.1): a handshake message must not span a key change or a flight boundary.
     if (LEffect.Kind = THandshakeEffectKind.SendHandshake) or
       ((LEffect.Kind = THandshakeEffectKind.InstallKeys) and
@@ -164,25 +172,71 @@ begin
       Exit(True);
 end;
 
+class function THandshakeConductor.HasReadKeyChange(
+  const AEffects: TArray<THandshakeEffect>): Boolean;
+var
+  LEffect: THandshakeEffect;
+begin
+  Result := False;
+  for LEffect in AEffects do
+    if (LEffect.Kind = THandshakeEffectKind.InstallKeys) and
+      (LEffect.Side = TRecordSide.ReadSide) then
+      Exit(True);
+end;
+
+function THandshakeConductor.ExcessAfterBoundary(
+  const AEffects: TArray<THandshakeEffect>; AWasEstablished: Boolean): Boolean;
+begin
+  Result := FChannel.HasPartialInbound and (HasReadKeyChange(AEffects) or
+    ((not AWasEstablished) and (HasFlightBoundary(AEffects) or IsEstablished)));
+end;
+
 procedure THandshakeConductor.Start;
 begin
   FDriver.ApplyAll(FMachine.Start);
 end;
 
-procedure THandshakeConductor.RequestKeyUpdate(ARequestPeerUpdate: Boolean);
+procedure THandshakeConductor.RequestKeyUpdate(ARequest: TKeyUpdateRequest);
 begin
-  FDriver.ApplyAll(FMachine.RequestKeyUpdate(ARequestPeerUpdate));
+  FDriver.ApplyAll(FMachine.RequestKeyUpdate(ARequest));
 end;
 
 function THandshakeConductor.ExportKeyingMaterial(const ALabel: string;
-  const AContext: TBytes; AUseContext: Boolean; ALength: Int32): TBytes;
+  ALength: Int32): TBytes;
 begin
-  Result := FMachine.ExportKeyingMaterial(ALabel, AContext, AUseContext, ALength);
+  Result := FMachine.ExportKeyingMaterial(ALabel, ALength);
+end;
+
+function THandshakeConductor.ExportKeyingMaterial(const ALabel: string;
+  const AContext: TBytes; ALength: Int32): TBytes;
+begin
+  Result := FMachine.ExportKeyingMaterial(ALabel, AContext, ALength);
 end;
 
 function THandshakeConductor.CanExportKeyingMaterial: Boolean;
 begin
   Result := FMachine.CanExportKeyingMaterial;
+end;
+
+function THandshakeConductor.ExportEarlyKeyingMaterial(const ALabel: string;
+  const AContext: TBytes; ALength: Int32): TBytes;
+begin
+  Result := FMachine.ExportEarlyKeyingMaterial(ALabel, AContext, ALength);
+end;
+
+function THandshakeConductor.CanExportEarlyKeyingMaterial: Boolean;
+begin
+  Result := FMachine.CanExportEarlyKeyingMaterial;
+end;
+
+procedure THandshakeConductor.ForgetSessionsOnFatal;
+begin
+  FMachine.ForgetSessionsOnFatal;
+end;
+
+function THandshakeConductor.HasBufferedHandshake: Boolean;
+begin
+  Result := FChannel.HasPartialInbound;
 end;
 
 procedure THandshakeConductor.FlushPendingKeyUpdate;
@@ -199,21 +253,22 @@ procedure THandshakeConductor.DrainInbound;
 var
   LMessage: TTlsHandshakeMessage;
   LEffects: TArray<THandshakeEffect>;
-  LEstablished, LFlightBoundary, LWasEstablished: Boolean;
+  LWasEstablished: Boolean;
 begin
-  LEstablished := False;
-  LFlightBoundary := False;
-  LWasEstablished := FEstablished;
+  LWasEstablished := IsEstablished;
   while FChannel.ReceiveHandshake(LMessage) do
   begin
     // once established, bound a peer flooding post-handshake messages (KeyUpdate /
-    // NewSessionTicket) with no intervening application data to reset the count
-    if FEstablished then
+    // NewSessionTicket) with no intervening application data to reset the count. Gated on the
+    // entry state so a message that establishes the connection in this same drain, and any
+    // coalesced with it, are not counted until a later drain.
+    if LWasEstablished then
     begin
       Inc(FPostHandshakeMessages);
       if FPostHandshakeMessages > MaxConsecutivePostHandshakeMessages then
       begin
-        FDriver.Apply(THandshakeEffects.Fail(TTlsAlertDescription.UnexpectedMessage));
+        FDriver.Apply(THandshakeEffects.Fail(TTlsAlertDescription.UnexpectedMessage,
+          SPostHandshakeFlood));
         Exit;
       end;
     end;
@@ -222,29 +277,26 @@ begin
     // a Fail makes the connection terminal; do not keep feeding the machine
     if HasFail(LEffects) then
       Exit;
-    if HasEstablished(LEffects) then
-      LEstablished := True;
-    if HasFlightBoundary(LEffects) then
-      LFlightBoundary := True;
+    // the peer must not pack the next flight's bytes into the record that ends the current one
+    // (a read-key change requires it, RFC 9846 5.1; a flight boundary is local policy), so buffered
+    // bytes past a read-key change, or past a flight boundary or completion while handshaking, are
+    // excess data. Checked per message so a complete message
+    // behind the boundary is refused too. Post-handshake NewSessionTicket / KeyUpdate may span
+    // records, so only a key change is a boundary once established.
+    if ExcessAfterBoundary(LEffects, LWasEstablished) then
+    begin
+      FDriver.Apply(THandshakeEffects.Fail(TTlsAlertDescription.UnexpectedMessage,
+        SDataPastFlightBoundary));
+      Exit;
+    end;
     // a park for an async peer-certificate verdict suspends processing: the rest of the
     // (possibly coalesced) flight stays buffered until the verdict resumes it
-    if HasAwaitVerdict(LEffects) then
+    if FMachine.Stage = THandshakeStage.ParkedForVerdict then
     begin
       FVerdictPending := True;
       Break;
     end;
   end;
-  if LEstablished then
-    FEstablished := True;
-  // the peer must not pack the next flight's bytes into the record that ends the current one
-  // (RFC 8446 5.1). Once we complete the handshake, or - while still handshaking - respond
-  // with a new flight or change the read epoch, any handshake bytes still buffered form a
-  // partial message that spans that boundary: excess data. Post-handshake messages
-  // (NewSessionTicket / KeyUpdate) may legitimately span records, so the mid-handshake
-  // boundary check is gated off once established.
-  if FChannel.HasPartialInbound and
-    (LEstablished or (LFlightBoundary and not LWasEstablished)) then
-    FDriver.Apply(THandshakeEffects.Fail(TTlsAlertDescription.UnexpectedMessage));
 end;
 
 procedure THandshakeConductor.DeliverHandshake(const AData: TBytes;
@@ -273,29 +325,27 @@ begin
   FVerdictPending := False;
   if not AAccept then
   begin
-    // fail-closed: the host rejected the peer chain (or the deadline expired). The built-in
+    // fail-closed: the host rejected the peer chain (or its resolver timed out). The built-in
     // pipeline had already accepted it, so this can only additionally reject - augment-only.
     // AAlert lets a definitive live-revocation reject abort with certificate_revoked
-    FDriver.Apply(THandshakeEffects.Fail(AAlert));
+    FDriver.Apply(THandshakeEffects.Fail(AAlert, SCertificateVerdictRejected));
     Exit;
   end;
-  // accepted. First apply any continuation the machine withheld behind the park: the TLS 1.3
-  // reverify-on-resume park sits at ServerFinished, where no peer message remains to drive
+  // accepted. First apply any continuation the machine withheld behind the park: a reverify-on-
+  // resume park sits at the (abbreviated) ServerFinished, where no peer message remains to drive
   // completion, so the machine emits its closing flight here. The initial-certificate park
   // returns none - its buffered server flight drives it below.
-  LWasEstablished := FEstablished;
+  LWasEstablished := IsEstablished;
   LEffects := FMachine.ResumeAfterVerdict;
   FDriver.ApplyAll(LEffects);
   if HasFail(LEffects) then
     Exit;
-  if HasEstablished(LEffects) then
-    FEstablished := True;
   // the same flight-boundary excess-data guard DrainInbound applies to a batch: the peer's
   // prior flight (the server Finished) must have ended on a record boundary
-  if FChannel.HasPartialInbound and
-    (HasEstablished(LEffects) or (HasFlightBoundary(LEffects) and not LWasEstablished)) then
+  if ExcessAfterBoundary(LEffects, LWasEstablished) then
   begin
-    FDriver.Apply(THandshakeEffects.Fail(TTlsAlertDescription.UnexpectedMessage));
+    FDriver.Apply(THandshakeEffects.Fail(TTlsAlertDescription.UnexpectedMessage,
+      SDataPastFlightBoundary));
     Exit;
   end;
   // process the buffered remainder: the initial-park server flight (CertificateVerify,

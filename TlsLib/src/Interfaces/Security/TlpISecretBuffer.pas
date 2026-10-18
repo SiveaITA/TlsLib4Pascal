@@ -20,12 +20,11 @@ uses
 
 type
   /// <summary>
-  /// A refcounted handle to a heap-stable region holding key material. Callers
-  /// hold this interface, never the concrete class, so the last release
-  /// deterministically wipes the backing memory.
+  /// A handle to a heap-stable region holding key material. The backing memory is
+  /// wiped when the buffer is released.
   /// </summary>
   ISecretBuffer = interface(IInterface)
-    ['{7DF4D709-8445-4227-AE82-EC9B9C930B72}']
+    ['{80E70BAC-E15F-41D6-A2E7-522817A65E9C}']
 
     /// <summary>The length of the secret in bytes.</summary>
     function Len: Int32;
@@ -35,12 +34,6 @@ type
     /// a reference to this instance is held.
     /// </summary>
     function DataPtr: PByte;
-
-    /// <summary>
-    /// Overwrites the owned buffer with ALen bytes read from ASrc. Raises if
-    /// ALen exceeds the buffer length.
-    /// </summary>
-    procedure CopyFrom(ASrc: PByte; ALen: Int32);
 
     /// <summary>
     /// A caller-owned copy of the secret as a transient array (typically to feed

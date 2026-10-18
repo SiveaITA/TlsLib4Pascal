@@ -19,7 +19,8 @@ uses
   SysUtils,
   TlpCryptoDomainTypes,
   TlpISigningKey,
-  TlpTlsCredential,
+  TlpIKeyExchangePrivateKey,
+  TlpImportedCredential,
   TlpISecretBuffer;
 
 type
@@ -31,9 +32,9 @@ type
   /// weak or zero fallback.
   /// </summary>
   IRandom = interface(IInterface)
-    ['{08659DB4-A63B-4FDB-AA8C-0810BB8D8BDC}']
+    ['{8D682F1C-50FC-41DA-9749-B0A68D4DE5D5}']
     /// <summary>Fills the whole of ABuffer with random bytes.</summary>
-    procedure NextBytes(var ABuffer: TBytes);
+    procedure NextBytes(const ABuffer: TBytes);
     /// <summary>Returns ALength fresh random bytes.</summary>
     function GenerateBytes(ALength: Int32): TBytes;
   end;
@@ -44,15 +45,11 @@ type
   /// </summary>
   IHash = interface(IInterface)
     ['{FAF552F4-DEBA-4AA1-A3EE-C58E291FDAAB}']
-    function AlgorithmName: string;
     /// <summary>Digest output size in bytes.</summary>
     function HashSize: Int32;
-    /// <summary>Internal block size in bytes.</summary>
-    function BlockSize: Int32;
     procedure Update(const AData: TBytes; AOffset, ALength: Int32);
     /// <summary>Finalizes and returns the digest; resets for reuse.</summary>
     function DoFinal: TBytes;
-    procedure Reset;
     /// <summary>An independent copy at the current state.</summary>
     function Clone: IHash;
   end;
@@ -60,13 +57,11 @@ type
   /// <summary>Keyed MAC (HMAC).</summary>
   IHmac = interface(IInterface)
     ['{E1A30A8D-B6A1-4F79-B12C-46B68BFB3C3B}']
-    function AlgorithmName: string;
     /// <summary>MAC output size in bytes.</summary>
     function MacSize: Int32;
     procedure Init(const AKey: ISecretBuffer);
     procedure Update(const AData: TBytes; AOffset, ALength: Int32);
     function DoFinal: TBytes;
-    procedure Reset;
   end;
 
   /// <summary>
@@ -76,9 +71,12 @@ type
   /// </summary>
   IHkdf = interface(IInterface)
     ['{CE8C6F1F-9C1E-46F2-95EC-8F8FA500A5DD}']
-    /// <summary>PRK = HMAC-Hash(salt, IKM); an empty salt is treated as HashLen zeros.</summary>
-    function Extract(const ASalt: TBytes; const AIkm: ISecretBuffer): ISecretBuffer;
-    /// <summary>OKM = HKDF-Expand(PRK, info, ALength).</summary>
+    /// <summary>PRK = HMAC-Hash(salt, IKM); a nil or zero-length salt is treated as HashLen
+    /// zeros. The salt is secret material (a derived-secret in the TLS 1.3 schedule), so it is
+    /// passed as a wiped buffer rather than a bare byte array the caller must scrub.</summary>
+    function Extract(const ASalt, AIkm: ISecretBuffer): ISecretBuffer;
+    /// <summary>OKM = HKDF-Expand(PRK, info, ALength). ALength is 0..255*HashLen; outside
+    /// that range raises EArgumentTlsLibException.</summary>
     function Expand(const APrk: ISecretBuffer; const AInfo: TBytes;
       ALength: Int32): ISecretBuffer;
   end;
@@ -92,7 +90,7 @@ type
   ITls12Prf = interface(IInterface)
     ['{3F9A2C71-5E84-4B60-9D17-8A2C4E7B10F5}']
     function Compute(const ASecret: ISecretBuffer; const ALabel: string;
-      const ASeed: TBytes; ALength: Int32): TBytes;
+      const ASeed: TBytes; ALength: Int32): ISecretBuffer;
   end;
 
   /// <summary>
@@ -101,23 +99,33 @@ type
   /// authentication failure.
   /// </summary>
   IAead = interface(IInterface)
-    ['{0A207715-F01E-4C2D-AD4D-AEC6C0EC32D9}']
-    function AlgorithmName: string;
-    /// <summary>The usage-limit family the record layer derives its rekey bound from.</summary>
+    ['{9F5FB86B-C4E6-49C0-BE25-95FA8DB9DAF6}']
+    /// <summary>The AEAD's family (AES-GCM vs ChaCha20-Poly1305): selects the TLS 1.2 nonce framing
+    /// and the default usage limit.</summary>
     function UsageCategory: TAeadUsageCategory;
+    /// <summary>Records that may be sealed under one key: the record layer rekeys a lead before this
+    /// bound and refuses to seal at it (RFC 9846 5.5). Must exceed the rekey lead of 16 records, or
+    /// the epoch is rejected at install (a KeyUpdate could never seal in time).</summary>
+    function UsageLimit: UInt64;
     /// <summary>Required key length in bytes.</summary>
     function KeySize: Int32;
     /// <summary>Required nonce length in bytes.</summary>
     function NonceSize: Int32;
-    /// <summary>Authentication tag length in bytes.</summary>
+    /// <summary>Authentication tag length in bytes (also the bytes sealing adds).</summary>
     function TagSize: Int32;
-    /// <summary>Bytes added by sealing (the tag length).</summary>
-    function Overhead: Int32;
     procedure Init(const AKey: ISecretBuffer);
-    /// <summary>Encrypts and authenticates; returns ciphertext followed by the tag.</summary>
-    function Seal(const ANonce, AAad, APlaintext: TBytes): TBytes;
-    /// <summary>Authenticates and decrypts ciphertext||tag; raises on auth failure.</summary>
-    function Open(const ANonce, AAad, ACiphertext: TBytes): TBytes;
+    /// <summary>Encrypts and authenticates ASrc[ASrcOff .. ASrcOff+ALen), writing ciphertext
+    /// followed by the tag (ALen + TagSize bytes) at ADest[ADestOff]. ADest may be the same array
+    /// as ASrc with ADestOff = ASrcOff (exact in-place); any other overlap is rejected. The caller
+    /// sizes ADest for ALen + TagSize at ADestOff. Returns the bytes written.</summary>
+    function Seal(const ANonce, AAad, ASrc: TBytes; ASrcOff, ALen: Int32;
+      const ADest: TBytes; ADestOff: Int32): Int32;
+    /// <summary>Authenticates and decrypts ciphertext||tag at ASrc[ASrcOff .. ASrcOff+ALen),
+    /// writing the plaintext (ALen - TagSize bytes) at ADest[ADestOff]; same aliasing rule. Raises
+    /// a fatal bad_record_mac on authentication failure, leaving no unverified plaintext in ADest.
+    /// Returns the plaintext length.</summary>
+    function Open(const ANonce, AAad, ASrc: TBytes; ASrcOff, ALen: Int32;
+      const ADest: TBytes; ADestOff: Int32): Int32;
   end;
 
   /// <summary>
@@ -126,28 +134,25 @@ type
   /// provider so a different backend can supply it.
   /// </summary>
   IKeyAgreement = interface(IInterface)
-    ['{FFE70BE6-D33F-4CD4-B6B4-AA381B8863DE}']
-    function Name: string;
-    /// <summary>A fresh key pair: the private key and the public value to send.</summary>
-    procedure GenerateKeyPair(out APrivateKey: ISecretBuffer; out APublicKey: TBytes);
-    /// <summary>The shared secret from our private key and a peer's public value.
-    /// AUsage declares whether the private key is a fresh single-use scalar or a
-    /// long-lived one reused across operations; callers must pass Static for any key
-    /// that outlives one operation. A backend that can select a reuse-hardened
-    /// scalar-blinding posture does so for Static; others accept it without effect.</summary>
-    function Agree(const APrivateKey: ISecretBuffer; const APeerPublicKey: TBytes;
-      AUsage: TKeyAgreementUsage): ISecretBuffer;
+    ['{D3D95685-9395-45A0-806E-F7869452C8E6}']
+    /// <summary>A fresh key pair: the private key (an Ephemeral handle) and the public value
+    /// to send.</summary>
+    procedure GenerateKeyPair(out APrivateKey: IKeyExchangePrivateKey;
+      out APublicKey: TBytes);
+    /// <summary>The shared secret from our private key and a peer's public value. The key's
+    /// own Usage (fixed at mint) tells the backend whether it is a fresh single-use scalar or a
+    /// long-lived one, so a backend that can select a reuse-hardened scalar-blinding posture
+    /// does so for a Static key.</summary>
+    function Agree(const APrivateKey: IKeyExchangePrivateKey;
+      const APeerPublicKey: TBytes): ISecretBuffer;
     /// <summary>Whether a peer's public value is well-formed and safe to use.</summary>
     function ValidatePublicKey(const APublicKey: TBytes): Boolean;
-    /// <summary>A private key adopted from a raw scalar (the curve's fixed-width
-    /// serialization), plus its derived public value. The returned key is in this
-    /// backend's own representation, ready for <see cref="Agree" />.</summary>
+    /// <summary>A private key adopted from a raw scalar (the curve's fixed-width serialization),
+    /// plus its derived public value. AUsage declares whether it will be reused (Static) or is
+    /// single-use (Ephemeral) - the one place a Static posture is set. The returned key is in
+    /// this backend's own representation, ready for <see cref="Agree" />.</summary>
     function ImportPrivateKey(const ARawPrivateKey: ISecretBuffer;
-      out APublicKey: TBytes): ISecretBuffer;
-    /// <summary>The raw scalar behind a private key from GenerateKeyPair /
-    /// ImportPrivateKey - the neutral currency a caller can persist and re-import,
-    /// on either backend.</summary>
-    function ExportPrivateKey(const APrivateKey: ISecretBuffer): ISecretBuffer;
+      AUsage: TKeyAgreementUsage; out APublicKey: TBytes): IKeyExchangePrivateKey;
   end;
 
   /// <summary>
@@ -155,18 +160,18 @@ type
   /// so a different backend can supply it; the named-group layer wraps it.
   /// </summary>
   IKem = interface(IInterface)
-    ['{F362C3EF-E378-4C84-A7AB-45777EC1A8CA}']
-    function Name: string;
-    /// <summary>A fresh key pair: the private (decapsulation) key and the public
+    ['{6D6797E6-1ECD-4ED4-B420-6E171CC8D457}']
+    /// <summary>A fresh key pair: the private (decapsulation) key handle and the public
     /// (encapsulation) key to send.</summary>
-    procedure GenerateKeyPair(out APrivateKey: ISecretBuffer; out APublicKey: TBytes);
+    procedure GenerateKeyPair(out APrivateKey: IKeyExchangePrivateKey;
+      out APublicKey: TBytes);
     /// <summary>Against a peer's public key, the ciphertext to send and the
     /// shared secret.</summary>
     procedure Encapsulate(const APeerPublicKey: TBytes; out ACiphertext: TBytes;
       out ASharedSecret: ISecretBuffer);
     /// <summary>From the private key and a ciphertext, the shared secret.</summary>
-    procedure Decapsulate(const APrivateKey: ISecretBuffer; const ACiphertext: TBytes;
-      out ASharedSecret: ISecretBuffer);
+    procedure Decapsulate(const APrivateKey: IKeyExchangePrivateKey;
+      const ACiphertext: TBytes; out ASharedSecret: ISecretBuffer);
     /// <summary>Whether a peer's public key is well-formed.</summary>
     function ValidatePublicKey(const APublicKey: TBytes): Boolean;
   end;
@@ -200,7 +205,6 @@ type
   /// </summary>
   ISignatureSigner = interface(IInterface)
     ['{9B1CAFD9-7162-4B3A-8615-6DD9AC6C0A7E}']
-    function AlgorithmName: string;
     procedure Update(const AData: TBytes; AOffset, ALength: Int32);
     function Sign: TBytes;
   end;
@@ -211,7 +215,6 @@ type
   /// </summary>
   ISignatureVerifier = interface(IInterface)
     ['{AE23AEDF-7BCD-42A3-A5A9-2D49868D4FDC}']
-    function AlgorithmName: string;
     procedure Update(const AData: TBytes; AOffset, ALength: Int32);
     function Verify(const ASignature: TBytes): Boolean;
   end;
@@ -224,261 +227,54 @@ type
   /// coherence domain.
   /// </summary>
   ISigningCrypto = interface(IInterface)
-    ['{367BAFEA-1828-4B5A-BA87-82CEDB994DD0}']
+    ['{F109F075-4F7D-4FF5-91F4-CCE67C2E080F}']
     /// <summary>
     /// Imports a signing private key in any supported encoding - PKCS#8, PKCS#1
     /// (RSAPrivateKey) or SEC1 (ECPrivateKey), in DER or PEM - into an opaque handle
-    /// that holds it as canonical PKCS#8 and reports the schemes it can sign with.
-    /// Malformed input raises EArgumentTlsLibException; an unsupported key algorithm
-    /// raises ENotSupportedTlsLibException.
-    /// </summary>
-    function ImportSigningKey(const AData: TBytes): ISigningKey; overload;
-    /// <summary>
-    /// As <see cref="ImportSigningKey" />, decrypting an encrypted PKCS#8 key (DER
-    /// EncryptedPrivateKeyInfo or an encrypted PEM key) with APassword.
+    /// that holds the parsed key (the PKCS#8 bytes are not retained) and reports the schemes it
+    /// can sign with. An encrypted
+    /// PKCS#8 key (DER EncryptedPrivateKeyInfo or an encrypted PEM key) is decrypted with APassword,
+    /// a wiped buffer of UTF-8 passphrase octets: nil and a zero-length buffer are both the empty
+    /// passphrase. An encrypted key that does not decrypt under an empty passphrase raises
+    /// EArgumentTlsLibException (password required); a legacy "Proc-Type: 4,ENCRYPTED" PEM key
+    /// needs a non-empty one. Malformed input raises
+    /// EArgumentTlsLibException; an unsupported key algorithm or key encryption raises
+    /// ENotSupportedTlsLibException.
     /// </summary>
     function ImportSigningKey(const AData: TBytes;
-      const APassword: string): ISigningKey; overload;
+      const APassword: ISecretBuffer): ISigningKey;
     /// <summary>
-    /// Imports a PKCS#12 (.pfx/.p12) blob decrypted with APassword into a complete
-    /// credential: the leaf and any intermediates as the chain (leaf first, DER) and an
-    /// ISigningKey composed from the enclosed private key. The store must hold exactly one
-    /// private-key entry - a multi-identity store is ambiguous and rejected. Fails closed:
-    /// a wrong password, bad MAC, malformed store, or an ambiguous/absent key raises
-    /// EArgumentTlsLibException and no partial credential is returned; an unsupported key
-    /// algorithm raises ENotSupportedTlsLibException.
+    /// Imports a PKCS#12 (.pfx/.p12) blob decrypted with APassword into a crypto-level identity:
+    /// the leaf and any intermediates as the chain (leaf first, DER) and an ISigningKey composed
+    /// from the enclosed private key (TTlsCredential.LoadPkcs12 lifts it into a full credential).
+    /// The store must yield exactly one private key, else it is rejected; a backend may ignore a
+    /// key bag that no certificate pairs.
+    /// The leaf is the certificate whose public key pairs the private key (PKCS#12 imposes no
+    /// order and the key/cert link may be absent or wrong): the certificate the store links to the
+    /// key when it pairs it, else the pairing certificate with the lowest DER byte order. The chain
+    /// follows the leaf by issuer name: each next certificate is the one whose Subject equals the
+    /// current Issuer byte for byte (the lowest DER on a tie), ending at a self-issued
+    /// certificate, when none matches, or when a certificate would repeat; certificates off that
+    /// walk are dropped. Fails closed: a wrong password, bad MAC, malformed store, or a store
+    /// with no certificate for its key raises EArgumentTlsLibException and no partial credential
+    /// is returned; an unsupported key algorithm raises ENotSupportedTlsLibException.
+    /// The passphrase is a wiped buffer of UTF-8 passphrase octets: nil and a zero-length buffer
+    /// are both the empty passphrase.
     /// </summary>
     function ImportPkcs12(const AData: TBytes;
-      const APassword: string): TTlsCredential;
-    /// <summary>A signer for AScheme over the imported signing key AKey.</summary>
+      const APassword: ISecretBuffer): TImportedCredential;
+    /// <summary>A signer for AScheme over the imported signing key AKey. Raises
+    /// EArgumentTlsLibException when AScheme is not among the key's CapableSchemes or the key
+    /// cannot produce it; never lets a raw backend exception cross the seam.</summary>
     function CreateSignatureSigner(AScheme: TSignatureScheme;
       const AKey: ISigningKey): ISignatureSigner;
-    /// <summary>A verifier for AScheme over the SubjectPublicKeyInfo in APublicKeyDer.</summary>
+    /// <summary>A verifier for AScheme over the SubjectPublicKeyInfo in APublicKeyDer. Raises
+    /// EArgumentTlsLibException on a malformed SPKI; when the scheme's key family does not match
+    /// the key (e.g. an EC key under rsa_pss_rsae_*) returns a verifier that fails closed, so the
+    /// mismatch surfaces as a failed verification. Never lets a raw backend exception cross the
+    /// seam.</summary>
     function CreateSignatureVerifier(AScheme: TSignatureScheme;
       const APublicKeyDer: TBytes): ISignatureVerifier;
-  end;
-
-{ ===== Certificate operations ===== }
-
-  /// <summary>
-  /// A single certificate parsed once into an opaque handle, answering the
-  /// per-certificate queries from that one decode. It lets a caller that inspects the
-  /// same leaf several times in a handshake pay the ASN.1 decode a single time. The
-  /// handle is obtained from <see cref="ICertificateInspector.Parse" /> and is not
-  /// shared across threads.
-  /// </summary>
-  IInspectedCertificate = interface(IInterface)
-    ['{5A0E2B77-3C41-4E28-9B6E-7E9F0C6D1A44}']
-    function PublicKeyInfo: TBytes;
-    function DnsNames: TArray<string>;
-    function IpAddresses: TArray<TBytes>;
-    /// <summary>
-    /// Whether the certificate's keyUsage extension (RFC 5280 4.2.1.3) permits AUsage.
-    /// Yes when the extension is absent (no restriction) or asserts the bit; No only when
-    /// the extension is present and the bit is clear; Undetermined on a malformed certificate.
-    /// </summary>
-    function KeyUsagePermits(AUsage: TCertKeyUsage): TCertAnswer;
-    /// <summary>
-    /// Whether the certificate's SubjectPublicKeyInfo algorithm is id-RSASSA-PSS
-    /// (OID 1.2.840.113549.1.1.10), the restricted RSA-PSS key type that the
-    /// rsa_pss_rsae_* schemes must not be used with (RFC 8446 4.2.3). Yes when it is,
-    /// No when it is not, Undetermined on a malformed certificate.
-    /// </summary>
-    function KeyIsRsaPss: TCertAnswer;
-    function KeyKind(out AKind: TCertKeyKind; out AEcNamedGroup: UInt16): Boolean;
-    /// <summary>
-    /// The subject public key's strength facts (family, size, curve). Returns False (facts
-    /// undeterminable - unknown key OID, explicit EC parameters, malformed) so the caller
-    /// fails closed.
-    /// </summary>
-    function KeyFacts(out AFacts: TCertKeyFacts): Boolean;
-    /// <summary>
-    /// The algorithm the certificate was signed with (family, hash, canonical-PSS flag).
-    /// Returns False (undeterminable - unknown signature OID, malformed parameters) so the
-    /// caller fails closed.
-    /// </summary>
-    function SignatureFacts(out AFacts: TCertSignatureFacts): Boolean;
-    /// <summary>
-    /// Extracts the certificate's human-readable identity from the already-decoded handle:
-    /// the subject and issuer distinguished names, the subject common name, and the serial
-    /// number in hex. Returns False (all empty) on a malformed field; never raises.
-    /// </summary>
-    function PeerInfo(out ASubject, AIssuer, ACommonName, ASerialHex: string): Boolean;
-  end;
-
-  /// <summary>
-  /// Pure, per-certificate, side-effect-free X.509 inspection. The Boolean-returning
-  /// queries are fail-closed: they never raise on malformed input, returning False (or
-  /// an empty result) so the caller decides the alert. Parse, LoadChain, and the
-  /// extractor methods (PublicKeyInfo, DnsNames, IpAddresses) raise on malformed input.
-  /// </summary>
-  ICertificateInspector = interface(IInterface)
-    ['{243AB9CD-2900-4A04-B952-FEC3CD105B05}']
-    /// <summary>
-    /// Decodes ADer once into a handle that answers the per-certificate queries from
-    /// that single decode. Raises when ADer does not decode to a certificate (empty or
-    /// malformed); otherwise returns a handle over a well-formed certificate. Unlike the
-    /// fail-closed DER-taking queries it raises rather than returning False, so use it
-    /// where the certificate is already known well-formed.
-    /// </summary>
-    function Parse(const ADer: TBytes): IInspectedCertificate;
-    /// <summary>
-    /// Decodes certificates from AData - a PEM block (a single certificate or a whole
-    /// leaf-first chain/bundle) or a single DER certificate - into their ordered raw
-    /// DER encodings. Serves both credential chains and trust anchors. Raises
-    /// EArgumentTlsLibException if nothing parses.
-    /// </summary>
-    function LoadChain(const AData: TBytes): TArray<TBytes>;
-    /// <summary>
-    /// True if ADer decodes as a structurally well-formed X.509 certificate. A
-    /// parse-only gate (no trust, expiry or signature check) used to screen raw
-    /// OS-harvested trust anchors before they reach path validation.
-    /// </summary>
-    function IsWellFormed(const ADer: TBytes): Boolean;
-    /// <summary>The DER SubjectPublicKeyInfo of the X.509 certificate in ACertificateDer.</summary>
-    function PublicKeyInfo(const ACertificateDer: TBytes): TBytes;
-    /// <summary>The dNSName SubjectAltName entries of the X.509 certificate in ACertificateDer.</summary>
-    function DnsNames(const ACertificateDer: TBytes): TArray<string>;
-    /// <summary>The iPAddress SAN entries (raw 4- or 16-byte octets) in ACertificateDer.</summary>
-    function IpAddresses(const ACertificateDer: TBytes): TArray<TBytes>;
-    /// <summary>
-    /// Extracts a certificate's human-readable identity: the subject and issuer
-    /// distinguished names, the subject common name, and the serial number in hex. Returns
-    /// False (all empty) on a malformed certificate; never raises.
-    /// </summary>
-    function PeerInfo(const ACertificateDer: TBytes;
-      out ASubject, AIssuer, ACommonName, ASerialHex: string): Boolean;
-    /// <summary>
-    /// Reads the RFC 7633 TLS Feature extension (id-pe-tlsfeature, OID
-    /// 1.3.6.1.5.5.7.1.24) of the certificate and returns its feature codepoints.
-    /// An absent extension yields True with an empty list. A present value that is
-    /// not a well-formed ASN.1 SEQUENCE OF INTEGER yields False, so the caller can
-    /// abort with bad_certificate.
-    /// </summary>
-    function TlsFeatures(const ACert: TBytes;
-      out AFeatures: TArray<UInt16>): Boolean;
-    /// <summary>
-    /// Whether the certificate's keyUsage extension (RFC 5280 4.2.1.3) permits AUsage.
-    /// Yes when the extension is absent (no restriction) or asserts the bit; No only when
-    /// the extension is present and the bit is clear; Undetermined on a malformed certificate.
-    /// </summary>
-    function KeyUsagePermits(const ACertificateDer: TBytes;
-      AUsage: TCertKeyUsage): TCertAnswer;
-    /// <summary>
-    /// Whether the certificate's SubjectPublicKeyInfo algorithm is id-RSASSA-PSS
-    /// (OID 1.2.840.113549.1.1.10), the restricted RSA-PSS key type that the
-    /// rsa_pss_rsae_* schemes must not be used with (RFC 8446 4.2.3). Yes when it is,
-    /// No when it is not, Undetermined on a malformed certificate.
-    /// </summary>
-    function KeyIsRsaPss(const ACertificateDer: TBytes): TCertAnswer;
-    /// <summary>
-    /// Classifies the certificate leaf key: AKind is the public-key algorithm, and for an
-    /// ECDSA key AEcNamedGroup is the named-group code of its curve (secp256r1 = 0x0017,
-    /// secp384r1 = 0x0018, secp521r1 = 0x0019), 0 otherwise. Returns False (could not
-    /// determine) on a malformed or unrecognized certificate, leaving AKind = Other.
-    /// </summary>
-    function KeyKind(const ACertificateDer: TBytes;
-      out AKind: TCertKeyKind; out AEcNamedGroup: UInt16): Boolean;
-  end;
-
-  /// <summary>
-  /// The trust decision: RFC 5280 path validation. The highest-stakes call in the
-  /// library - it raises a fatal-alert exception on failure rather than returning a
-  /// boolean.
-  /// </summary>
-  ICertificatePathValidator = interface(IInterface)
-    ['{2457CB06-FD52-43D1-BAF4-ADF7D932FCD5}']
-    /// <summary>
-    /// Validates the DER chain (leaf first) to one of the DER trust anchors (RFC
-    /// 5280 path validation; revocation is out of band). Returns normally when the
-    /// chain is trusted; on failure it raises a fatal-alert exception carrying the
-    /// reason (certificate_expired / unknown_ca / bad_certificate). Every validity
-    /// check (chain notBefore/notAfter and the PKIX path date) is evaluated at
-    /// AValidationTimeUtc, so the caller's injected clock drives the whole time-based
-    /// trust decision from one source. AIntermediates are extra untrusted DER
-    /// certificates seeded into path building for a peer that sends an incomplete
-    /// chain (e.g. a leaf-only server); empty validates the chain exactly as received.
-    /// They never anchor a path and never bypass validation. The chain is first validated
-    /// exactly as presented; the intermediates are consulted only if that strict pass fails.
-    /// AEffectiveChain returns the validated leaf-first chain - the assembled path when one was
-    /// built, otherwise AChain - so the caller's staple and pin checks see the real issuer. It is
-    /// a var parameter so a caller may pre-seed it with AChain as a fallback; an implementation
-    /// that returns normally must set it. AKeyPurpose selects the extendedKeyUsage the
-    /// path must carry (server vs client role); a certificate on the path (leaf or
-    /// intermediate, never the anchor) that carries an EKU extension lacking the purpose
-    /// is rejected with unsupported_certificate, while one with no EKU is unrestricted.
-    /// </summary>
-    procedure ValidateCertificatePath(const AChain, ATrustAnchors,
-      AIntermediates: TArray<TBytes>; const AValidationTimeUtc: TDateTime;
-      AKeyPurpose: TCertKeyPurpose; var AEffectiveChain: TArray<TBytes>);
-  end;
-
-  /// <summary>
-  /// Revocation checks (OCSP / CRL). Indeterminate-tolerant: a Boolean result means
-  /// "could I determine", never raises a backend exception, so an unreachable or
-  /// malformed responder degrades to indeterminate rather than a hard failure.
-  /// </summary>
-  IRevocationChecker = interface(IInterface)
-    ['{B8D6113D-83F1-413C-921C-5D4CE9DCCEEF}']
-    /// <summary>
-    /// Verifies a stapled OCSP response (RFC 6960) about the leaf certificate,
-    /// in-band only - no network. Confirms the response is signed by the leaf's
-    /// issuer or an authorized delegated responder (id-kp-OCSPSigning, RFC 6960
-    /// sec. 4.2.2.2) and that its CertID matches the leaf (serial + issuer name/key
-    /// hash), then returns the reported status and the response's
-    /// thisUpdate/nextUpdate window. A malformed, unauthorized, or non-matching
-    /// response returns False (indeterminate); it never raises a backend exception.
-    /// ANextUpdate is 0 when the responder omitted nextUpdate (no upper bound). The
-    /// delegated-responder certificate validity is evaluated at AValidationTimeUtc,
-    /// so the caller's injected clock drives it (the caller enforces the
-    /// thisUpdate/nextUpdate freshness window against the same source).
-    /// </summary>
-    function ValidateOcspStaple(const ALeafCert, AIssuerCert,
-      AOcspResponseDer: TBytes; const AValidationTimeUtc: TDateTime;
-      out AStatus: TOcspStatus;
-      out AThisUpdate, ANextUpdate: TDateTime): Boolean;
-    /// <summary>
-    /// Builds an unsigned DER OCSP request (RFC 6960 4.1.1) for the leaf, its CertID formed
-    /// from the issuer name/key hash and the leaf serial - the request a live OCSP check
-    /// POSTs to the responder. Returns False (no request) on a malformed input; never raises.
-    /// The engine core never calls this; it is used only by the driver-edge live-revocation
-    /// resolver.
-    /// </summary>
-    function BuildOcspRequest(const ALeafCert, AIssuerCert: TBytes;
-      out ARequestDer: TBytes): Boolean;
-    /// <summary>
-    /// Reads the certificate's Authority Information Access extension (RFC 5280 4.2.2.1) and
-    /// returns the first id-ad-ocsp responder URL (an http/https accessLocation). Returns
-    /// False (no URL) when the extension is absent or carries no OCSP URI; never raises.
-    /// </summary>
-    function TryGetOcspResponderUrl(const ACert: TBytes;
-      out AUrl: string): Boolean;
-    /// <summary>
-    /// Reads the certificate's CRL Distribution Points extension (RFC 5280 4.2.1.13) and
-    /// returns the full-name http/https URLs. Returns False (empty) when absent or carrying
-    /// no URI distribution point; never raises.
-    /// </summary>
-    function TryGetCrlDistributionPoints(const ACert: TBytes;
-      out AUrls: TArray<string>): Boolean;
-    /// <summary>
-    /// Checks the leaf against a fetched DER CRL (RFC 5280): confirms the CRL is signed by
-    /// the issuer, then reports whether the leaf serial appears in the revoked list.
-    /// Returns True when the CRL parsed and verified (ARevoked then meaningful); False on a
-    /// malformed or unverifiable CRL (indeterminate). Never raises.
-    /// </summary>
-    function CheckCrlRevocation(const ALeafCert, AIssuerCert, ACrlDer: TBytes;
-      out ARevoked: Boolean): Boolean;
-    /// <summary>
-    /// Finds, among ACandidates, the certificate that issued ALeaf - for a live revocation check on a
-    /// peer that presented a leaf-only chain (a mutual-TLS client whose issuer is a configured anchor,
-    /// not sent on the wire; RFC 8446 4.4.2). A candidate qualifies only when its subject name matches
-    /// the leaf's issuer name AND its public key verifies the leaf's signature, so a same-name/wrong-key
-    /// candidate is rejected (it would otherwise mis-key the OCSP CertID). Candidates must come from
-    /// local configuration (anchors / configured intermediates), never the peer. Returns False (no
-    /// issuer) when none qualifies or on malformed input; never raises.
-    /// </summary>
-    function TryFindIssuer(const ALeafCert: TBytes; const ACandidates: TArray<TBytes>;
-      out AIssuerCert: TBytes): Boolean;
   end;
 
 { ===== HPKE (RFC 9180) ===== }
@@ -574,9 +370,11 @@ type
     ['{4D8F1C60-3A72-4E59-9B14-6C0D2E7A3B58}']
     /// <summary>
     /// The provider's instance of the suite (AKem, AKdf, AAead), or nil when it cannot
-    /// instantiate it - a known KEM, a known KDF, and a real (not export-only) AEAD. The ECH
-    /// config filter skips a nil suite rather than raising; a non-nil suite is ready to seal
-    /// or open with.
+    /// instantiate it: nil unless the KEM, KDF and AEAD ids are all known AND this provider's
+    /// primitives can actually build every one of them (the KEM curve and its KDF hash, the
+    /// suite KDF hash, and the AEAD). The ECH config filter skips a nil suite rather than
+    /// raising, so an offer this provider cannot satisfy is a clean reject, not internal_error;
+    /// a non-nil suite is ready to seal or open with.
     /// </summary>
     function Suite(AKem, AKdf, AAead: UInt16): IHpkeSuite;
     /// <summary>
@@ -594,9 +392,10 @@ type
     procedure GenerateKeyPair(AKem: UInt16; out APublicKey: TBytes;
       out APrivateKey: ISecretBuffer);
     /// <summary>
-    /// Decodes a PKCS#8 private key (RFC 8410 X25519/X448 or RFC 5915 EC) for the KEM
+    /// Decodes a PKCS#8 private key (RFC 8410 X25519 or RFC 5915 EC) for the KEM
     /// AKem into the raw HPKE scalar, wiped on release. Raises EArgumentTlsLibException
-    /// on a malformed key or one whose algorithm does not match AKem.
+    /// on a malformed key or one whose algorithm does not match AKem, and
+    /// ENotSupportedTlsLibException for an unknown KEM.
     /// </summary>
     function ImportPrivateKey(AKem: UInt16; const APkcs8Der: TBytes): ISecretBuffer;
     /// <summary>
@@ -617,27 +416,36 @@ type
     /// A KEM encapsulation for AKem against a throwaway placeholder recipient - the real output of
     /// a base-mode setup, not a bare public key, so it is a valid encapsulation for any KEM (the
     /// two coincide only for a DH KEM). A GREASE ech (RFC 9849 sec. 6.2) uses it as its enc so the
-    /// decoy carries a genuine encapsulation shape. nil for an unknown KEM.
+    /// decoy carries a genuine encapsulation shape. nil for an unknown KEM or one this provider
+    /// cannot build.
     /// </summary>
     function RandomEncapsulation(AKem: UInt16): TBytes;
+  end;
+
+  /// <summary>
+  /// Marks an <see cref="IHpkeCrypto" /> that is the library's own composition over a primitives
+  /// facet, so a native overlay can tell it from a caller-supplied one.
+  /// </summary>
+  IHpkeComposition = interface(IInterface)
+    ['{59E92AA8-1A0F-4517-805C-B6E588FDBE97}']
+    /// <summary>The primitives facet this HPKE is composed over.</summary>
+    function ComposedOver: ICryptoPrimitives;
   end;
 
 { ===== Composition root ===== }
 
   /// <summary>
-  /// The coherent composition root - one backend family, so its
-  /// <see cref="ISigningKey" /> handles, SPKI encodings, and path-validation
-  /// semantics all agree. Each accessor returns a stable, thread-safe, never-nil
-  /// facet reference (the same reference every call); consumers hold this
-  /// aggregator and reach a facet through its accessor.
+  /// The coherent composition root for the crypto primitives - one backend family,
+  /// so its <see cref="ISigningKey" /> handles, SPKI encodings and HPKE all agree.
+  /// X.509/PKIX (certificate inspection, path validation, revocation) is a separate
+  /// concern, composed by <see cref="IPkixProvider" />. Each accessor returns a stable,
+  /// thread-safe, never-nil facet reference (the same reference every call); consumers
+  /// hold this aggregator and reach a facet through its accessor.
   /// </summary>
   ICryptoProvider = interface(IInterface)
     ['{8945BF7C-FB99-42DC-B3BD-69C6E3FFB3C0}']
     function Primitives: ICryptoPrimitives;
     function Signing: ISigningCrypto;
-    function Certificates: ICertificateInspector;
-    function PathValidation: ICertificatePathValidator;
-    function Revocation: IRevocationChecker;
     /// <summary>The HPKE facet (RFC 9180), used by Encrypted Client Hello.</summary>
     function Hpke: IHpkeCrypto;
   end;
@@ -655,9 +463,6 @@ type
     function WithRandom(const ARandom: IRandom): ICryptoProviderBuilder;
     function WithPrimitives(const APrimitives: ICryptoPrimitives): ICryptoProviderBuilder;
     function WithSigning(const ASigning: ISigningCrypto): ICryptoProviderBuilder;
-    function WithInspector(const AInspector: ICertificateInspector): ICryptoProviderBuilder;
-    function WithPathValidation(const APathValidation: ICertificatePathValidator): ICryptoProviderBuilder;
-    function WithRevocation(const ARevocation: IRevocationChecker): ICryptoProviderBuilder;
     function WithHpke(const AHpke: IHpkeCrypto): ICryptoProviderBuilder;
     /// <summary>Composes the provider from the accumulated overrides.</summary>
     function Build: ICryptoProvider;

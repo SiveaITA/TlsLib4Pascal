@@ -37,37 +37,18 @@ uses
   TlpNegotiationTypes,
   TlpRecordLayer,
   TlpITlsEngine,
+  TlpTrustPolicy,
   TlpHandshakeMessage,
   TlpIHandshakeChannel,
   TlpHandshakeChannel,
   TlpIHandshakeMachine,
   TlpHandshakeEffect,
   TlpHandshakeDriver,
-  Tls13ClientReplayTests,
+  MockSink,
+  MockRecordInstaller,
   TlsLibTestBase;
 
 type
-  TRecordingSink = class(TInterfacedObject, IHandshakeSink)
-  strict private
-  var
-    FEventCount: Int32;
-    FLastEvent: TTlsEventKind;
-    FEstablished: Boolean;
-    FFailed: Boolean;
-    FFailedAlert: TTlsAlertDescription;
-  public
-    procedure OnHandshakeEvent(AEvent: TTlsEventKind);
-    procedure OnAlpnSelected(const AProtocol: string);
-    procedure OnOcspStapleReceived(const AStaple: TBytes);
-    procedure OnHandshakeEstablished;
-    procedure OnHandshakeFailed(AAlert: TTlsAlertDescription);
-    property EventCount: Int32 read FEventCount;
-    property LastEvent: TTlsEventKind read FLastEvent;
-    property Established: Boolean read FEstablished;
-    property Failed: Boolean read FFailed;
-    property FailedAlert: TTlsAlertDescription read FFailedAlert;
-  end;
-
   TTestHandshakeDriver = class(TTlsLibAlgorithmTestCase)
   private
     function DefaultSuite: TTlsCipherSuite;
@@ -82,38 +63,19 @@ type
     procedure TestChannelReassemblesInbound;
     procedure TestDriverInstallKeysDecryptsRfc8448Record;
     procedure TestDriverReportsOutcomesToSink;
+    procedure TestDriverForwardsTheFailReasonToTheSink;
+    procedure TestTryFromExceptionCarriesTheFatalAlertMessage;
+    procedure TestTryFromExceptionCarriesThePeerInputMessage;
+    procedure TestDriverFailsClosedOnUndeliverableVerdictPark;
+    procedure TestUndeliverableVerdictParkSaysWhy;
     procedure TestDriverArmsTls12ReadInstallButInstallsTls13Immediately;
     procedure TestDriverWriteInstallIsImmediate;
   end;
 
 implementation
 
-{ TRecordingSink }
-
-procedure TRecordingSink.OnHandshakeEvent(AEvent: TTlsEventKind);
-begin
-  Inc(FEventCount);
-  FLastEvent := AEvent;
-end;
-
-procedure TRecordingSink.OnOcspStapleReceived(const AStaple: TBytes);
-begin
-end;
-
-procedure TRecordingSink.OnAlpnSelected(const AProtocol: string);
-begin
-end;
-
-procedure TRecordingSink.OnHandshakeEstablished;
-begin
-  FEstablished := True;
-end;
-
-procedure TRecordingSink.OnHandshakeFailed(AAlert: TTlsAlertDescription);
-begin
-  FFailed := True;
-  FFailedAlert := AAlert;
-end;
+resourcestring
+  SProbeReason = 'probe abort';
 
 { TTestHandshakeDriver }
 
@@ -130,8 +92,18 @@ begin
 end;
 
 function TTestHandshakeDriver.TakeOutgoing(const ALayer: TRecordLayer): TBytes;
+var
+  LChunk: TBytes;
+  LN: Int32;
 begin
-  Result := ALayer.TakeOutgoing;
+  Result := nil;
+  repeat
+    LChunk := nil;
+    SetLength(LChunk, 4096);
+    LN := ALayer.TakeOutgoing(LChunk, 0);
+    if LN > 0 then
+      Result := ConcatBytes(Result, System.Copy(LChunk, 0, LN));
+  until LN <= 0;
 end;
 
 function TTestHandshakeDriver.SampleTrafficKeys: ITrafficKeys;
@@ -140,7 +112,7 @@ var
   LHash: TBytes;
 begin
   // any valid epoch keys; the routing tests only care where the driver installs them, not what
-  LSchedule := TTls13KeySchedule.Create(Provider, THashAlgorithm.SHA_256, 16);
+  LSchedule := TTls13KeySchedule.Create(Crypto, THashAlgorithm.SHA_256, 16);
   LSchedule.SetSharedSecret(TSecretBuffer.From(DecodeHex(
     '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f')));
   SetLength(LHash, 32);
@@ -152,8 +124,8 @@ function TTestHandshakeDriver.DriverOver(const ALayer: TRecordLayer): THandshake
 begin
   Result := THandshakeDriver.Create(
     THandshakeChannel.Create(ALayer) as IHandshakeChannel,
-    TRecordLayerInstaller.Create(ALayer) as IRecordEpochInstaller, Provider,
-    TSilentSink.Create as IHandshakeSink);
+    TRecordLayerInstaller.Create(ALayer) as IRecordEpochInstaller, Crypto,
+    TMockHandshakeSink.Create as IHandshakeSink);
 end;
 
 function TTestHandshakeDriver.ReadInstallAlert(const AVersion: TTlsVersion;
@@ -172,7 +144,7 @@ begin
   LDriver := DriverOver(LLayer);
   try
     LDriver.Apply(THandshakeEffects.InstallKeys(SampleTrafficKeys, TRecordSide.ReadSide,
-      DefaultSuite.Common.Aead, AVersion));
+      DefaultSuite.Common.Aead, AVersion, TTlsEpoch.Application));
     try
       LLayer.ProcessInput(DecodeHex('160303000401020304'), 0, 9);
       LLayer.NextIncoming(LFrag);
@@ -218,7 +190,7 @@ begin
   LDriver := DriverOver(LLayer);
   try
     LDriver.Apply(THandshakeEffects.InstallKeys(SampleTrafficKeys, TRecordSide.WriteSide,
-      DefaultSuite.Common.Aead, TTlsVersion.Tls13));
+      DefaultSuite.Common.Aead, TTlsVersion.Tls13, TTlsEpoch.Application));
     LLayer.Write(TTlsContentType.ApplicationData, DecodeHex('0102030405'), 0, 5);
     LWire := TakeOutgoing(LLayer);
     // a plaintext framing of 5 bytes would be 10 bytes (5 header + 5 body); an AEAD record is
@@ -303,21 +275,20 @@ begin
   LLayer := TRecordLayer.Create;
   LDriver := nil;
   try
-    LSchedule := TTls13KeySchedule.Create(Provider, THashAlgorithm.SHA_256, 16);
+    LSchedule := TTls13KeySchedule.Create(Crypto, THashAlgorithm.SHA_256, 16);
     LSchedule.SetSharedSecret(TSecretBuffer.From(DecodeHex(LVec.Values['shared_secret'])));
     LSchedule.DeriveEpochSecrets(TTlsEpoch.Handshake,
       DecodeHex(LVec.Values['hash_ch_sh']));
 
     // install the READ side (from the client's handshake traffic secret) through the
-    // driver into a standalone record layer - the engine no longer exposes an
-    // installer seam that a caller could take a counted reference to
+    // driver into a standalone record layer - the engine exposes no installer seam to callers
     LDriver := THandshakeDriver.Create(
       THandshakeChannel.Create(LLayer) as IHandshakeChannel,
-      TRecordLayerInstaller.Create(LLayer) as IRecordEpochInstaller, Provider,
-      TSilentSink.Create as IHandshakeSink);
+      TRecordLayerInstaller.Create(LLayer) as IRecordEpochInstaller, Crypto,
+      TMockHandshakeSink.Create as IHandshakeSink);
     LDriver.Apply(THandshakeEffects.InstallKeys(LSchedule.TrafficKeys(
       TTlsEpoch.Handshake, TTlsDirection.ClientWrite), TRecordSide.ReadSide,
-      DefaultSuite.Common.Aead, TTlsVersion.Tls13));
+      DefaultSuite.Common.Aead, TTlsVersion.Tls13, TTlsEpoch.Handshake));
 
     LRecord := DecodeHex(LRec.Values['record']);
     LLayer.ProcessInput(LRecord, 0, System.Length(LRecord));
@@ -336,27 +307,134 @@ procedure TTestHandshakeDriver.TestDriverReportsOutcomesToSink;
 var
   LLayer: TRecordLayer;
   LDriver: THandshakeDriver;
-  LSink: TRecordingSink;
+  LSink: TMockHandshakeSink;
   LSinkRef: IHandshakeSink;
 begin
   LLayer := TRecordLayer.Create;
-  LSink := TRecordingSink.Create;
+  LSink := TMockHandshakeSink.Create;
   LSinkRef := LSink;
   LDriver := THandshakeDriver.Create(THandshakeChannel.Create(LLayer) as IHandshakeChannel, nil,
-    Provider, LSinkRef);
+    Crypto, LSinkRef);
   try
-    LDriver.Apply(THandshakeEffects.RaiseEvent(TTlsEventKind.KeysInstalled));
+    LDriver.Apply(THandshakeEffects.RaiseEvent(TTlsEventKind.SessionTicketReceived));
     LDriver.Apply(THandshakeEffects.HandshakeEstablished);
-    LDriver.Apply(THandshakeEffects.Fail(TTlsAlertDescription.DecodeError));
+    LDriver.Apply(THandshakeEffects.SendWarningAlert(TTlsAlertDescription.NoRenegotiation));
+    LDriver.Apply(THandshakeEffects.Fail(TTlsAlertDescription.DecodeError, SProbeReason));
     LDriver.Apply(THandshakeEffects.SendChangeCipherSpec);
 
     CheckEquals(1, LSink.EventCount, 'one event raised');
-    CheckEquals(Ord(TTlsEventKind.KeysInstalled), Ord(LSink.LastEvent), 'the event');
+    CheckEquals(Ord(TTlsEventKind.SessionTicketReceived), Ord(LSink.LastEvent), 'the event');
     CheckTrue(LSink.Established, 'handshake established');
+    CheckTrue(LSink.Warned, 'warning alert reported');
+    CheckEquals(Ord(TTlsAlertDescription.NoRenegotiation), Ord(LSink.WarnedAlert),
+      'warning alert code');
     CheckTrue(LSink.Failed, 'failure reported');
     CheckEquals(Ord(TTlsAlertDescription.DecodeError), Ord(LSink.FailedAlert), 'alert');
     // the CCS effect reached the record layer
     CheckEqualBytes('CCS emitted', DecodeHex('140303000101'), TakeOutgoing(LLayer));
+  finally
+    LDriver.Free;
+    LLayer.Free;
+  end;
+end;
+
+procedure TTestHandshakeDriver.TestDriverFailsClosedOnUndeliverableVerdictPark;
+var
+  LLayer: TRecordLayer;
+  LDriver: THandshakeDriver;
+  LSink: TMockHandshakeSink;
+  LSinkRef: IHandshakeSink;
+begin
+  // the mock sink carries no verdict handling: a park it cannot deliver would wedge the
+  // handshake forever, so the driver must fail it closed instead
+  LLayer := TRecordLayer.Create;
+  LSink := TMockHandshakeSink.Create;
+  LSinkRef := LSink;
+  LDriver := THandshakeDriver.Create(THandshakeChannel.Create(LLayer) as IHandshakeChannel, nil,
+    Crypto, LSinkRef);
+  try
+    LDriver.Apply(THandshakeEffects.AwaitCertificateVerdict(
+      TArray<TBytes>.Create(DecodeHex('3003020100')), nil, 'localhost', nil,
+      TRevocationPosture.Soft));
+    CheckTrue(LSink.Failed, 'an undeliverable verdict park fails the handshake');
+    CheckEquals(Ord(TTlsAlertDescription.InternalError), Ord(LSink.FailedAlert),
+      'the failure is internal_error: our side could not carry the park');
+  finally
+    LDriver.Free;
+    LLayer.Free;
+  end;
+end;
+
+procedure TTestHandshakeDriver.TestDriverForwardsTheFailReasonToTheSink;
+var
+  LLayer: TRecordLayer;
+  LDriver: THandshakeDriver;
+  LSink: TMockHandshakeSink;
+  LSinkRef: IHandshakeSink;
+begin
+  LLayer := TRecordLayer.Create;
+  LSink := TMockHandshakeSink.Create;
+  LSinkRef := LSink;
+  LDriver := THandshakeDriver.Create(THandshakeChannel.Create(LLayer) as IHandshakeChannel, nil,
+    Crypto, LSinkRef);
+  try
+    LDriver.Apply(THandshakeEffects.Fail(TTlsAlertDescription.DecodeError, SProbeReason));
+    CheckEquals(SProbeReason, LSink.FailedReason, 'the effect reason reaches the sink');
+  finally
+    LDriver.Free;
+    LLayer.Free;
+  end;
+end;
+
+procedure TTestHandshakeDriver.TestTryFromExceptionCarriesTheFatalAlertMessage;
+var
+  LError: Exception;
+  LEffect: THandshakeEffect;
+begin
+  LError := EFatalAlertTlsLibException.CreateRes(TTlsAlertDescription.HandshakeFailure,
+    @SProbeReason);
+  try
+    CheckTrue(THandshakeEffects.TryFromException(LError, LEffect), 'the fatal alert maps to Fail');
+    CheckEquals(SProbeReason, LEffect.Reason, 'the exception message is the reason');
+  finally
+    LError.Free;
+  end;
+end;
+
+procedure TTestHandshakeDriver.TestTryFromExceptionCarriesThePeerInputMessage;
+var
+  LError: Exception;
+  LEffect: THandshakeEffect;
+begin
+  LError := EPeerInputTlsLibException.CreateRes(@SProbeReason);
+  try
+    CheckTrue(THandshakeEffects.TryFromException(LError, LEffect), 'peer input maps to Fail');
+    CheckEquals(Ord(TTlsAlertDescription.IllegalParameter), Ord(LEffect.Alert),
+      'peer input stays illegal_parameter');
+    CheckEquals(SProbeReason, LEffect.Reason, 'the exception message is the reason');
+  finally
+    LError.Free;
+  end;
+end;
+
+procedure TTestHandshakeDriver.TestUndeliverableVerdictParkSaysWhy;
+var
+  LLayer: TRecordLayer;
+  LDriver: THandshakeDriver;
+  LSink: TMockHandshakeSink;
+  LSinkRef: IHandshakeSink;
+begin
+  LLayer := TRecordLayer.Create;
+  LSink := TMockHandshakeSink.Create;
+  LSinkRef := LSink;
+  LDriver := THandshakeDriver.Create(THandshakeChannel.Create(LLayer) as IHandshakeChannel, nil,
+    Crypto, LSinkRef);
+  try
+    LDriver.Apply(THandshakeEffects.AwaitCertificateVerdict(
+      TArray<TBytes>.Create(DecodeHex('3003020100')), nil, 'localhost', nil,
+      TRevocationPosture.Soft));
+    CheckEquals('the handshake parked for a certificate verdict that nothing can deliver',
+      LSink.FailedReason, 'the failure says the park could not be delivered');
   finally
     LDriver.Free;
     LLayer.Free;

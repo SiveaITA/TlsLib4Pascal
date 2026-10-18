@@ -18,10 +18,26 @@ interface
 uses
   SysUtils,
   TlpISecretBuffer,
-  TlpEchOuterExtensions,
+  TlpICryptoProvider,
+  TlpExtensionVector,
+  TlpHandshakeMessages,
   TlpEchConfig;
 
 type
+  /// <summary>
+  /// How a client offers Encrypted Client Hello (RFC 9849): one exclusive choice, made by
+  /// TEchClientModes. A config list is offered for real (Enable, Retry) or ECH is only GREASEd.
+  /// </summary>
+  IEchClientMode = interface(IInterface)
+    ['{9C41D6B7-3A58-4E0F-8B72-5D1E96A0C3F4}']
+    /// <summary>The ECHConfigList to offer; empty for GREASE.</summary>
+    function ConfigList: TBytes;
+    /// <summary>Whether this attempt follows an earlier ECH reject (the one-retry cap).</summary>
+    function IsRetry: Boolean;
+    /// <summary>Whether ECH is only GREASEd, with no config to offer.</summary>
+    function IsGrease: Boolean;
+  end;
+
   /// <summary>
   /// The client's frozen Encrypted Client Hello policy (RFC 9849): the parsed
   /// ECHConfigList to offer, whether GREASE ECH is enabled, and whether this handshake
@@ -29,19 +45,23 @@ type
   /// shared lock-free.
   /// </summary>
   IEchClientPolicy = interface(IInterface)
-    ['{9E1B7A34-5C82-46D0-A1F7-3B6E8C2D4059}']
-    /// <summary>The parsed ECHConfigList (in decreasing order of preference); empty when
-    /// only GREASE is configured.</summary>
-    function Configs: TArray<TEchConfig>;
+    ['{5E379F43-A271-47AA-A1DB-01BC7B86900A}']
     /// <summary>Whether to send a GREASE ECH when no config is usable (RFC 9849 sec. 6.2).</summary>
     function GreaseEnabled: Boolean;
     /// <summary>Whether this handshake already follows an earlier ECH reject; a further
     /// reject then does not chain another retry.</summary>
     function IsRetryAttempt: Boolean;
+    /// <summary>Whether a usable (config, HPKE suite) was resolved once at Build; when False the
+    /// client offers GREASE (if enabled) or the config fails at Build.</summary>
+    function Usable: Boolean;
+    /// <summary>The config resolved at Build (valid only when Usable).</summary>
+    function SelectedConfig: TEchConfig;
+    /// <summary>The HPKE suite resolved at Build (valid only when Usable).</summary>
+    function SelectedSuite: IHpkeSuite;
   end;
 
   /// <summary>
-  /// The server's Encrypted Client Hello key store (RFC 9849 sec. 4.5 / RFC 9934):
+  /// The server's Encrypted Client Hello key store (RFC 9849 sec. 4.1, 8.1 / RFC 9934):
   /// app-driven, immutable once frozen, holding the currently valid config/private-key
   /// entries and the retry_configs to advertise on reject. The operator manages validity
   /// out of band. Shared lock-free; the operator swaps the whole store to rotate keys.
@@ -55,27 +75,25 @@ type
     /// <summary>The retry_configs advertised on an ECH reject: an ECHConfigList of the
     /// entries flagged is_retry, in preference order. A server that holds any ECH keys MUST
     /// advertise retry_configs on a reject (RFC 9849 sec. 7.1), so an implementation whose
-    /// Entries is non-empty must return a non-empty list here; TInMemoryEchKeyStore enforces
-    /// this at construction.</summary>
+    /// Entries is non-empty must return a non-empty list here, holding at least one config
+    /// byte-equal to an entry's; the Keyed policy refuses a store whose list is empty,
+    /// malformed or names none.</summary>
     function RetryConfigs: TBytes;
   end;
 
   /// <summary>
-  /// The client side of one connection's Encrypted Client Hello (RFC 9849): seals the
-  /// ClientHelloInner under the selected config and assembles the EncodedClientHelloInner
-  /// with its compressed outer_extensions. One instance per connection; carries the HPKE
-  /// sender context (reused with an empty enc across a HelloRetryRequest).
+  /// A server's frozen Encrypted Client Hello policy (RFC 9849): the role it plays and, for a
+  /// keyed server, the key store and whether it trial-decrypts. A server that serves no ECH has
+  /// no policy. Immutable and shared lock-free.
   /// </summary>
-  IEchClientHandshake = interface(IInterface)
-    ['{7C3E9A15-4D82-4F60-9B18-2E6C0D5A3F84}']
-    /// <summary>The EncodedClientHelloInner for AInnerBody: the inner extensions replaced by an
-    /// ech_outer_extensions block referencing the outer, padded per RFC 9849 sec. 6.1.3.</summary>
-    function BuildEncodedInner(const AInnerBody: TBytes;
-      const AOuterEntries: TArray<TEchExtEntry>): TBytes;
-    /// <summary>Sets up the HPKE sender against the selected config and returns the enc.</summary>
-    function SetupSeal: TBytes;
-    /// <summary>Seals APlaintext under the ClientHelloOuterAAD AAad at the current sequence.</summary>
-    function Seal(const AAad, APlaintext: TBytes): TBytes;
+  IEchServerPolicy = interface(IInterface)
+    ['{419E9510-E0A5-47DE-86A6-D20DC148540B}']
+    function Role: TEchServerRole;
+    /// <summary>The key store of a Keyed server; nil for a Backend.</summary>
+    function KeyStore: IEchServerKeyStore;
+    /// <summary>Whether a Keyed server trial-decrypts against every entry rather than only the one
+    /// whose config_id matches; False for a Backend.</summary>
+    function TrialDecrypt: Boolean;
   end;
 
   /// <summary>
@@ -84,15 +102,20 @@ type
   /// (reused across a HelloRetryRequest). One instance per connection.
   /// </summary>
   IEchServerHandshake = interface(IInterface)
-    ['{2B8D4F60-6A13-4E59-9C82-5D6E0B3A1F47}']
-    /// <summary>Trial-decrypts the ClientHelloOuter AOuterFramed: Accepted (inner reconstructed),
+    ['{5EE8D115-D01C-40CE-A12D-D4D7955C3442}']
+    /// <summary>Trial-decrypts the ClientHelloOuter AOuterFramed, reusing the outer the caller
+    /// already decoded (AOuter) and vector-parsed (AOuterEntries): Accepted (inner reconstructed),
     /// Rejected (serve the public_name), or NotOffered / Backend.</summary>
-    function ProcessOuter(const AOuterFramed: TBytes): TEchStatus;
-    /// <summary>Decrypts the retry ClientHelloOuter (seq 1, empty enc) after an accepted CH1.</summary>
+    function ProcessOuter(const AOuterFramed: TBytes; const AOuter: TTlsClientHello;
+      const AOuterEntries: TExtensionVector): TEchStatus;
+    /// <summary>Decrypts the retry ClientHelloOuter (seq 1, empty enc) after an accepted CH1.
+    /// Precondition: the first ClientHelloOuter was accepted (ProcessOuter returned Accepted);
+    /// calling it otherwise is a programming error and raises.</summary>
     function ProcessRetryOuter(const AOuterFramed: TBytes): TEchStatus;
-    /// <summary>The reconstructed inner ClientHello, framed as a handshake message.</summary>
+    /// <summary>The reconstructed inner ClientHello, framed as a handshake message; a copy; the
+    /// handshake releases its own buffer.</summary>
     function InnerFramed: TBytes;
-    /// <summary>The inner ClientHello's random, cross-checked against CH2 under HRR.</summary>
+    /// <summary>The inner ClientHello's random (a copy), cross-checked against CH2 under HRR.</summary>
     function InnerRandom: TBytes;
   end;
 

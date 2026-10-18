@@ -27,9 +27,18 @@ uses
   TestFramework,
 {$ENDIF FPC}
   TlpICryptoProvider,
+  TlpIPkixProvider,
+  TlpPkixDomainTypes,
+  TlpISigningKey,
+  TlsLibTestProviders,
   TlpCryptoDomainTypes,
   TlpNegotiationTypes,
+  TlpINegotiation,
+  TlpSignatureSchemeRegistry,
   TlpHandshakeMessages,
+  TlpCertificateVerify,
+  TlpTlsAlert,
+  TlpTlsLibExceptions,
   TlsLibTestBase;
 
 type
@@ -41,38 +50,128 @@ type
     function TamperedVerifyFails(AScheme: TSignatureScheme;
       const APrivDer, APubDer: TBytes): Boolean;
     function Rfc8448LeafSpki: TBytes;
+    function VerifyEcdsa(const ACryptoProvider: ICryptoProvider;
+      const ASig, AMsg: TBytes): Boolean;
     function HashOf(const ANames: array of string): TBytes;
     function ServerCertVerifyContent(const ATranscriptHash: TBytes): TBytes;
     function CertVerifySignature: TBytes;
   protected
     procedure SetUp; override;
-    procedure TearDown; override;
   published
     procedure TestEd25519SignVerifyRoundTrip;
     procedure TestEd25519TamperedSignatureFails;
+    procedure TestEd448SignVerifyRoundTrip;
+    procedure TestEd448TamperedSignatureFails;
     procedure TestEcdsaP256SignVerifyRoundTrip;
     procedure TestEcdsaP256TamperedSignatureFails;
+    procedure TestEcdsaP256DeterministicNoncesRfc6979;
+    procedure TestRsaSignatureShorterThanModulusIsRejected;
     procedure TestRsaPssVerifiesRfc8448CertificateVerify;
     procedure TestRsaPssRejectsWrongTranscript;
     procedure TestSignatureSchemeCodesMatchCatalog;
+    procedure TestSchemeCodesFromRegistryMatchesRegistryOrder;
+    // the provider seam binds the scheme's key family and never leaks a backend exception
+    procedure TestVerifierFailsClosedOnSchemeKeyFamilyMismatch;
+    procedure TestVerifierAllowsEcdsaCurveHashDecoupling;
+    procedure TestVerifierRejectsMalformedSpki;
+    procedure TestVerifierFailsClosedOnUnclassifiableKey;
+    procedure TestVerifyMalformedSignatureShapesNeverRaise;
+    procedure TestSignerRejectsSchemeOutsideCapableSchemes;
+    procedure TestLeafPolicyRejectsSchemeFamilyMismatch;
+    procedure TestLeafPolicyRejectsUndecodableKeyUsage;
+    procedure TestLeafWithMalformedKeyUsageFailsToParse;
+    // the ECDSA verifier accepts a valid signature and rejects a non-DER encoding
+    procedure TestEcdsaVerifiesValidAndRejectsTrailingBytes;
   end;
 
 implementation
+
+type
+  // a real parsed leaf whose keyUsage reads as undecodable, as a malformed extension would
+  TUndecodableKeyUsageLeaf = class sealed(TInterfacedObject, IInspectedCertificate)
+  strict private
+    FInner: IInspectedCertificate;
+  public
+    constructor Create(const AInner: IInspectedCertificate);
+    function PublicKeyInfo: TBytes;
+    function DnsNames: TArray<string>;
+    function IpAddresses: TArray<TBytes>;
+    function KeyUsagePermits(AUsage: TCertKeyUsage): TCertAnswer;
+    function KeyIsRsaPss: TCertAnswer;
+    function IsCertificateAuthority: TCertAnswer;
+    function KeyKind(out AKind: TSignatureKeyKind; out AEcNamedGroup: UInt16): Boolean;
+    function KeyFacts(out AFacts: TCertKeyFacts): Boolean;
+    function SignatureFacts(out AFacts: TCertSignatureFacts): Boolean;
+    function PeerInfo(out ASubject, AIssuer, ACommonName, ASerialHex: string): Boolean;
+  end;
+
+{ TUndecodableKeyUsageLeaf }
+
+constructor TUndecodableKeyUsageLeaf.Create(const AInner: IInspectedCertificate);
+begin
+  inherited Create;
+  FInner := AInner;
+end;
+
+function TUndecodableKeyUsageLeaf.PublicKeyInfo: TBytes;
+begin
+  Result := FInner.PublicKeyInfo;
+end;
+
+function TUndecodableKeyUsageLeaf.DnsNames: TArray<string>;
+begin
+  Result := FInner.DnsNames;
+end;
+
+function TUndecodableKeyUsageLeaf.IpAddresses: TArray<TBytes>;
+begin
+  Result := FInner.IpAddresses;
+end;
+
+function TUndecodableKeyUsageLeaf.KeyUsagePermits(AUsage: TCertKeyUsage): TCertAnswer;
+begin
+  Result := TCertAnswer.Undetermined;
+end;
+
+function TUndecodableKeyUsageLeaf.KeyIsRsaPss: TCertAnswer;
+begin
+  Result := FInner.KeyIsRsaPss;
+end;
+
+function TUndecodableKeyUsageLeaf.IsCertificateAuthority: TCertAnswer;
+begin
+  Result := FInner.IsCertificateAuthority;
+end;
+
+function TUndecodableKeyUsageLeaf.KeyKind(out AKind: TSignatureKeyKind;
+  out AEcNamedGroup: UInt16): Boolean;
+begin
+  Result := FInner.KeyKind(AKind, AEcNamedGroup);
+end;
+
+function TUndecodableKeyUsageLeaf.KeyFacts(out AFacts: TCertKeyFacts): Boolean;
+begin
+  Result := FInner.KeyFacts(AFacts);
+end;
+
+function TUndecodableKeyUsageLeaf.SignatureFacts(out AFacts: TCertSignatureFacts): Boolean;
+begin
+  Result := FInner.SignatureFacts(AFacts);
+end;
+
+function TUndecodableKeyUsageLeaf.PeerInfo(out ASubject, AIssuer, ACommonName,
+  ASerialHex: string): Boolean;
+begin
+  Result := FInner.PeerInfo(ASubject, AIssuer, ACommonName, ASerialHex);
+end;
 
 { TTestSignature }
 
 procedure TTestSignature.SetUp;
 begin
   inherited SetUp;
-  FHs := LoadVectorFields('Rfc8448/HandshakeMessages.txt');
-  FKeys := LoadVectorFields('Certs/SignatureKeys.txt');
-end;
-
-procedure TTestSignature.TearDown;
-begin
-  FHs.Free;
-  FKeys.Free;
-  inherited TearDown;
+  FHs := Own<TStringList>(LoadVectorFields('Rfc8448/HandshakeMessages.txt'));
+  FKeys := Own<TStringList>(LoadVectorFields('Certs/SignatureKeys.txt'));
 end;
 
 function TTestSignature.SignThenVerify(AScheme: TSignatureScheme;
@@ -83,11 +182,11 @@ var
   LMessage, LSignature: TBytes;
 begin
   LMessage := DecodeHex('54686520717569636b2062726f776e20666f78'); // "The quick brown fox"
-  LSigner := Provider.Signing.CreateSignatureSigner(AScheme, Provider.Signing.ImportSigningKey(APrivDer));
+  LSigner := Crypto.Signing.CreateSignatureSigner(AScheme, Crypto.Signing.ImportSigningKey(APrivDer, nil));
   LSigner.Update(LMessage, 0, System.Length(LMessage));
   LSignature := LSigner.Sign;
 
-  LVerifier := Provider.Signing.CreateSignatureVerifier(AScheme, APubDer);
+  LVerifier := Crypto.Signing.CreateSignatureVerifier(AScheme, APubDer);
   LVerifier.Update(LMessage, 0, System.Length(LMessage));
   Result := LVerifier.Verify(LSignature);
 end;
@@ -100,16 +199,48 @@ var
   LMessage, LSignature: TBytes;
 begin
   LMessage := DecodeHex('54686520717569636b2062726f776e20666f78');
-  LSigner := Provider.Signing.CreateSignatureSigner(AScheme, Provider.Signing.ImportSigningKey(APrivDer));
+  LSigner := Crypto.Signing.CreateSignatureSigner(AScheme, Crypto.Signing.ImportSigningKey(APrivDer, nil));
   LSigner.Update(LMessage, 0, System.Length(LMessage));
   LSignature := LSigner.Sign;
   // flip a signature byte
   LSignature[System.Length(LSignature) - 1] :=
     Byte(LSignature[System.Length(LSignature) - 1] xor $01);
 
-  LVerifier := Provider.Signing.CreateSignatureVerifier(AScheme, APubDer);
+  LVerifier := Crypto.Signing.CreateSignatureVerifier(AScheme, APubDer);
   LVerifier.Update(LMessage, 0, System.Length(LMessage));
   Result := not LVerifier.Verify(LSignature);
+end;
+
+procedure TTestSignature.TestVerifyMalformedSignatureShapesNeverRaise;
+
+  procedure CheckNeverRaises(AScheme: TSignatureScheme; const APubDer: TBytes);
+  const
+    LMsgHex = '54686520717569636b2062726f776e20666f78';
+  var
+    LVerifier: ISignatureVerifier;
+    LMsg: TBytes;
+    LShapes: array [0 .. 3] of TBytes;
+    LI: Int32;
+  begin
+    LMsg := DecodeHex(LMsgHex);
+    LShapes[0] := nil;
+    LShapes[1] := DecodeHex('00');
+    LShapes[2] := DecodeHex('deadbeefdeadbeefdeadbeef');
+    LShapes[3] := DecodeHex('3081'); // truncated DER SEQUENCE header
+    for LI := 0 to System.High(LShapes) do
+    begin
+      LVerifier := Crypto.Signing.CreateSignatureVerifier(AScheme, APubDer);
+      LVerifier.Update(LMsg, 0, System.Length(LMsg));
+      CheckFalse(LVerifier.Verify(LShapes[LI]),
+        'a malformed signature verifies False without raising');
+    end;
+  end;
+
+begin
+  // fail-closed: an ASN.1/bignum error on a malformed signature is a failed verification, not a raise
+  CheckNeverRaises(TSignatureScheme.ECDSA_SECP256R1_SHA256,
+    DecodeHex(FKeys.Values['ecdsa_pub']));
+  CheckNeverRaises(TSignatureScheme.ED25519, DecodeHex(FKeys.Values['ed25519_pub']));
 end;
 
 function TTestSignature.HashOf(const ANames: array of string): TBytes;
@@ -118,7 +249,7 @@ var
   LMsg: TBytes;
   LI: Int32;
 begin
-  LHash := Provider.Primitives.CreateHash(THashAlgorithm.SHA_256);
+  LHash := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256);
   for LI := 0 to High(ANames) do
   begin
     LMsg := DecodeHex(FHs.Values[ANames[LI]]);
@@ -137,7 +268,7 @@ begin
   LFramed := DecodeHex(FHs.Values['certificate']);
   LBody := System.Copy(LFramed, 4, System.Length(LFramed) - 4);
   LCert := THandshakeMessages.DecodeCertificate(LBody);
-  Result := Provider.Certificates.PublicKeyInfo(LCert.Entries[0].CertData);
+  Result := Pkix.Certificates.PublicKeyInfo(LCert.Entries[0].CertData);
 end;
 
 function TTestSignature.CertVerifySignature: TBytes;
@@ -154,7 +285,7 @@ function TTestSignature.ServerCertVerifyContent(
 var
   LContext: TBytes;
 begin
-  // RFC 8446 4.4.3: 64 spaces, the context string, a 0x00 separator, the transcript hash
+  // RFC 9846 4.5.2: 64 spaces, the context string, a 0x00 separator, the transcript hash
   SetLength(Result, 64);
   FillChar(Result[0], 64, $20);
   LContext := TEncoding.ASCII.GetBytes('TLS 1.3, server CertificateVerify');
@@ -177,6 +308,20 @@ begin
     'a tampered Ed25519 signature fails to verify');
 end;
 
+procedure TTestSignature.TestEd448SignVerifyRoundTrip;
+begin
+  CheckTrue(SignThenVerify(TSignatureScheme.ED448, DecodeHex(FKeys.Values['ed448_key']),
+    DecodeHex(FKeys.Values['ed448_pub'])),
+    'an Ed448 signature verifies against its public key');
+end;
+
+procedure TTestSignature.TestEd448TamperedSignatureFails;
+begin
+  CheckTrue(TamperedVerifyFails(TSignatureScheme.ED448, DecodeHex(FKeys.Values['ed448_key']),
+    DecodeHex(FKeys.Values['ed448_pub'])),
+    'a tampered Ed448 signature fails to verify');
+end;
+
 procedure TTestSignature.TestEcdsaP256SignVerifyRoundTrip;
 begin
   CheckTrue(SignThenVerify(TSignatureScheme.ECDSA_SECP256R1_SHA256,
@@ -191,6 +336,99 @@ begin
     'a tampered ECDSA P-256 signature fails to verify');
 end;
 
+procedure TTestSignature.TestEcdsaP256DeterministicNoncesRfc6979;
+const
+  // RFC 6979 A.2.5: the P-256 private key x and public point U as PKCS#8 / SPKI
+  Rfc6979P256Pkcs8 = '3041020100301306072a8648ce3d020106082a8648ce3d030107042730250201010420' +
+    'c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721';
+  Rfc6979P256Spki = '3059301306072a8648ce3d020106082a8648ce3d030107034200' +
+    '0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6' +
+    '7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299';
+  // the SHA-256 (r, s) pairs for the messages "sample" and "test", DER-encoded
+  SampleSignature = '3046022100efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716' +
+    '022100f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8';
+  TestSignature = '3045022100f1abb023518351cd71d881567b1ea663ed3efcf6c5132b354f28d3b0b7d38367' +
+    '0220019f4113742a2b14bd25926b49c649155f267e60d3814b4c0cc84250e46f0083';
+
+  function SignWith(const ACrypto: ICryptoProvider; const AKey: ISigningKey;
+    const AMessage: TBytes): TBytes;
+  var
+    LSigner: ISignatureSigner;
+  begin
+    LSigner := ACrypto.Signing.CreateSignatureSigner(TSignatureScheme.ECDSA_SECP256R1_SHA256,
+      AKey);
+    LSigner.Update(AMessage, 0, System.Length(AMessage));
+    Result := LSigner.Sign;
+  end;
+
+var
+  LCrypto: ICryptoProvider;
+  LKey: ISigningKey;
+  LSample, LTest, LSignature: TBytes;
+  LVerifier: ISignatureVerifier;
+begin
+  // a random nonce would make each signature differ; matching the RFC's answers proves the
+  // portable signer derives k from the key and message. Pinned to portable: native ECDSA signs
+  // with a random nonce
+  LCrypto := TTlsLibTestProviders.Crypto(TCryptoProviderChoice.Portable);
+  LKey := LCrypto.Signing.ImportSigningKey(DecodeHex(Rfc6979P256Pkcs8), nil);
+  LSample := DecodeHex('73616d706c65'); // "sample"
+  LTest := DecodeHex('74657374'); // "test"
+  LSignature := SignWith(LCrypto, LKey, LSample);
+  CheckEqualBytes('RFC 6979 A.2.5 P-256/SHA-256 "sample"', DecodeHex(SampleSignature),
+    LSignature);
+  CheckEqualBytes('RFC 6979 A.2.5 P-256/SHA-256 "test"', DecodeHex(TestSignature),
+    SignWith(LCrypto, LKey, LTest));
+  CheckEqualBytes('signing the same message again is byte-identical', LSignature,
+    SignWith(LCrypto, LKey, LSample));
+  LVerifier := LCrypto.Signing.CreateSignatureVerifier(TSignatureScheme.ECDSA_SECP256R1_SHA256,
+    DecodeHex(Rfc6979P256Spki));
+  LVerifier.Update(LSample, 0, System.Length(LSample));
+  CheckTrue(LVerifier.Verify(LSignature), 'the deterministic signature is an ordinary ECDSA signature');
+end;
+
+procedure TTestSignature.TestRsaSignatureShorterThanModulusIsRejected;
+
+  procedure CheckScheme(AScheme: TSignatureScheme);
+  var
+    LKey: ISigningKey;
+    LSigner: ISignatureSigner;
+    LVerifier: ISignatureVerifier;
+    LSpki, LMessage, LSignature, LStripped: TBytes;
+    LCounter: Int32;
+  begin
+    LSpki := Pkix.Certificates.PublicKeyInfo(DecodeHex(FKeys.Values['rsa_cert']));
+    LKey := Crypto.Signing.ImportSigningKey(DecodeHex(FKeys.Values['rsa_key']), nil);
+    // vary the message until the signature starts with a zero octet (about 1 in 256), the only
+    // shape whose stripped form a lenient backend still accepts
+    LMessage := nil;
+    LSignature := nil;
+    for LCounter := 0 to 4095 do
+    begin
+      LMessage := TBytes.Create(Byte(LCounter shr 8), Byte(LCounter and $FF));
+      LSigner := Crypto.Signing.CreateSignatureSigner(AScheme, LKey);
+      LSigner.Update(LMessage, 0, System.Length(LMessage));
+      LSignature := LSigner.Sign;
+      if LSignature[0] = 0 then
+        Break;
+    end;
+    CheckTrue((System.Length(LSignature) > 0) and (LSignature[0] = 0),
+      'a signature with a leading zero octet was found');
+    LVerifier := Crypto.Signing.CreateSignatureVerifier(AScheme, LSpki);
+    LVerifier.Update(LMessage, 0, System.Length(LMessage));
+    CheckTrue(LVerifier.Verify(LSignature), 'the full-length signature verifies');
+    LStripped := System.Copy(LSignature, 1, System.Length(LSignature) - 1);
+    LVerifier := Crypto.Signing.CreateSignatureVerifier(AScheme, LSpki);
+    LVerifier.Update(LMessage, 0, System.Length(LMessage));
+    CheckFalse(LVerifier.Verify(LStripped),
+      'the same signature without its leading zero octet is rejected (RFC 8017 8.1.2 / 8.2.2)');
+  end;
+
+begin
+  CheckScheme(TSignatureScheme.RSA_PKCS1_SHA256);
+  CheckScheme(TSignatureScheme.RSA_PSS_RSAE_SHA256);
+end;
+
 procedure TTestSignature.TestRsaPssVerifiesRfc8448CertificateVerify;
 var
   LVerifier: ISignatureVerifier;
@@ -199,7 +437,7 @@ begin
   // the genuine RFC 8448 server CertificateVerify over the real transcript
   LContent := ServerCertVerifyContent(HashOf(['client_hello', 'server_hello',
     'encrypted_ext', 'certificate']));
-  LVerifier := Provider.Signing.CreateSignatureVerifier(TSignatureScheme.RSA_PSS_RSAE_SHA256, Rfc8448LeafSpki);
+  LVerifier := Crypto.Signing.CreateSignatureVerifier(TSignatureScheme.RSA_PSS_RSAE_SHA256, Rfc8448LeafSpki);
   LVerifier.Update(LContent, 0, System.Length(LContent));
   CheckTrue(LVerifier.Verify(CertVerifySignature),
     'the genuine RFC 8448 server CertificateVerify verifies against the leaf key');
@@ -214,7 +452,7 @@ begin
   LHash := HashOf(['client_hello', 'server_hello', 'encrypted_ext', 'certificate']);
   LHash[0] := Byte(LHash[0] xor $01);
   LContent := ServerCertVerifyContent(LHash);
-  LVerifier := Provider.Signing.CreateSignatureVerifier(TSignatureScheme.RSA_PSS_RSAE_SHA256, Rfc8448LeafSpki);
+  LVerifier := Crypto.Signing.CreateSignatureVerifier(TSignatureScheme.RSA_PSS_RSAE_SHA256, Rfc8448LeafSpki);
   LVerifier.Update(LContent, 0, System.Length(LContent));
   CheckFalse(LVerifier.Verify(CertVerifySignature),
     'the signature does not verify over a different transcript');
@@ -223,7 +461,7 @@ end;
 procedure TTestSignature.TestSignatureSchemeCodesMatchCatalog;
 begin
   // the enum's ToCode and the wire-code catalog are two hand-kept mappings of the same
-  // RFC 8446 4.2.3 codepoints; assert every scheme agrees so an edit to one that misses the
+  // RFC 9846 4.3.3 codepoints; assert every scheme agrees so an edit to one that misses the
   // other cannot drift silently
   CheckEquals(TSignatureSchemes.EcdsaSecp256r1Sha256,
     TSignatureScheme.ECDSA_SECP256R1_SHA256.ToCode, 'ecdsa_secp256r1_sha256');
@@ -245,6 +483,225 @@ begin
     TSignatureScheme.RSA_PKCS1_SHA384.ToCode, 'rsa_pkcs1_sha384');
   CheckEquals(TSignatureSchemes.RsaPkcs1Sha512,
     TSignatureScheme.RSA_PKCS1_SHA512.ToCode, 'rsa_pkcs1_sha512');
+end;
+
+procedure TTestSignature.TestSchemeCodesFromRegistryMatchesRegistryOrder;
+var
+  LRegistry: ISignatureSchemeRegistry;
+  LItems: TArray<TSignatureScheme>;
+  LCodes: TArray<UInt16>;
+  LI: Int32;
+begin
+  // the projection yields one wire code per registered scheme, in registry (preference) order
+  LRegistry := TSignatureSchemeRegistry.CreateDefault;
+  LItems := LRegistry.Items;
+  LCodes := TSignatureSchemeCodes.FromRegistry(LRegistry);
+  CheckEquals(System.Length(LItems), System.Length(LCodes), 'one code per registered scheme');
+  for LI := 0 to System.High(LItems) do
+    CheckEquals(Integer(LItems[LI].ToCode), Integer(LCodes[LI]),
+      'the projection preserves registry order');
+end;
+
+procedure TTestSignature.TestVerifierFailsClosedOnSchemeKeyFamilyMismatch;
+
+  procedure CheckMismatchFailsClosed(AScheme: TSignatureScheme; const APubDer: TBytes;
+    const AWhat: string);
+  var
+    LVerifier: ISignatureVerifier;
+  begin
+    // a scheme whose key family does not match the SPKI can never verify: the seam returns a
+    // verifier that fails closed (so the outcome is decrypt_error), never a raised argument error
+    LVerifier := Crypto.Signing.CreateSignatureVerifier(AScheme, APubDer);
+    CheckTrue(LVerifier <> nil, AWhat + ' (a verifier is returned)');
+    LVerifier.Update(TBytes.Create(1, 2, 3), 0, 3);
+    CheckFalse(LVerifier.Verify(TBytes.Create(0, 0, 0, 0)), AWhat + ' (verification fails closed)');
+  end;
+
+begin
+  CheckMismatchFailsClosed(TSignatureScheme.RSA_PSS_RSAE_SHA256,
+    DecodeHex(FKeys.Values['ecdsa_pub']), 'an EC key under rsa_pss_rsae_*');
+  CheckMismatchFailsClosed(TSignatureScheme.ECDSA_SECP256R1_SHA256, Rfc8448LeafSpki,
+    'an RSA key under ecdsa_*');
+  CheckMismatchFailsClosed(TSignatureScheme.ECDSA_SECP256R1_SHA256,
+    DecodeHex(FKeys.Values['ed25519_pub']), 'an Ed25519 key under ecdsa_*');
+end;
+
+procedure TTestSignature.TestVerifierAllowsEcdsaCurveHashDecoupling;
+var
+  LVerifier: ISignatureVerifier;
+begin
+  // the seam binds the key FAMILY, not the curve: a P-256 key under ecdsa_secp384r1_sha384 is a
+  // legitimate TLS 1.2 pairing (the curve bind is a TLS 1.3 handshake concern), so it constructs
+  LVerifier := Crypto.Signing.CreateSignatureVerifier(
+    TSignatureScheme.ECDSA_SECP384R1_SHA384, DecodeHex(FKeys.Values['ecdsa_pub']));
+  CheckTrue(LVerifier <> nil, 'an EC key under a different-curve ecdsa_* scheme still constructs');
+end;
+
+procedure TTestSignature.TestVerifierRejectsMalformedSpki;
+var
+  LRaised: Boolean;
+begin
+  LRaised := False;
+  try
+    Crypto.Signing.CreateSignatureVerifier(TSignatureScheme.ECDSA_SECP256R1_SHA256,
+      DecodeHex('deadbeefdeadbeef'));
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a malformed SubjectPublicKeyInfo raises a typed exception, not a backend one');
+end;
+
+procedure TTestSignature.TestVerifierFailsClosedOnUnclassifiableKey;
+var
+  LX25519Spki: TBytes;
+  LVerifier: ISignatureVerifier;
+begin
+  // an X25519 SubjectPublicKeyInfo parses to a valid key that cannot sign ANY TLS scheme; the seam
+  // returns a fail-closed verifier (no raw backend cast exception, no raised error), so an
+  // unclassifiable key simply never verifies
+  LX25519Spki := DecodeHex('302a300506032b656e032100' +
+    '0000000000000000000000000000000000000000000000000000000000000000');
+  LVerifier := Crypto.Signing.CreateSignatureVerifier(TSignatureScheme.ED25519, LX25519Spki);
+  CheckTrue(LVerifier <> nil, 'an unclassifiable key still yields a verifier');
+  LVerifier.Update(TBytes.Create(1, 2, 3), 0, 3);
+  CheckFalse(LVerifier.Verify(TBytes.Create(0, 0, 0, 0)),
+    'an X25519 key (unclassifiable for signing) fails closed');
+end;
+
+procedure TTestSignature.TestSignerRejectsSchemeOutsideCapableSchemes;
+var
+  LKey: ISigningKey;
+  LRaised: Boolean;
+begin
+  // an EC key cannot sign an rsa_pss_rsae_* scheme; the seam refuses it before the backend
+  LKey := Crypto.Signing.ImportSigningKey(DecodeHex(FKeys.Values['ecdsa_key']), nil);
+  LRaised := False;
+  try
+    Crypto.Signing.CreateSignatureSigner(TSignatureScheme.RSA_PSS_RSAE_SHA256, LKey);
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a scheme outside the key''s CapableSchemes is refused');
+end;
+
+procedure TTestSignature.TestLeafPolicyRejectsSchemeFamilyMismatch;
+var
+  LLeaf: IInspectedCertificate;
+  LRaised: Boolean;
+  LAlert: TTlsAlertDescription;
+begin
+  // the handshake leaf-policy gate rejects a scheme/leaf family mismatch with illegal_parameter
+  // before signature verification (an RSA leaf presented for an ecdsa_* signature)
+  LLeaf := Pkix.Certificates.Parse(DecodeHex(FKeys.Values['rsa_cert']));
+  LRaised := False;
+  LAlert := TTlsAlertDescription.BadCertificate;
+  try
+    TCertificateVerify.EnforceSigningLeafPolicy(LLeaf,
+      TSignatureScheme.ECDSA_SECP256R1_SHA256, True);
+  except
+    on E: EFatalAlertTlsLibException do
+    begin
+      LRaised := True;
+      LAlert := E.AlertDescription;
+    end;
+  end;
+  CheckTrue(LRaised, 'an RSA leaf presented for an ecdsa_* signature is rejected');
+  CheckEquals(Ord(TTlsAlertDescription.IllegalParameter), Ord(LAlert),
+    'the alert is illegal_parameter');
+end;
+
+procedure TTestSignature.TestLeafPolicyRejectsUndecodableKeyUsage;
+var
+  LLeaf: IInspectedCertificate;
+  LRaised: Boolean;
+  LAlert: TTlsAlertDescription;
+begin
+  // a keyUsage that cannot be decoded is as unusable as one without digitalSignature (RFC 5280 4.2)
+  LLeaf := TUndecodableKeyUsageLeaf.Create(
+    Pkix.Certificates.Parse(DecodeHex(FKeys.Values['rsa_cert']))) as IInspectedCertificate;
+  LRaised := False;
+  LAlert := TTlsAlertDescription.InternalError;
+  try
+    TCertificateVerify.EnforceSigningLeafPolicy(LLeaf,
+      TSignatureScheme.RSA_PSS_RSAE_SHA256, False);
+  except
+    on E: EFatalAlertTlsLibException do
+    begin
+      LRaised := True;
+      LAlert := E.AlertDescription;
+    end;
+  end;
+  CheckTrue(LRaised, 'a leaf with an undecodable keyUsage is refused for signing');
+  CheckEquals(Ord(TTlsAlertDescription.BadCertificate), Ord(LAlert), 'as bad_certificate');
+end;
+
+procedure TTestSignature.TestLeafWithMalformedKeyUsageFailsToParse;
+var
+  LDer: TBytes;
+  LI, LValue: Int32;
+  LPatched, LRaised: Boolean;
+begin
+  // the keyUsage value is an OCTET STRING wrapping a BIT STRING; retagging the inner BIT STRING
+  // makes the extension undecodable without touching anything else (parsing fails before any
+  // signature is checked, so the broken signature does not matter)
+  LDer := DecodeHex(Own<TStringList>(LoadVectorFields('Certs/EcP256Chain.txt')).Values['leaf_cert']);
+  LPatched := False;
+  for LI := 0 to System.Length(LDer) - 12 do
+    if (LDer[LI] = $55) and (LDer[LI + 1] = $1D) and (LDer[LI + 2] = $0F) then
+    begin
+      LValue := LI + 3;
+      if (LDer[LValue] = $01) and (LDer[LValue + 1] = $01) then
+        Inc(LValue, 3); // the critical flag
+      if (LDer[LValue] = $04) and (LDer[LValue + 2] = $03) then
+      begin
+        LDer[LValue + 2] := $04;
+        LPatched := True;
+      end;
+      Break;
+    end;
+  CheckTrue(LPatched, 'the fixture leaf carries a keyUsage extension to corrupt');
+  LRaised := False;
+  try
+    TCertificateVerify.ParseWellFormedLeaf(Pkix.Certificates, LDer);
+  except
+    on E: EDecodeErrorTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a leaf whose keyUsage cannot be decoded is rejected when it is parsed');
+end;
+
+function TTestSignature.VerifyEcdsa(const ACryptoProvider: ICryptoProvider;
+  const ASig, AMsg: TBytes): Boolean;
+var
+  LVerifier: ISignatureVerifier;
+begin
+  LVerifier := ACryptoProvider.Signing.CreateSignatureVerifier(
+    TSignatureScheme.ECDSA_SECP256R1_SHA256, DecodeHex(FKeys.Values['ecdsa_pub']));
+  LVerifier.Update(AMsg, 0, System.Length(AMsg));
+  Result := LVerifier.Verify(ASig);
+end;
+
+procedure TTestSignature.TestEcdsaVerifiesValidAndRejectsTrailingBytes;
+var
+  LMessage, LSig, LTampered: TBytes;
+  LSigner: ISignatureSigner;
+begin
+  // a trailing byte after the DER SEQUENCE is a False verdict, never a raise
+  LMessage := DecodeHex('54686520717569636b2062726f776e20666f78'); // "The quick brown fox"
+  LSigner := Crypto.Signing.CreateSignatureSigner(
+    TSignatureScheme.ECDSA_SECP256R1_SHA256,
+    Crypto.Signing.ImportSigningKey(DecodeHex(FKeys.Values['ecdsa_key']), nil));
+  LSigner.Update(LMessage, 0, System.Length(LMessage));
+  LSig := LSigner.Sign;
+
+  CheckTrue(VerifyEcdsa(Crypto, LSig, LMessage), 'a valid ECDSA signature verifies');
+
+  LTampered := System.Copy(LSig);
+  SetLength(LTampered, System.Length(LTampered) + 1); // a trailing byte after the DER SEQUENCE
+  CheckFalse(VerifyEcdsa(Crypto, LTampered, LMessage),
+    'a signature with a trailing byte verifies False without raising');
 end;
 
 initialization

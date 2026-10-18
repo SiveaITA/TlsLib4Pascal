@@ -27,60 +27,57 @@ uses
   TlpCryptoDomainTypes,
   TlpNegotiationTypes,
   TlpINegotiation,
-  TlpCipherSuiteRegistry,
-  TlpSignatureSchemeRegistry;
+  TlpCipherSuiteRegistry;
 
 type
   /// <summary>
-  /// The pure TLS 1.3 negotiation policy. The server calls it to choose from a
-  /// client's offers; the client calls the same routines to confirm the server
-  /// picked only what was offered. Cipher-suite choice follows a server-preference
-  /// backbone with the AEAD group reordered by the provider's HasHardwareAes -
-  /// ChaCha20-Poly1305 ahead of AES-GCM only when there is no hardware AES (a
-  /// performance ordering; the software AES-GCM path is constant-time either way).
+  /// The server's pure negotiation policy. Cipher-suite choice follows the registry's order
+  /// (server preference) unless the configured preference hands the order to the client.
   /// </summary>
   TNegotiationPolicy = class sealed(TInterfacedObject, INegotiationPolicy)
   strict private
   var
-    FProvider: ICryptoProvider;
     FCipherSuites: ICipherSuiteRegistry;
     FGroups: INamedGroupRegistry;
-    FSignatureSchemes: ISignatureSchemeRegistry;
     FPreferredGroups: TArray<UInt16>;
     FSupportedVersions: TArray<UInt16>;
     FCipherPreference: TServerCipherPreference;
-    /// <summary>The offered suites for ANegotiatedVersion in preference order (the
-    /// hardware-AES tiebreak applied), filtered to that version's protocol.</summary>
+    /// <summary>The offered suites for ANegotiatedVersion in registry order, filtered to that
+    /// version's protocol.</summary>
     function EffectiveSuiteOrder(ANegotiatedVersion: UInt16): TArray<UInt16>;
-    class function ProtocolOf(ANegotiatedVersion: UInt16): TSuiteProtocol; static;
   public
-    constructor Create(const AProvider: ICryptoProvider;
-      const ACipherSuites: ICipherSuiteRegistry; const AGroups: INamedGroupRegistry;
-      const ASignatureSchemes: ISignatureSchemeRegistry;
+    constructor Create(const ACipherSuites: ICipherSuiteRegistry;
+      const AGroups: INamedGroupRegistry;
       const APreferredGroups, ASupportedVersions: TArray<UInt16>;
       ACipherPreference: TServerCipherPreference);
 
     function SelectVersion(const AClientVersions: TArray<UInt16>): UInt16;
+    function CandidateSuites(const AClientSuites: TArray<UInt16>;
+      ANegotiatedVersion: UInt16): TArray<UInt16>;
     function SelectCipherSuite(const AClientSuites: TArray<UInt16>;
       ANegotiatedVersion: UInt16): UInt16;
+    function TrySelectCipherSuiteWithHash(const AClientSuites: TArray<UInt16>;
+      ANegotiatedVersion: UInt16; AHash: THashAlgorithm; out ASuite: UInt16): Boolean;
     function SelectGroup(const AClientGroups: TArray<UInt16>;
       ANegotiatedVersion: UInt16): UInt16;
-    function SelectSignatureScheme(const AClientSchemes: TArray<UInt16>): UInt16;
 
-    /// <summary>A policy wired with the default registries and a 1.3-only version set.</summary>
-    class function CreateDefault(const AProvider: ICryptoProvider)
+    /// <summary>Test-support scaffolding: a policy wired with the default registries (holding
+    /// both protocols' suites) and a 1.3-only version set. Production wires the policy from the
+    /// configuration.</summary>
+    class function CreateDefault(const ACryptoProvider: ICryptoProvider)
       : INegotiationPolicy; static;
 
-    /// <summary>The AProtocol suites in server-preference order with the hardware-AES
-    /// tiebreak applied (ChaCha20-Poly1305 ahead of AES-GCM only without hardware AES).
-    /// The one order the 1.3 fresh path, the 1.2 server, and the 1.3 PSK pick all share.</summary>
-    class function SuitePreferenceOrder(const AProvider: ICryptoProvider;
-      const ASuites: ICipherSuiteRegistry; AProtocol: TSuiteProtocol)
+    /// <summary>The suite protocol a negotiated wire version uses.</summary>
+    class function ProtocolOf(ANegotiatedVersion: UInt16): TSuiteProtocol; static;
+    /// <summary>The AProtocol suites of the registry, in registry order: a dual-version registry
+    /// never crosses a 1.2 suite onto a 1.3 handshake (or the reverse). The backbone of every
+    /// candidate list.</summary>
+    class function SuiteOrder(const ASuites: ICipherSuiteRegistry; AProtocol: TSuiteProtocol)
       : TArray<UInt16>; static;
   end;
 
   /// <summary>
-  /// The HelloRetryRequest sentinel (RFC 8446 4.1.3): a HelloRetryRequest is a
+  /// The HelloRetryRequest sentinel (RFC 9846 4.2.3): a HelloRetryRequest is a
   /// ServerHello whose random is the fixed SHA-256("HelloRetryRequest") value, so
   /// both roles recognize it by that random without a distinct message type.
   /// </summary>
@@ -93,7 +90,7 @@ type
   end;
 
   /// <summary>
-  /// The ServerHello.random downgrade sentinel (RFC 8446 4.1.3): a 1.3-capable
+  /// The ServerHello.random downgrade sentinel (RFC 9846 4.2.3): a 1.3-capable
   /// server that negotiates a lower version stamps the last 8 bytes, and a
   /// 1.3-capable client aborts if it sees that stamp on a downgraded connection.
   /// </summary>
@@ -115,21 +112,17 @@ resourcestring
   SNoCommonVersion = 'no mutually supported protocol version';
   SNoCommonSuite = 'no mutually supported cipher suite';
   SNoCommonGroup = 'no mutually supported named group';
-  SNoCommonScheme = 'no mutually supported signature scheme';
 
 { TNegotiationPolicy }
 
-constructor TNegotiationPolicy.Create(const AProvider: ICryptoProvider;
-  const ACipherSuites: ICipherSuiteRegistry; const AGroups: INamedGroupRegistry;
-  const ASignatureSchemes: ISignatureSchemeRegistry;
+constructor TNegotiationPolicy.Create(const ACipherSuites: ICipherSuiteRegistry;
+  const AGroups: INamedGroupRegistry;
   const APreferredGroups, ASupportedVersions: TArray<UInt16>;
   ACipherPreference: TServerCipherPreference);
 begin
   inherited Create;
-  FProvider := AProvider;
   FCipherSuites := ACipherSuites;
   FGroups := AGroups;
-  FSignatureSchemes := ASignatureSchemes;
   FPreferredGroups := APreferredGroups;
   FSupportedVersions := ASupportedVersions;
   FCipherPreference := ACipherPreference;
@@ -144,35 +137,21 @@ begin
     Result := TSuiteProtocol.Tls12;
 end;
 
-class function TNegotiationPolicy.SuitePreferenceOrder(
-  const AProvider: ICryptoProvider; const ASuites: ICipherSuiteRegistry;
+class function TNegotiationPolicy.SuiteOrder(const ASuites: ICipherSuiteRegistry;
   AProtocol: TSuiteProtocol): TArray<UInt16>;
 var
-  LAes, LChaCha: TArray<UInt16>;
   LSuite: TTlsCipherSuite;
 begin
-  LAes := nil;
-  LChaCha := nil;
-  // only this protocol's suites are eligible, so a dual-version registry never crosses
-  // a 1.2 suite onto a 1.3 handshake (or the reverse)
+  Result := nil;
   for LSuite in ASuites.Items do
     if LSuite.Protocol = AProtocol then
-      if LSuite.Common.Aead = TAeadAlgorithm.CHACHA20_POLY1305 then
-        TArrayUtilities.Append<UInt16>(LChaCha, LSuite.Common.Code)
-      else
-        TArrayUtilities.Append<UInt16>(LAes, LSuite.Common.Code);
-  // AES-GCM first when hardware AES is present; otherwise ChaCha20-Poly1305 first
-  if AProvider.Primitives.HasHardwareAes then
-    Result := TArrayUtilities.Concat<UInt16>(LAes, LChaCha)
-  else
-    Result := TArrayUtilities.Concat<UInt16>(LChaCha, LAes);
+      TArrayUtilities.Append<UInt16>(Result, LSuite.Common.Code);
 end;
 
 function TNegotiationPolicy.EffectiveSuiteOrder(
   ANegotiatedVersion: UInt16): TArray<UInt16>;
 begin
-  Result := SuitePreferenceOrder(FProvider, FCipherSuites,
-    ProtocolOf(ANegotiatedVersion));
+  Result := SuiteOrder(FCipherSuites, ProtocolOf(ANegotiatedVersion));
 end;
 
 function TNegotiationPolicy.SelectVersion(
@@ -188,29 +167,58 @@ begin
     @SNoCommonVersion);
 end;
 
-function TNegotiationPolicy.SelectCipherSuite(
-  const AClientSuites: TArray<UInt16>; ANegotiatedVersion: UInt16): UInt16;
+function TNegotiationPolicy.CandidateSuites(
+  const AClientSuites: TArray<UInt16>; ANegotiatedVersion: UInt16): TArray<UInt16>;
 var
   LCode: UInt16;
   LServerOrder: TArray<UInt16>;
 begin
+  Result := nil;
   LServerOrder := EffectiveSuiteOrder(ANegotiatedVersion);
   if FCipherPreference = TServerCipherPreference.ClientOrder then
   begin
-    // honor the client's preference: the client's most-preferred suite the server also offers
+    // the client's order, kept to what the server offers (a repeated client entry counts once)
     for LCode in AClientSuites do
-      if TArrayUtilities.Contains<UInt16>(LServerOrder, LCode) then
-        Exit(LCode);
+      if (TArrayUtilities.Contains<UInt16>(LServerOrder, LCode)) and
+        not (TArrayUtilities.Contains<UInt16>(Result, LCode)) then
+        TArrayUtilities.Append<UInt16>(Result, LCode);
   end
   else
   begin
-    // server preference (default): the server's most-preferred suite the client also offered
+    // server preference (default): the server's order, kept to what the client offered
     for LCode in LServerOrder do
       if TArrayUtilities.Contains<UInt16>(AClientSuites, LCode) then
-        Exit(LCode);
+        TArrayUtilities.Append<UInt16>(Result, LCode);
   end;
-  raise EFatalAlertTlsLibException.CreateRes(TTlsAlertDescription.HandshakeFailure,
-    @SNoCommonSuite);
+end;
+
+function TNegotiationPolicy.SelectCipherSuite(
+  const AClientSuites: TArray<UInt16>; ANegotiatedVersion: UInt16): UInt16;
+var
+  LCandidates: TArray<UInt16>;
+begin
+  LCandidates := CandidateSuites(AClientSuites, ANegotiatedVersion);
+  if System.Length(LCandidates) = 0 then
+    raise EFatalAlertTlsLibException.CreateRes(TTlsAlertDescription.HandshakeFailure,
+      @SNoCommonSuite);
+  Result := LCandidates[0];
+end;
+
+function TNegotiationPolicy.TrySelectCipherSuiteWithHash(
+  const AClientSuites: TArray<UInt16>; ANegotiatedVersion: UInt16;
+  AHash: THashAlgorithm; out ASuite: UInt16): Boolean;
+var
+  LCode: UInt16;
+  LSuite: TTlsCipherSuite;
+begin
+  Result := False;
+  ASuite := 0;
+  for LCode in CandidateSuites(AClientSuites, ANegotiatedVersion) do
+    if FCipherSuites.TryGet(LCode, LSuite) and (LSuite.Common.Hash = AHash) then
+    begin
+      ASuite := LCode;
+      Exit(True);
+    end;
 end;
 
 function TNegotiationPolicy.SelectGroup(
@@ -231,25 +239,12 @@ begin
     @SNoCommonGroup);
 end;
 
-function TNegotiationPolicy.SelectSignatureScheme(
-  const AClientSchemes: TArray<UInt16>): UInt16;
-var
-  LScheme: TSignatureScheme;
-begin
-  for LScheme in FSignatureSchemes.Items do
-    if TArrayUtilities.Contains<UInt16>(AClientSchemes, LScheme.ToCode) then
-      Exit(LScheme.ToCode);
-  raise EFatalAlertTlsLibException.CreateRes(TTlsAlertDescription.HandshakeFailure,
-    @SNoCommonScheme);
-end;
-
-class function TNegotiationPolicy.CreateDefault(const AProvider: ICryptoProvider)
+class function TNegotiationPolicy.CreateDefault(const ACryptoProvider: ICryptoProvider)
   : INegotiationPolicy;
 begin
-  Result := TNegotiationPolicy.Create(AProvider,
-    TCipherSuiteRegistry.CreateDefault(AProvider),
-    TNamedGroups.CreateDefaultRegistry(AProvider),
-    TSignatureSchemeRegistry.CreateDefault,
+  Result := TNegotiationPolicy.Create(
+    TCipherSuiteRegistry.CreateDualVersion(ACryptoProvider),
+    TNamedGroups.CreateDefaultRegistry(ACryptoProvider),
     TArray<UInt16>.Create(TNamedGroupCatalog.X25519MlKem768, TNamedGroupCatalog.SecP256r1MlKem768,
     TNamedGroupCatalog.X25519, TNamedGroupCatalog.Secp256r1,
     TNamedGroupCatalog.Secp384r1, TNamedGroupCatalog.Secp521r1),
@@ -301,8 +296,11 @@ end;
 class function TDowngradeProtection.IsDowngradeAttack(const AServerRandom: TBytes;
   AClientSupportsTls13: Boolean; ANegotiatedVersion: UInt16): Boolean;
 begin
+  // a 1.3-capable client checks for both sentinels whatever lower version was negotiated
+  // (RFC 9846 4.2.3): a server stamps either only when it answers below its own highest version
   Result := AClientSupportsTls13 and (ANegotiatedVersion < TlsWireVersionTls13) and
-    HasSentinel(AServerRandom, ANegotiatedVersion);
+    (HasSentinel(AServerRandom, TlsWireVersionTls12) or
+    HasSentinel(AServerRandom, TlsWireVersionTls11));
 end;
 
 end.

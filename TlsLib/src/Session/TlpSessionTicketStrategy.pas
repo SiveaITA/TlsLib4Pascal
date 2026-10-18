@@ -17,6 +17,8 @@ interface
 
 uses
   SysUtils,
+  TlpAeadUtilities,
+  TlpTlsLibExceptions,
   TlpTlsVersion,
   TlpCryptoDomainTypes,
   TlpICryptoProvider,
@@ -33,7 +35,8 @@ uses
 type
   /// <summary>
   /// The stateful ticket strategy: an opaque handle into an <see cref="ISessionStore" />.
-  /// Seal stores the session and returns its handle; Open removes it (true single-use).
+  /// Seal stores the session and returns its handle; Open recovers it and Consume removes it
+  /// (true single-use, committed only once the server resumes from it).
   /// </summary>
   TStoreTicketStrategy = class sealed(TInterfacedObject, ISessionTicketStrategy)
   strict private
@@ -43,6 +46,7 @@ type
     constructor Create(const AStore: ISessionStore);
     function Seal(const ASession: IResumableSession): TBytes;
     function Open(const ATicket: TBytes; out ASession: IResumableSession): Boolean;
+    function Consume(const ATicket: TBytes): Boolean;
   end;
 
   /// <summary>
@@ -55,7 +59,7 @@ type
   TStekTicketStrategy = class sealed(TInterfacedObject, ISessionTicketStrategy)
   strict private
   var
-    FProvider: ICryptoProvider;
+    FCrypto: ICryptoProvider;
     FKeys: ISessionTicketKeyManager;
     class function SerializeSession(const ASession: IResumableSession): TBytes; static;
     class function DeserializeSession(const AData: TBytes;
@@ -63,11 +67,17 @@ type
     class procedure SerializeChain(const AWriter: IWireWriter;
       const AChain: TArray<TBytes>); static;
     class function DeserializeChain(var AReader: TWireReader): TArray<TBytes>; static;
+    /// <summary>A stable, enum-order-independent wire code for the PRF hash, so a fleet build that
+    /// reorders THashAlgorithm cannot silently reinterpret a peer's ticket; an unknown code fails
+    /// the deserialize (a graceful full handshake), never a mis-derived key.</summary>
+    class function HashToCode(AHash: THashAlgorithm): Byte; static;
+    class function TryCodeToHash(ACode: Byte; out AHash: THashAlgorithm): Boolean; static;
   public
-    constructor Create(const AProvider: ICryptoProvider;
+    constructor Create(const ACryptoProvider: ICryptoProvider;
       const AKeys: ISessionTicketKeyManager);
     function Seal(const ASession: IResumableSession): TBytes;
     function Open(const ATicket: TBytes; out ASession: IResumableSession): Boolean;
+    function Consume(const ATicket: TBytes): Boolean;
   end;
 
   /// <summary>Selects the server's ticket strategy: a configured store upgrades the
@@ -76,7 +86,7 @@ type
   public
     /// <summary>The store strategy when AStore is set, else the STEK strategy when AKeys
     /// is set, else nil (resumption disabled).</summary>
-    class function ForServer(const AProvider: ICryptoProvider;
+    class function ForServer(const ACryptoProvider: ICryptoProvider;
       const AKeys: ISessionTicketKeyManager;
       const AStore: ISessionStore): ISessionTicketStrategy; static;
   end;
@@ -84,15 +94,14 @@ type
 implementation
 
 const
-  // bumped when the ticket layout changes; an older ticket fails the version check on Open and
-  // simply draws a full handshake. 2 added the SNI host_name (virtual-hosting guard); 3 added the
-  // peer certificate chain (so a resumed mTLS connection can surface the client's identity)
-  TicketFormatVersion = Byte(3);
+  // bumped on any layout change; an older ticket fails the version check and draws a full handshake
+  TicketFormatVersion = UInt32(11);
   TicketNonceLength = Int32(12); // AES-256-GCM nonce
   // the serialized session carries the peer chain the client volunteered; cap it so an oversized
   // chain does not bloat the ticket and the resumed ClientHello that re-presents it. Past the cap
   // the server issues no ticket for that connection rather than a chain-reduced one
-  MaxSerializedSessionLength = Int32(16384);
+  MaxSerializedSessionLength = TSessionTicketLimits.MaxSerializedSession;
+  Tls12MasterSecretLength = Int32(48); // RFC 5246 8.1
 
 { TStoreTicketStrategy }
 
@@ -110,17 +119,58 @@ end;
 function TStoreTicketStrategy.Open(const ATicket: TBytes;
   out ASession: IResumableSession): Boolean;
 begin
-  Result := FStore.Take(ATicket, ASession);
+  Result := FStore.Peek(ATicket, ASession);
+end;
+
+function TStoreTicketStrategy.Consume(const ATicket: TBytes): Boolean;
+var
+  LSession: IResumableSession;
+begin
+  // Take is atomic, so of two connections presenting the same ticket only one commits
+  Result := FStore.Take(ATicket, LSession);
 end;
 
 { TStekTicketStrategy }
 
-constructor TStekTicketStrategy.Create(const AProvider: ICryptoProvider;
+constructor TStekTicketStrategy.Create(const ACryptoProvider: ICryptoProvider;
   const AKeys: ISessionTicketKeyManager);
 begin
   inherited Create;
-  FProvider := AProvider;
+  FCrypto := ACryptoProvider;
   FKeys := AKeys;
+end;
+
+class function TStekTicketStrategy.HashToCode(AHash: THashAlgorithm): Byte;
+begin
+  // fixed codes bound to the named value, not the ordinal, so a reorder of THashAlgorithm keeps
+  // the wire meaning stable across a mixed fleet
+  case AHash of
+    THashAlgorithm.SHA_256:
+      Result := 1;
+    THashAlgorithm.SHA_384:
+      Result := 2;
+    THashAlgorithm.SHA_512:
+      Result := 3;
+  else
+    Result := 0; // never serialized: the library's suites only use the three above
+  end;
+end;
+
+class function TStekTicketStrategy.TryCodeToHash(ACode: Byte;
+  out AHash: THashAlgorithm): Boolean;
+begin
+  Result := True;
+  case ACode of
+    1:
+      AHash := THashAlgorithm.SHA_256;
+    2:
+      AHash := THashAlgorithm.SHA_384;
+    3:
+      AHash := THashAlgorithm.SHA_512;
+  else
+    AHash := THashAlgorithm.SHA_256;
+    Result := False;
+  end;
 end;
 
 class function TStekTicketStrategy.SerializeSession(
@@ -128,55 +178,74 @@ class function TStekTicketStrategy.SerializeSession(
 var
   LWriter: IWireWriter;
   LMarker: TWireVectorMarker;
-  LIssued: UInt64;
+  LIssued, LAuthenticated: UInt64;
+  L13: ITls13ResumableSession;
+  L12: ITls12ResumableSession;
   LResumption, LMaster: TBytes;
 begin
   Result := nil;
   LWriter := TWireWriter.Create;
-  LWriter.WriteUInt8(TicketFormatVersion);
+  LWriter.WriteUInt32(TicketFormatVersion);
   LWriter.WriteUInt16(ASession.Version.WireValue);
   LWriter.WriteUInt16(ASession.CipherSuite);
-  LWriter.WriteUInt8(Byte(Ord(ASession.Hash)));
-  LWriter.WriteUInt16(ASession.NamedGroup);
+  LWriter.WriteUInt8(HashToCode(ASession.Hash));
   LWriter.WriteUInt32(ASession.TicketLifetime);
-  LWriter.WriteUInt32(ASession.TicketAgeAdd);
   LIssued := ASession.IssuedAtMillis;
   LWriter.WriteUInt32(UInt32(LIssued shr 32));
   LWriter.WriteUInt32(UInt32(LIssued and $FFFFFFFF));
-  LWriter.WriteUInt32(ASession.MaxEarlyData);
-  if ASession.ExtendedMasterSecret then
-    LWriter.WriteUInt8(1)
-  else
-    LWriter.WriteUInt8(0);
+  LAuthenticated := ASession.AuthenticatedAtMillis;
+  LWriter.WriteUInt32(UInt32(LAuthenticated shr 32));
+  LWriter.WriteUInt32(UInt32(LAuthenticated and $FFFFFFFF));
   LMarker := LWriter.OpenVector(2);
-  LWriter.WriteBytes(TEncoding.ASCII.GetBytes(ASession.Alpn));
+  LWriter.WriteBytes(ASession.Alpn);
   LWriter.CloseVector(LMarker);
   // the SNI host_name the session was issued under, bound so a ticket cannot resume as a
   // different virtual host
   LMarker := LWriter.OpenVector(2);
   LWriter.WriteBytes(TEncoding.UTF8.GetBytes(ASession.ServerName));
   LWriter.CloseVector(LMarker);
-  LResumption := nil;
-  if ASession.ResumptionSecret <> nil then
-    LResumption := ASession.ResumptionSecret.ToBytes;
-  LMarker := LWriter.OpenVector(2);
-  LWriter.WriteBytes(LResumption);
-  LWriter.CloseVector(LMarker);
-  TSecureMemory.WipeBytes(LResumption);
-  LMaster := nil;
-  if ASession.MasterSecret <> nil then
-    LMaster := ASession.MasterSecret.ToBytes;
-  LMarker := LWriter.OpenVector(2);
-  LWriter.WriteBytes(LMaster);
-  LWriter.CloseVector(LMarker);
-  TSecureMemory.WipeBytes(LMaster);
-  LMarker := LWriter.OpenVector(1);
-  LWriter.WriteBytes(ASession.SessionId);
-  LWriter.CloseVector(LMarker);
-  LMarker := LWriter.OpenVector(2);
-  LWriter.WriteBytes(ASession.SessionTicket);
-  LWriter.CloseVector(LMarker);
   SerializeChain(LWriter, ASession.PeerCertificates);
+  // the opaque resumption scope, so a configuration only reuses a ticket sealed under the same scope
+  LMarker := LWriter.OpenVector(1);
+  LWriter.WriteBytes(ASession.ResumptionScope);
+  LWriter.CloseVector(LMarker);
+  // the external PSK that authenticated the session (empty for a certificate session), so the
+  // server resumes it only while that key is still configured with the same secret
+  LMarker := LWriter.OpenVector(2);
+  LWriter.WriteBytes(ASession.PskIdentity);
+  LWriter.CloseVector(LMarker);
+  LMarker := LWriter.OpenVector(1);
+  LWriter.WriteBytes(ASession.PskBinding);
+  LWriter.CloseVector(LMarker);
+  LWriter.WriteUInt16(ASession.PeerSignatureScheme);
+  if Supports(ASession, ITls13ResumableSession, L13) then
+  begin
+    LWriter.WriteUInt32(L13.TicketAgeAdd);
+    LWriter.WriteUInt32(L13.MaxEarlyData);
+    LResumption := nil;
+    if L13.ResumptionSecret <> nil then
+      LResumption := L13.ResumptionSecret.ToBytes;
+    LMarker := LWriter.OpenVector(2);
+    LWriter.WriteBytes(LResumption);
+    LWriter.CloseVector(LMarker);
+    TSecureMemory.WipeBytes(LResumption);
+  end
+  else if Supports(ASession, ITls12ResumableSession, L12) then
+  begin
+    LWriter.WriteUInt16(L12.NamedGroup);
+    if L12.ExtendedMasterSecret then
+      LWriter.WriteUInt8(1)
+    else
+      LWriter.WriteUInt8(0);
+    LMaster := nil;
+    if L12.MasterSecret <> nil then
+      LMaster := L12.MasterSecret.ToBytes;
+    // the master secret is a fixed 48 bytes (RFC 5246 8.1); written raw, checked on open
+    LWriter.WriteBytes(LMaster);
+    TSecureMemory.WipeBytes(LMaster);
+  end
+  else
+    Exit; // neither sub-interface: nothing to seal
   Result := LWriter.ToBytes;
 end;
 
@@ -223,61 +292,81 @@ class function TStekTicketStrategy.DeserializeSession(const AData: TBytes;
   out ASession: IResumableSession): Boolean;
 var
   LReader, LVec: TWireReader;
-  LVersion, LSuite, LGroup: UInt16;
+  LVersion, LSuite, LScheme, LGroup: UInt16;
   LHashByte, LEms: Byte;
   LHash: THashAlgorithm;
   LLifetime, LAgeAdd, LMaxEarly, LHi, LLo: UInt32;
-  LIssued: UInt64;
-  LAlpn, LServerName: string;
-  LResumption, LMaster, LSessionId, LSessionTicket: TBytes;
+  LIssued, LAuthenticated: UInt64;
+  LServerName: string;
+  LAlpn, LResumption, LMaster, LScope, LPskIdentity, LPskBinding: TBytes;
   LPeerChain: TArray<TBytes>;
 begin
   ASession := nil;
   Result := False;
+  LPskIdentity := nil;
+  LPskBinding := nil;
+  LResumption := nil;
+  LMaster := nil;
   LReader := TWireReader.Create(AData);
-  if LReader.ReadUInt8 <> TicketFormatVersion then
+  if LReader.ReadUInt32 <> TicketFormatVersion then
     Exit;
   LVersion := LReader.ReadUInt16;
   LSuite := LReader.ReadUInt16;
   LHashByte := LReader.ReadUInt8;
-  if LHashByte > Byte(Ord(High(THashAlgorithm))) then
+  if not TryCodeToHash(LHashByte, LHash) then
     Exit;
-  LHash := THashAlgorithm(LHashByte);
-  LGroup := LReader.ReadUInt16;
   LLifetime := LReader.ReadUInt32;
-  LAgeAdd := LReader.ReadUInt32;
   LHi := LReader.ReadUInt32;
   LLo := LReader.ReadUInt32;
   LIssued := (UInt64(LHi) shl 32) or UInt64(LLo);
-  LMaxEarly := LReader.ReadUInt32;
-  LEms := LReader.ReadUInt8;
+  LHi := LReader.ReadUInt32;
+  LLo := LReader.ReadUInt32;
+  LAuthenticated := (UInt64(LHi) shl 32) or UInt64(LLo);
   LVec := LReader.OpenVector(2);
-  LAlpn := TEncoding.ASCII.GetString(LVec.ReadBytes(LVec.Remaining));
+  LAlpn := LVec.ReadBytes(LVec.Remaining);
   LVec := LReader.OpenVector(2);
   LServerName := TEncoding.UTF8.GetString(LVec.ReadBytes(LVec.Remaining));
-  LVec := LReader.OpenVector(2);
-  LResumption := LVec.ReadBytes(LVec.Remaining);
-  LVec := LReader.OpenVector(2);
-  LMaster := LVec.ReadBytes(LVec.Remaining);
-  LVec := LReader.OpenVector(1);
-  LSessionId := LVec.ReadBytes(LVec.Remaining);
-  LVec := LReader.OpenVector(2);
-  LSessionTicket := LVec.ReadBytes(LVec.Remaining);
   LPeerChain := DeserializeChain(LReader);
+  LVec := LReader.OpenVector(1);
+  LScope := LVec.ReadBytes(LVec.Remaining);
+  LVec := LReader.OpenVector(2);
+  LPskIdentity := LVec.ReadBytes(LVec.Remaining);
+  LVec := LReader.OpenVector(1);
+  LPskBinding := LVec.ReadBytes(LVec.Remaining);
+  LScheme := LReader.ReadUInt16;
 
   try
-    // an authenticated body with trailing bytes is a format mismatch, not a valid ticket -> full
-    // handshake
-    if LReader.Remaining <> 0 then
-      Exit;
     if LVersion = TlsWireVersionTls13 then
-      ASession := TResumableSession.CreateTls13(LSuite, LHash,
-        TSecretBuffer.From(LResumption), LGroup, LAlpn, LServerName, nil, LLifetime, LAgeAdd,
-        LIssued, LMaxEarly, LPeerChain)
+    begin
+      LAgeAdd := LReader.ReadUInt32;
+      LMaxEarly := LReader.ReadUInt32;
+      LVec := LReader.OpenVector(2);
+      LResumption := LVec.ReadBytes(LVec.Remaining);
+      // a 1.3 ticket with no resumption secret is unusable
+      if System.Length(LResumption) = 0 then
+        Exit;
+      // an authenticated body with trailing bytes is a format mismatch -> full handshake
+      if LReader.Remaining <> 0 then
+        Exit;
+      ASession := TTls13ResumableSession.Create(LSuite, LHash,
+        TSecretBuffer.From(LResumption), LAlpn, LServerName, nil, LLifetime, LAgeAdd,
+        LIssued, LMaxEarly, LPeerChain, LScope, LPskIdentity, LPskBinding, LScheme, LAuthenticated);
+    end
     else if LVersion = TlsWireVersionTls12 then
-      ASession := TResumableSession.CreateTls12(LSuite, LHash,
-        TSecretBuffer.From(LMaster), LSessionId, LSessionTicket, LEms <> 0, LAlpn, LServerName,
-        LLifetime, LAgeAdd, LIssued, LPeerChain)
+    begin
+      LGroup := LReader.ReadUInt16;
+      LEms := LReader.ReadUInt8;
+      if LEms > 1 then
+        Exit;
+      // the master secret is the fixed-length tail; anything else is a format mismatch
+      if LReader.Remaining <> Tls12MasterSecretLength then
+        Exit;
+      LMaster := LReader.ReadBytes(Tls12MasterSecretLength);
+      ASession := TTls12ResumableSession.Create(LSuite, LHash,
+        TSecretBuffer.From(LMaster), nil, nil, LEms <> 0, LAlpn, LServerName,
+        LLifetime, LIssued, LPeerChain, LScope, LPskIdentity, LPskBinding, LGroup, LScheme,
+        LAuthenticated);
+    end
     else
       Exit;
   finally
@@ -297,28 +386,41 @@ begin
   if not FKeys.CurrentKey(LKeyName, LKey) then
     Exit;
   LPlain := SerializeSession(ASession);
-  // an oversized peer chain would bloat the ticket and the resumed ClientHello; decline to issue
-  // rather than degrade it (the caller emits no ticket, leaving the client to full-handshake)
-  if System.Length(LPlain) > MaxSerializedSessionLength then
-  begin
-    TSecureMemory.WipeBytes(LPlain);
-    Exit;
-  end;
-  LNonce := FProvider.Primitives.GetRandom.GenerateBytes(TicketNonceLength);
-  LAead := FProvider.Primitives.CreateAead(TAeadAlgorithm.AES_256_GCM);
-  LAead.Init(LKey);
   try
-    // the key name is authenticated as associated data (it is not secret)
-    LCipher := LAead.Seal(LNonce, LKeyName, LPlain);
+    // a session that is neither a 1.3 nor a 1.2 sub-interface serializes to nothing: decline to seal
+    if LPlain = nil then
+      Exit;
+    // an oversized peer chain would bloat the ticket and the resumed ClientHello; decline to seal
+    // rather than degrade it, and the caller signals the decline in its protocol's terms
+    if System.Length(LPlain) > MaxSerializedSessionLength then
+      Exit;
+    LNonce := FCrypto.Primitives.GetRandom.GenerateBytes(TicketNonceLength);
+    LAead := FCrypto.Primitives.CreateAead(TAeadAlgorithm.AES_256_GCM);
+    try
+      LAead.Init(LKey);
+      // the key name is authenticated as associated data (it is not secret)
+      LCipher := TAeadUtilities.Seal(LAead, LNonce, LKeyName, LPlain);
+    except
+      // a custom manager that hands over an unusable key must not fault the handshake; decline to seal
+      on E: EBaseTlsLibException do
+        Exit;
+    end;
+    SetLength(Result, System.Length(LKeyName) + System.Length(LNonce) +
+      System.Length(LCipher));
+    Move(LKeyName[0], Result[0], System.Length(LKeyName));
+    Move(LNonce[0], Result[System.Length(LKeyName)], System.Length(LNonce));
+    Move(LCipher[0], Result[System.Length(LKeyName) + System.Length(LNonce)],
+      System.Length(LCipher));
   finally
+    // the plaintext session holds the resumption secret, whatever the AEAD raises
     TSecureMemory.WipeBytes(LPlain);
   end;
-  SetLength(Result, System.Length(LKeyName) + System.Length(LNonce) +
-    System.Length(LCipher));
-  Move(LKeyName[0], Result[0], System.Length(LKeyName));
-  Move(LNonce[0], Result[System.Length(LKeyName)], System.Length(LNonce));
-  Move(LCipher[0], Result[System.Length(LKeyName) + System.Length(LNonce)],
-    System.Length(LCipher));
+end;
+
+function TStekTicketStrategy.Consume(const ATicket: TBytes): Boolean;
+begin
+  // a stateless ticket holds no server state to use up
+  Result := True;
 end;
 
 function TStekTicketStrategy.Open(const ATicket: TBytes;
@@ -332,7 +434,7 @@ begin
   ASession := nil;
   Result := False;
   LNameLen := FKeys.KeyNameLength;
-  LAead := FProvider.Primitives.CreateAead(TAeadAlgorithm.AES_256_GCM);
+  LAead := FCrypto.Primitives.CreateAead(TAeadAlgorithm.AES_256_GCM);
   // key_name || nonce || ciphertext+tag; reject anything shorter than the framing
   if System.Length(ATicket) < LNameLen + TicketNonceLength + LAead.TagSize then
     Exit;
@@ -342,21 +444,26 @@ begin
   LNonce := System.Copy(ATicket, LNameLen, TicketNonceLength);
   LCipher := System.Copy(ATicket, LNameLen + TicketNonceLength,
     System.Length(ATicket) - LNameLen - TicketNonceLength);
-  LAead.Init(LKey);
   try
-    LPlain := LAead.Open(LNonce, LKeyName, LCipher);
+    // Init can reject a key a custom manager cannot bind (e.g. a wrong-length one); keep it inside
+    // the guard so that, like an authentication failure, it falls back to a full handshake
+    LAead.Init(LKey);
+    LPlain := TAeadUtilities.Open(LAead, LNonce, LKeyName, LCipher);
   except
-    // authentication failure (tampered / wrong key) -> full handshake
-    Exit;
+    on E: EBaseTlsLibException do
+      Exit;
   end;
   try
     try
       Result := DeserializeSession(LPlain, ASession);
     except
-      // belt to the version check's braces: an authenticated body that still fails to parse
-      // (a future layout change, a truncated ticket) is unusable, never fatal -> full handshake
-      ASession := nil;
-      Result := False;
+      // an authenticated body that still fails to parse (a layout change, a truncated ticket)
+      // is unusable, never fatal -> full handshake
+      on E: EBaseTlsLibException do
+      begin
+        ASession := nil;
+        Result := False;
+      end;
     end;
   finally
     TSecureMemory.WipeBytes(LPlain);
@@ -365,7 +472,7 @@ end;
 
 { TSessionTicketStrategies }
 
-class function TSessionTicketStrategies.ForServer(const AProvider: ICryptoProvider;
+class function TSessionTicketStrategies.ForServer(const ACryptoProvider: ICryptoProvider;
   const AKeys: ISessionTicketKeyManager;
   const AStore: ISessionStore): ISessionTicketStrategy;
 begin
@@ -373,7 +480,7 @@ begin
   if AStore <> nil then
     Result := TStoreTicketStrategy.Create(AStore)
   else if AKeys <> nil then
-    Result := TStekTicketStrategy.Create(AProvider, AKeys)
+    Result := TStekTicketStrategy.Create(ACryptoProvider, AKeys)
   else
     Result := nil;
 end;

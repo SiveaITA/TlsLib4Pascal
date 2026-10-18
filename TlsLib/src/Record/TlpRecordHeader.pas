@@ -16,15 +16,16 @@ unit TlpRecordHeader;
 interface
 
 uses
+  SysUtils,
+  TlpBinaryPrimitives,
   TlpTlsAlert,
   TlpTlsLibExceptions,
   TlpTlsContentType,
   TlpTlsVersion,
-  TlpWireReader,
-  TlpIWireWriter;
+  TlpWireReader;
 
 type
-  /// <summary>The record-layer size ceilings (RFC 8446 5.1/5.2, RFC 5246 6.2.3).</summary>
+  /// <summary>The record-layer size ceilings (RFC 9846 5.1/5.2, RFC 5246 6.2.3).</summary>
   TRecordLimits = class sealed(TObject)
   public const
     /// <summary>The fixed 5-byte record header: type(1) version(2) length(2).</summary>
@@ -40,7 +41,7 @@ type
   /// <summary>
   /// The 5-byte TLS record header. The content type is held as its raw wire byte
   /// so an unknown code survives the parse for the record layer's demux to reject
-  /// (RFC 8446 5.1) rather than being guessed or dropped here.
+  /// (RFC 9846 5) rather than being guessed or dropped here.
   /// </summary>
   TTlsRecordHeader = record
   strict private
@@ -63,8 +64,8 @@ type
     /// </summary>
     class function Parse(var AReader: TWireReader;
       AMaxCiphertextLength: Int32): TTlsRecordHeader; static;
-    /// <summary>Writes the 5 header bytes through the wire writer.</summary>
-    procedure Serialize(const AWriter: IWireWriter);
+    /// <summary>Writes the 5 header bytes at ABuf[AOffset]; the caller sizes ABuf.</summary>
+    procedure WriteTo(const ABuf: TBytes; AOffset: Int32);
     /// <summary>Maps the content-type byte to a known type; False if unknown.</summary>
     function TryContentType(out AContentType: TTlsContentType): Boolean;
 
@@ -116,11 +117,11 @@ begin
   Result.FLength := LLength;
 end;
 
-procedure TTlsRecordHeader.Serialize(const AWriter: IWireWriter);
+procedure TTlsRecordHeader.WriteTo(const ABuf: TBytes; AOffset: Int32);
 begin
-  AWriter.WriteUInt8(FContentTypeByte);
-  AWriter.WriteUInt16(FVersion.WireValue);
-  AWriter.WriteUInt16(UInt16(FLength));
+  ABuf[AOffset] := FContentTypeByte;
+  TBinaryPrimitives.WriteUInt16BigEndian(ABuf, AOffset + 1, FVersion.WireValue);
+  TBinaryPrimitives.WriteUInt16BigEndian(ABuf, AOffset + 3, UInt16(FLength));
 end;
 
 function TTlsRecordHeader.TryContentType(out AContentType: TTlsContentType): Boolean;

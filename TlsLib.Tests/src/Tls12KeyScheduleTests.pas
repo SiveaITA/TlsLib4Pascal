@@ -35,6 +35,7 @@ uses
   TlpRecordProtection,
   TlpIKeySchedule,
   TlpTls12KeySchedule,
+  TlpTlsLibExceptions,
   TlsLibTestBase;
 
 type
@@ -47,6 +48,14 @@ type
     procedure TestExtendedMasterSecretChangesTheMaster;
     procedure TestVerifyDataComputeAndReject;
     procedure TestExporterIsDeterministic;
+    procedure TestExporterRejectsBadArgs;
+    procedure TestForgetKeepsMasterForExporterAndReleasesKeyBlock;
+    procedure TestDeriveMasterTwiceRaises;
+    procedure TestDeriveMasterAfterSetMasterRaises;
+    procedure TestDeriveMasterWithoutPreMasterRaises;
+    procedure TestDeriveKeyBlockAfterForgetRaises;
+    procedure TestSetPreMasterAfterForgetRaises;
+    procedure TestSetMasterAfterForgetRaises;
   end;
 
 implementation
@@ -64,7 +73,7 @@ const
 function TTestTls12KeySchedule.NewSchedule: ITls12KeySchedule;
 begin
   // TLS_ECDHE_..._WITH_AES_128_GCM_SHA256: PRF SHA-256, 16-byte key, 4-byte GCM salt
-  Result := TTls12KeySchedule.Create(Provider, THashAlgorithm.SHA_256, 16,
+  Result := TTls12KeySchedule.Create(Crypto, THashAlgorithm.SHA_256, 16,
     TAeadAlgorithm.AES_128_GCM);
   Result.SetPreMasterSecret(TSecretBuffer.From(DecodeHex(PreMasterHex)));
   Result.SetRandoms(DecodeHex(ClientRandomHex), DecodeHex(ServerRandomHex));
@@ -77,10 +86,10 @@ var
 begin
   LVec := LoadVectorFields('Tls12/PrfSha256.txt');
   try
-    LOutput := Provider.Primitives.CreateTls12Prf(THashAlgorithm.SHA_256).Compute(
+    LOutput := Crypto.Primitives.CreateTls12Prf(THashAlgorithm.SHA_256).Compute(
       TSecretBuffer.From(DecodeHex(LVec.Values['secret'])),
       LVec.Values['label'], DecodeHex(LVec.Values['seed']),
-      StrToInt(LVec.Values['length']));
+      StrToInt(LVec.Values['length'])).ToBytes;
     CheckEqualBytes('PRF-SHA256 output', DecodeHex(LVec.Values['output']), LOutput);
   finally
     LVec.Free;
@@ -101,9 +110,9 @@ begin
   // the client write (key, salt) must drive TLS 1.2 AEAD record protection
   LKeys := LSched.TrafficKeys(TTlsEpoch.Application, TTlsDirection.ClientWrite);
   LSender := TTls12RecordProtection.Create(LKeys.Key, LKeys.Iv,
-    Provider.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM));
+    Crypto.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM));
   LReceiver := TTls12RecordProtection.Create(LKeys.Key, LKeys.Iv,
-    Provider.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM));
+    Crypto.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM));
   LPlain := DecodeHex('141516171819');
   LRecord := LSender.Protect(TTlsContentType.ApplicationData, LPlain, 0,
     System.Length(LPlain));
@@ -157,10 +166,176 @@ var
 begin
   LSched := NewSchedule;
   LSched.DeriveMasterSecret;
-  LFirst := LSched.ExportKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), True, 32);
-  LSecond := LSched.ExportKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), True, 32);
+  LFirst := LSched.ExportKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), 32);
+  LSecond := LSched.ExportKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), 32);
   CheckEquals(32, System.Length(LFirst), 'requested length honored');
   CheckEqualBytes('exporter is deterministic', LFirst, LSecond);
+end;
+
+procedure TTestTls12KeySchedule.TestExporterRejectsBadArgs;
+var
+  LSched: ITls12KeySchedule;
+
+  function Raises(const ALabel: string; ALength: Int32): Boolean;
+  begin
+    Result := False;
+    try
+      LSched.ExportKeyingMaterial(ALabel, ALength);
+    except
+      on EArgumentTlsLibException do
+        Result := True;
+    end;
+  end;
+
+begin
+  LSched := NewSchedule;
+  LSched.DeriveMasterSecret;
+  CheckTrue(Raises('EXPORTER-test', 0), 'a zero length is rejected');
+  CheckTrue(Raises('EXPORTER-test', -1), 'a negative length is rejected');
+  CheckTrue(Raises(#$00E9 + 'label', 32), 'a non-ASCII label is rejected');
+  // RFC 5705 4: an exporter label must not reuse a TLS PRF label
+  CheckTrue(Raises('master secret', 32), 'a reserved PRF label is rejected');
+  CheckTrue(Raises('key expansion', 32), 'a reserved key-expansion label is rejected');
+  // RFC 5705 imposes no minimum label length, so an empty label is accepted
+  CheckEquals(32, System.Length(LSched.ExportKeyingMaterial('', 32)),
+    'an empty label is accepted for TLS 1.2');
+end;
+
+procedure TTestTls12KeySchedule.TestForgetKeepsMasterForExporterAndReleasesKeyBlock;
+var
+  LSched: ITls12KeySchedule;
+  LExportBefore, LExportAfter: TBytes;
+  LRaised: Boolean;
+begin
+  // after forget the master secret (RFC 5705 exporter) still works, but the key-block traffic
+  // keys are released
+  LSched := NewSchedule;
+  LSched.DeriveMasterSecret;
+  LSched.DeriveKeyBlock;
+  LExportBefore := LSched.ExportKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), 32);
+
+  LSched.ForgetHandshakeSecrets;
+
+  LExportAfter := LSched.ExportKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), 32);
+  CheckEqualBytes('exporter unchanged after forget', LExportBefore, LExportAfter);
+  CheckTrue(LSched.MasterSecret <> nil, 'master secret retained after forget');
+
+  LRaised := False;
+  try
+    LSched.TrafficKeys(TTlsEpoch.Application, TTlsDirection.ClientWrite);
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'the key-block traffic keys are released after forget');
+end;
+
+procedure TTestTls12KeySchedule.TestDeriveMasterTwiceRaises;
+var
+  LSched: ITls12KeySchedule;
+  LRaised: Boolean;
+begin
+  LSched := NewSchedule;
+  LSched.DeriveMasterSecret;
+  LRaised := False;
+  try
+    LSched.DeriveMasterSecret;
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a second master derivation raises a typed error');
+end;
+
+procedure TTestTls12KeySchedule.TestDeriveMasterAfterSetMasterRaises;
+var
+  LSched: ITls12KeySchedule;
+  LRaised: Boolean;
+begin
+  // a pre-master secret is still held, so only the installed master secret stops the derivation
+  LSched := NewSchedule;
+  LSched.SetMasterSecret(TSecretBuffer.From(DecodeHex(PreMasterHex)));
+  LRaised := False;
+  try
+    LSched.DeriveExtendedMasterSecret(DecodeHex(SessionHashHex));
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'deriving after an installed master secret raises a typed error');
+end;
+
+procedure TTestTls12KeySchedule.TestDeriveMasterWithoutPreMasterRaises;
+var
+  LSched: ITls12KeySchedule;
+  LRaised: Boolean;
+begin
+  LSched := TTls12KeySchedule.Create(Crypto, THashAlgorithm.SHA_256, 16,
+    TAeadAlgorithm.AES_128_GCM);
+  LSched.SetRandoms(DecodeHex(ClientRandomHex), DecodeHex(ServerRandomHex));
+  LRaised := False;
+  try
+    LSched.DeriveMasterSecret;
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'deriving with no pre-master secret raises a typed error');
+end;
+
+procedure TTestTls12KeySchedule.TestDeriveKeyBlockAfterForgetRaises;
+var
+  LSched: ITls12KeySchedule;
+  LRaised: Boolean;
+begin
+  LSched := NewSchedule;
+  LSched.DeriveMasterSecret;
+  LSched.DeriveKeyBlock;
+  LSched.ForgetHandshakeSecrets;
+  LRaised := False;
+  try
+    LSched.DeriveKeyBlock;
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a released schedule rejects a further key block derivation');
+end;
+
+procedure TTestTls12KeySchedule.TestSetPreMasterAfterForgetRaises;
+var
+  LSched: ITls12KeySchedule;
+  LRaised: Boolean;
+begin
+  LSched := TTls12KeySchedule.Create(Crypto, THashAlgorithm.SHA_256, 16,
+    TAeadAlgorithm.AES_128_GCM);
+  LSched.ForgetHandshakeSecrets;
+  LRaised := False;
+  try
+    LSched.SetPreMasterSecret(TSecretBuffer.From(DecodeHex(PreMasterHex)));
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a released schedule rejects a pre-master secret');
+end;
+
+procedure TTestTls12KeySchedule.TestSetMasterAfterForgetRaises;
+var
+  LSched: ITls12KeySchedule;
+  LRaised: Boolean;
+begin
+  LSched := TTls12KeySchedule.Create(Crypto, THashAlgorithm.SHA_256, 16,
+    TAeadAlgorithm.AES_128_GCM);
+  LSched.ForgetHandshakeSecrets;
+  LRaised := False;
+  try
+    LSched.SetMasterSecret(TSecretBuffer.From(DecodeHex(PreMasterHex)));
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a released schedule rejects a master secret');
 end;
 
 initialization

@@ -26,10 +26,11 @@ uses
   TestFramework,
 {$ENDIF FPC}
   TlpEndpointIdentity,
-  TlpServerName;
+  TlpServerName,
+  TlsLibTestBase;
 
 type
-  TTestEndpointIdentity = class(TTestCase)
+  TTestEndpointIdentity = class(TTlsLibTestCase)
   private
     function Matches(const AHost: string; const ANames: array of string): Boolean;
     function MatchesIp(const AHost: string; const AIps: array of TBytes): Boolean;
@@ -40,6 +41,16 @@ type
     procedure TestWildcardMatchesOneLabel;
     procedure TestWildcardDoesNotMatchBareDomain;
     procedure TestWildcardDoesNotMatchMultipleLabels;
+    procedure TestWildcardPublicSuffixNotMatched;
+    procedure TestWildcardTwoLabelSuffixMatches;
+    procedure TestPartialWildcardIgnored;
+    procedure TestMultipleWildcardsIgnored;
+    procedure TestReferenceHostWildcardRejected;
+    procedure TestReferenceHostNonLdhRejected;
+    procedure TestReferenceHostUnderscoreAndALabelAccepted;
+    procedure TestNumericLookingHostsAreNotNames;
+    procedure TestLabelLengthAndHyphenLimits;
+    procedure TestDnsPatternPredicatesDirect;
     procedure TestFirstOfSeveralNamesMatches;
     procedure TestIpLiteralDoesNotMatchWildcardDns;
     procedure TestIpLiteralMatchesIpSan;
@@ -69,7 +80,7 @@ begin
   for LI := 0 to High(ANames) do
     LNames[LI] := ANames[LI];
   if not TServerName.TryParse(AHost, LName) then
-    Exit(False);
+    Fail('the host under test does not parse: ' + AHost);
   Result := TEndpointIdentity.Matches(LName, LNames, nil);
 end;
 
@@ -84,7 +95,7 @@ begin
   for LI := 0 to High(AIps) do
     LIps[LI] := AIps[LI];
   if not TServerName.TryParse(AHost, LName) then
-    Exit(False);
+    Fail('the host under test does not parse: ' + AHost);
   Result := TEndpointIdentity.Matches(LName, nil, LIps);
 end;
 
@@ -108,6 +119,127 @@ begin
   CheckTrue(Matches('a.example.com', ['*.example.com']));
 end;
 
+procedure TTestEndpointIdentity.TestWildcardPublicSuffixNotMatched;
+begin
+  // *.com leaves only one label below the wildcard - local policy: it must never match
+  // (public suffixes, out of scope per RFC 9525 7.1)
+  CheckFalse(Matches('example.com', ['*.com']));
+end;
+
+procedure TTestEndpointIdentity.TestWildcardTwoLabelSuffixMatches;
+begin
+  // a wildcard leaving two labels below it is fine (*.co.uk vs host.co.uk)
+  CheckTrue(Matches('host.co.uk', ['*.co.uk']));
+end;
+
+procedure TTestEndpointIdentity.TestPartialWildcardIgnored;
+begin
+  // a wildcard that is not the entire leftmost label is ill-formed and ignored, not a literal
+  CheckFalse(Matches('foo.example.com', ['f*.example.com']));
+  CheckFalse(Matches('foo.example.com', ['*oo.example.com']));
+end;
+
+procedure TTestEndpointIdentity.TestMultipleWildcardsIgnored;
+begin
+  CheckFalse(Matches('a.b.com', ['*.*.com']));
+end;
+
+procedure TTestEndpointIdentity.TestReferenceHostWildcardRejected;
+var
+  LName: TServerName;
+begin
+  // a client verifies a concrete host; a wildcard is not a usable reference host
+  CheckFalse(TServerName.TryParse('*.example.com', LName));
+end;
+
+procedure TTestEndpointIdentity.TestReferenceHostNonLdhRejected;
+var
+  LName: TServerName;
+begin
+  CheckFalse(TServerName.TryParse('bad host.example.com', LName));
+end;
+
+procedure TTestEndpointIdentity.TestReferenceHostUnderscoreAndALabelAccepted;
+var
+  LName: TServerName;
+begin
+  // underscore is tolerated; a punycode A-label is a normal LDH host
+  CheckTrue(TServerName.TryParse('_dmarc.example.com', LName));
+  CheckTrue(TServerName.TryParse('xn--nxasmq6b.example.com', LName));
+end;
+
+procedure TTestEndpointIdentity.TestNumericLookingHostsAreNotNames;
+var
+  LName: TServerName;
+begin
+  // octal-ambiguous and numeric-final-label hosts are neither an IP literal nor a DNS name
+  CheckFalse(TServerName.TryParse('010.0.0.1', LName), 'leading zero');
+  CheckFalse(TServerName.TryParse('1.2.3', LName), 'short dotted decimal');
+  CheckFalse(TServerName.TryParse('0x7f.0.0.1', LName), 'hex octet');
+  CheckFalse(TServerName.TryParse('example.0x7f', LName), 'hex final label');
+  CheckFalse(TServerName.TryParse('2130706433', LName), 'single decimal label');
+  CheckFalse(TServerName.TryParse('example.123.', LName), 'numeric final label before a root dot');
+  CheckFalse(TServerName.TryParse('example.0x', LName), 'bare hex prefix');
+  CheckTrue(TServerName.TryParse('localhost', LName), 'a single alphabetic label');
+  CheckTrue(TServerName.TryParse('0.0.0.0', LName), 'a lone zero octet is a valid IPv4');
+  CheckTrue(LName.IsIp, 'and it is an IP');
+  CheckTrue(TServerName.TryParse('example.face', LName), 'bare hex letters are an ordinary label');
+  CheckTrue(TServerName.TryParse('0x.example.com', LName), 'a numeric-looking non-final label is fine');
+end;
+
+procedure TTestEndpointIdentity.TestLabelLengthAndHyphenLimits;
+begin
+  // RFC 1035: a label is at most 63 octets
+  CheckTrue(TEndpointIdentity.IsValidReferenceHostName(
+    StringOfChar('a', 63) + '.example.com'), 'a 63-octet label is accepted');
+  CheckFalse(TEndpointIdentity.IsValidReferenceHostName(
+    StringOfChar('a', 64) + '.example.com'), 'a 64-octet label is rejected');
+  // a label may not begin or end with a hyphen; an interior hyphen is fine
+  CheckFalse(TEndpointIdentity.IsValidReferenceHostName('-bad.example.com'),
+    'a leading hyphen is rejected');
+  CheckFalse(TEndpointIdentity.IsValidReferenceHostName('bad-.example.com'),
+    'a trailing hyphen is rejected');
+  CheckTrue(TEndpointIdentity.IsValidReferenceHostName('a-b.example.com'),
+    'an interior hyphen is accepted');
+  // RFC 1035 2.3.4: the whole name is at most 255 wire octets (253 in text form follows)
+  CheckTrue(TEndpointIdentity.IsValidReferenceHostName(StringOfChar('a', 63) + '.' +
+    StringOfChar('a', 63) + '.' + StringOfChar('a', 63) + '.' + StringOfChar('a', 61)),
+    'a 253-octet name is accepted');
+  CheckFalse(TEndpointIdentity.IsValidReferenceHostName(StringOfChar('a', 63) + '.' +
+    StringOfChar('a', 63) + '.' + StringOfChar('a', 63) + '.' + StringOfChar('a', 63)),
+    'a name over 253 octets is rejected');
+  // the length limits do not touch the wildcard label or the underscore tolerance
+  CheckTrue(TEndpointIdentity.IsValidPresentedDnsName('*.example.com'),
+    'a wildcard label is still valid');
+  CheckTrue(TEndpointIdentity.IsValidReferenceHostName('_dmarc.example.com'),
+    'underscore tolerance is kept');
+end;
+
+procedure TTestEndpointIdentity.TestDnsPatternPredicatesDirect;
+begin
+  // matchable patterns (exactly what MatchesOneDns accepts)
+  CheckTrue(TEndpointIdentity.IsMatchableDnsPattern('example.com'));
+  CheckTrue(TEndpointIdentity.IsMatchableDnsPattern('*.example.com'));
+  CheckTrue(TEndpointIdentity.IsMatchableDnsPattern('*.co.uk'));
+  // unmatchable / ill-formed
+  CheckFalse(TEndpointIdentity.IsMatchableDnsPattern('*.com'));
+  CheckFalse(TEndpointIdentity.IsMatchableDnsPattern('*'));
+  CheckFalse(TEndpointIdentity.IsMatchableDnsPattern('*.'));
+  CheckFalse(TEndpointIdentity.IsMatchableDnsPattern('f*.example.com'));
+  CheckFalse(TEndpointIdentity.IsMatchableDnsPattern('a.*.com'));
+  CheckFalse(TEndpointIdentity.IsMatchableDnsPattern('a..com')); // empty label
+  CheckFalse(TEndpointIdentity.IsMatchableDnsPattern('example.com.')); // trailing dot
+  CheckFalse(TEndpointIdentity.IsMatchableDnsPattern('bad host.com')); // non-LDH
+  CheckFalse(TEndpointIdentity.IsMatchableDnsPattern(''));
+  // presented-name well-formedness (allows a whole-leftmost-label wildcard)
+  CheckTrue(TEndpointIdentity.IsValidPresentedDnsName('*.example.com'));
+  CheckFalse(TEndpointIdentity.IsValidPresentedDnsName('a b.com'));
+  // reference-host validity: never a wildcard
+  CheckTrue(TEndpointIdentity.IsValidReferenceHostName('localhost'));
+  CheckTrue(TEndpointIdentity.IsValidReferenceHostName('_dmarc.example.com'));
+  CheckFalse(TEndpointIdentity.IsValidReferenceHostName('*.example.com'));
+end;
+
 procedure TTestEndpointIdentity.TestWildcardDoesNotMatchBareDomain;
 begin
   CheckFalse(Matches('example.com', ['*.example.com']));
@@ -125,7 +257,7 @@ end;
 
 procedure TTestEndpointIdentity.TestIpLiteralDoesNotMatchWildcardDns;
 begin
-  // RFC 6125: an IP-literal host must never match a dNSName/wildcard
+  // RFC 9525: an IP-literal host must never match a dNSName/wildcard
   CheckFalse(Matches('127.0.0.1', ['*.0.0.1']));
   CheckFalse(Matches('127.0.0.1', ['127.0.0.1']));
 end;

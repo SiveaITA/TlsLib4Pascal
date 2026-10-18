@@ -20,7 +20,10 @@ uses
   TlpTlsAlert,
   TlpTlsVersion,
   TlpCryptoDomainTypes,
+  TlpTlsLibExceptions,
   TlpIKeySchedule,
+  TlpTrustPolicy,
+  TlpTlsConnectionInfo,
   TlpITlsEngine;
 
 type
@@ -29,9 +32,10 @@ type
 
   /// <summary>The kind of a handshake effect (an instruction for the driver).</summary>
   THandshakeEffectKind = (
-    SendHandshake,        // frame and send a handshake message
+    SendHandshake,
     SendChangeCipherSpec, // emit the middlebox-compatibility dummy CCS
     InstallKeys,          // install an epoch's record protection on one side
+    NegotiatedVersion,    // surface the negotiated protocol version to the record layer
     SelectAlpn,           // surface the negotiated ALPN protocol
     PeerOcspStaple,       // surface the stapled OCSP response the peer delivered
     SetRecordSizeLimit,   // apply the negotiated record_size_limit to the record layer
@@ -39,18 +43,29 @@ type
     SetEarlyDataLimit,    // cap outbound 0-RTT at the ticket's max_early_data
     RevertWriteToPlaintext, // drop the early-data write epoch back to plaintext (0-RTT + HRR)
     SetEarlyReadEpoch,    // open/close the accepted-0-RTT early-data read window (server)
-    RaiseEvent,           // raise an engine event
+    RaiseEvent,
     AwaitCertificateVerdict, // park the handshake for an out-of-band peer-certificate verdict
-    PeerCertificateChain, // surface the validated peer chain for connection info
+    PeerCertificateChain, // surface the presented peer chain and validated path for connection info
     RequestedCertificateAuthorities, // surface a CertificateRequest's certificate_authorities
-    ConnectionParams,     // surface the negotiated suite/group/resumed for connection info
-    HandshakeEstablished, // the handshake completed
+    PskIdentity,          // surface the identity of the pre-shared key that authenticated the connection
+    ConnectionParams,    // surface the negotiated suite/group/resumed for connection info
+    HandshakeEstablished,
     EchAccepted,          // ECH was accepted: record the status for connection info
     EchGreased,           // ECH was greased (client): record the status for connection info
     EchBackend,           // ECH split-mode backend (server): record the status for connection info
     EchServerRejected,    // ECH rejected at the server: record the status (the handshake continues)
     EchRejected,          // ECH was rejected (client): abort with ech_required, surface retry_configs
+    SendWarningAlert,     // emit a warning-level alert and continue (e.g. no_renegotiation)
     Fail);                // abort with a fatal alert
+
+  /// <summary>The facts a handshake machine reports at completion beside the suite, group and
+  /// resumption flag; the engine copies them onto the connection info.</summary>
+  TNegotiationFacts = record
+    PeerSignatureScheme: UInt16;
+    HelloRetryRequest: Boolean;
+    EarlyDataReason: TEarlyDataReason;
+    TicketAgeSkew: Int32;
+  end;
 
   /// <summary>
   /// A pure instruction the state machine emits for the driver to carry out. The
@@ -59,21 +74,35 @@ type
   /// </summary>
   THandshakeEffect = record
     Kind: THandshakeEffectKind;
-    Bytes: TBytes;               // SendHandshake
+    Bytes: TBytes;               // SendHandshake / SelectAlpn (the protocol name)
     Keys: ITrafficKeys;          // InstallKeys
     Side: TRecordSide;           // InstallKeys
     Aead: TAeadAlgorithm;        // InstallKeys (the negotiated suite's AEAD)
-    Version: TTlsVersion;        // InstallKeys (which record protection to build)
-    Text: string;                // SelectAlpn
-    Outbound: Int32;             // SetRecordSizeLimit (max outbound plaintext)
-    Inbound: Int32;              // SetRecordSizeLimit (max inbound plaintext)
+    Version: TTlsVersion;        // InstallKeys (which record protection to build) / NegotiatedVersion
+    Epoch: TTlsEpoch;            // InstallKeys (which epoch the keys belong to)
+    Outbound: Int32;             // SetRecordSizeLimit (raw outbound record_size_limit)
+    Inbound: Int32;              // SetRecordSizeLimit (raw inbound record_size_limit)
     Event: TTlsEventKind;        // RaiseEvent
-    Chain: TArray<TBytes>;       // AwaitCertificateVerdict / PeerCertificateChain (peer chain, leaf first)
+    Chain: TArray<TBytes>;       // AwaitCertificateVerdict / PeerCertificateChain (peer chain as presented, leaf first)
+    ValidatedPath: TArray<TBytes>; // AwaitCertificateVerdict / PeerCertificateChain (the pipeline-validated path; issuer at [1]; empty when none was validated)
     CipherSuite: UInt16;         // ConnectionParams (the negotiated cipher suite code)
     NamedGroup: UInt16;          // ConnectionParams (0 when none / non-(EC)DHE)
-    Resumed: Boolean;            // ConnectionParams (resumed); EchRejected (was a retry)
+    Resumed: Boolean;            // ConnectionParams (resumed)
+    ExtendedMasterSecret: Boolean; // ConnectionParams (RFC 7627 in use; always True on TLS 1.3)
     ServerName: string;          // ConnectionParams (the SNI in play; empty when none)
-    Alert: TTlsAlertDescription; // Fail
+    Alert: TTlsAlertDescription; // Fail / SendWarningAlert
+    Reason: string;              // Fail (why the handshake aborted; becomes LastError's message)
+    Staple: TBytes;              // AwaitCertificateVerdict (the handshake OCSP staple; empty when none)
+    HostName: string;            // AwaitCertificateVerdict (the host to authenticate against)
+    RevocationPosture: TRevocationPosture; // AwaitCertificateVerdict (the configured posture)
+    MaxBytes: Int32;             // SkipEarlyData / SetEarlyDataLimit / SetEarlyReadEpoch (a byte budget)
+    Active: Boolean;             // SetEarlyReadEpoch (the early-data read window is open)
+    IsRetry: Boolean;            // EchRejected (this handshake was itself a retry)
+    RetryConfigs: TBytes;        // EchRejected (the server's retry_configs; empty when none)
+    Authorities: TArray<TBytes>; // RequestedCertificateAuthorities (the named DistinguishedNames)
+    Schemes: TArray<UInt16>;     // RequestedCertificateAuthorities (the CertificateRequest signature_algorithms)
+    Facts: TNegotiationFacts;    // ConnectionParams (signature scheme, HelloRetryRequest, early-data reason, ticket age skew)
+    Identity: TBytes;            // PskIdentity (the pre-shared key's identity)
   end;
 
   /// <summary>Builds the handshake effect values.</summary>
@@ -82,43 +111,62 @@ type
     class function SendHandshake(const ABytes: TBytes): THandshakeEffect; static;
     class function SendChangeCipherSpec: THandshakeEffect; static;
     class function InstallKeys(const AKeys: ITrafficKeys; ASide: TRecordSide;
-      AAead: TAeadAlgorithm; const AVersion: TTlsVersion): THandshakeEffect; static;
-    class function SelectAlpn(const AProtocol: string): THandshakeEffect; static;
+      AAead: TAeadAlgorithm; const AVersion: TTlsVersion;
+      AEpoch: TTlsEpoch): THandshakeEffect; static;
+    class function NegotiatedVersion(const AVersion: TTlsVersion): THandshakeEffect; static;
+    class function SelectAlpn(const AProtocol: TBytes): THandshakeEffect; static;
     class function PeerOcspStaple(const AStaple: TBytes): THandshakeEffect; static;
     class function SetRecordSizeLimit(AOutbound, AInbound: Int32): THandshakeEffect; static;
     class function SkipEarlyData(AMaxBytes: Int32): THandshakeEffect; static;
     class function SetEarlyDataLimit(AMaxBytes: Int32): THandshakeEffect; static;
     /// <summary>Reverts the write epoch to plaintext after a HelloRetryRequest rejects offered
     /// 0-RTT: the early-data keys are abandoned and the second ClientHello (and the rest of the
-    /// flight) is sent in the clear (RFC 8446 4.2.10).</summary>
+    /// flight) is sent in the clear (RFC 9846 4.3.10).</summary>
     class function RevertWriteToPlaintext: THandshakeEffect; static;
     /// <summary>Opens (AActive) or closes the accepted-0-RTT early-data read window on the record
     /// layer: while open, an application_data record legitimately precedes the handshake
-    /// completion (RFC 8446 4.2.10). A server emits it on accepting early data and at
-    /// EndOfEarlyData.</summary>
-    class function SetEarlyReadEpoch(AActive: Boolean): THandshakeEffect; static;
+    /// completion (RFC 9846 4.3.10). A server emits it on accepting early data, with the
+    /// ticket's max_early_data_size as AMaxBytes (RFC 9846 4.7.1), and at EndOfEarlyData.</summary>
+    class function SetEarlyReadEpoch(AActive: Boolean;
+      AMaxBytes: Int32): THandshakeEffect; static;
     class function RaiseEvent(AEvent: TTlsEventKind): THandshakeEffect; static;
     /// <summary>Parks the handshake for an out-of-band peer-certificate verdict: the driver
-    /// surfaces AChain, AHostName and the handshake OCSP staple (empty when none) to the host,
-    /// which resumes with SetCertificateVerdict. Emitted only after the built-in trust pipeline
-    /// has already accepted the chain. The staple rides the record's Bytes slot.</summary>
-    class function AwaitCertificateVerdict(const AChain: TArray<TBytes>;
-      const AHostName: string; const AStaple: TBytes): THandshakeEffect; static;
-    /// <summary>Surfaces the validated peer certificate chain (leaf first, DER) for
-    /// read-only connection info; carries no verdict and never blocks the handshake.</summary>
+    /// surfaces AChain (as presented), AValidatedPath (the pipeline-validated path, leaf first with
+    /// the issuer at index 1), AHostName, the handshake OCSP staple (empty when none) and the
+    /// configured APosture to the host, which resumes with SetCertificateVerdict. Emitted only
+    /// after the built-in trust pipeline has accepted the chain and the peer has proved it holds
+    /// the leaf key.</summary>
+    class function AwaitCertificateVerdict(const AChain, AValidatedPath: TArray<TBytes>;
+      const AHostName: string; const AStaple: TBytes;
+      APosture: TRevocationPosture): THandshakeEffect; static;
+    /// <summary>Surfaces the peer certificate chain as presented (leaf first, DER) and the path the
+    /// built-in pipeline validated for read-only connection info; carries no verdict and never blocks
+    /// the handshake. AValidatedPath is empty on a resumption that re-ran no verification.</summary>
     class function PeerCertificateChain(
-      const AChain: TArray<TBytes>): THandshakeEffect; static;
+      const AChain, AValidatedPath: TArray<TBytes>): THandshakeEffect; static;
     /// <summary>Surfaces the DER-encoded DistinguishedName certificate_authorities a peer
-    /// named in its CertificateRequest (RFC 8446 4.2.4 / RFC 5246 7.4.4), for read-only
-    /// connection info; never blocks the handshake.</summary>
+    /// named in its CertificateRequest (RFC 9846 4.3.4 / RFC 5246 7.4.4), for read-only
+    /// connection info, with the signature_algorithms it listed (ASchemes); never blocks the
+    /// handshake.</summary>
     class function RequestedCertificateAuthorities(
-      const AAuthorities: TArray<TBytes>): THandshakeEffect; static;
+      const AAuthorities: TArray<TBytes>; const ASchemes: TArray<UInt16>): THandshakeEffect; static;
+    /// <summary>Surfaces the identity of the pre-shared key that authenticated the connection, for
+    /// read-only connection info.</summary>
+    class function PskIdentity(const AIdentity: TBytes): THandshakeEffect; static;
     /// <summary>Surfaces the negotiated cipher suite, named group (0 when none / non-(EC)DHE),
-    /// and whether the handshake was resumed/abbreviated, for read-only connection info.</summary>
+    /// whether the handshake was resumed/abbreviated, and whether the session used Extended Master
+    /// Secret (RFC 7627; always true on TLS 1.3), plus AFacts, for read-only connection info.</summary>
     class function ConnectionParams(ACipherSuite, ANamedGroup: UInt16;
-      AResumed: Boolean; const AServerName: string): THandshakeEffect; static;
+      AResumed, AExtendedMasterSecret: Boolean; const AServerName: string;
+      const AFacts: TNegotiationFacts): THandshakeEffect; static;
     class function HandshakeEstablished: THandshakeEffect; static;
-    class function Fail(AAlert: TTlsAlertDescription): THandshakeEffect; static;
+    /// <summary>Emits a warning-level alert without tearing down the connection: the driver
+    /// delivers it through the sink so the engine writes it under the current epoch and stays
+    /// live (e.g. no_renegotiation, RFC 5246 7.4.1.1 / 7.2.2).</summary>
+    class function SendWarningAlert(AAlert: TTlsAlertDescription): THandshakeEffect; static;
+    /// <summary>Aborts with AAlert; AReason is the error the application sees.</summary>
+    class function Fail(AAlert: TTlsAlertDescription;
+      const AReason: string): THandshakeEffect; static;
     /// <summary>ECH was accepted (RFC 9849): record the accepted status so connection info
     /// reports it. Emitted by the 1.3 machines at completion when ECH was in play.</summary>
     class function EchAccepted: THandshakeEffect; static;
@@ -137,6 +185,13 @@ type
     /// server's retry_configs (empty if none) and whether this handshake was itself a retry.</summary>
     class function EchRejected(const ARetryConfigs: TBytes;
       AIsRetryAttempt: Boolean): THandshakeEffect; static;
+    /// <summary>Maps an in-band protocol exception to a Fail effect (EFatalAlert - which covers
+    /// EDecodeError - to its alert; EPeerInput to illegal_parameter) carrying the exception's
+    /// message (our own resourcestrings only); returns False for any other exception, which the
+    /// caller re-raises. The single home for the machines' and the version dispatcher's
+    /// exception-to-Fail mapping.</summary>
+    class function TryFromException(const AError: Exception;
+      out AEffect: THandshakeEffect): Boolean; static;
   end;
 
 implementation
@@ -159,7 +214,7 @@ end;
 
 class function THandshakeEffects.InstallKeys(const AKeys: ITrafficKeys;
   ASide: TRecordSide; AAead: TAeadAlgorithm;
-  const AVersion: TTlsVersion): THandshakeEffect;
+  const AVersion: TTlsVersion; AEpoch: TTlsEpoch): THandshakeEffect;
 begin
   Result := Default(THandshakeEffect);
   Result.Kind := THandshakeEffectKind.InstallKeys;
@@ -167,14 +222,23 @@ begin
   Result.Side := ASide;
   Result.Aead := AAead;
   Result.Version := AVersion;
+  Result.Epoch := AEpoch;
+end;
+
+class function THandshakeEffects.NegotiatedVersion(
+  const AVersion: TTlsVersion): THandshakeEffect;
+begin
+  Result := Default(THandshakeEffect);
+  Result.Kind := THandshakeEffectKind.NegotiatedVersion;
+  Result.Version := AVersion;
 end;
 
 class function THandshakeEffects.SelectAlpn(
-  const AProtocol: string): THandshakeEffect;
+  const AProtocol: TBytes): THandshakeEffect;
 begin
   Result := Default(THandshakeEffect);
   Result.Kind := THandshakeEffectKind.SelectAlpn;
-  Result.Text := AProtocol;
+  Result.Bytes := AProtocol;
 end;
 
 class function THandshakeEffects.PeerOcspStaple(
@@ -198,14 +262,14 @@ class function THandshakeEffects.SkipEarlyData(AMaxBytes: Int32): THandshakeEffe
 begin
   Result := Default(THandshakeEffect);
   Result.Kind := THandshakeEffectKind.SkipEarlyData;
-  Result.Inbound := AMaxBytes; // the byte budget for undecryptable early records
+  Result.MaxBytes := AMaxBytes; // the byte budget for undecryptable early records
 end;
 
 class function THandshakeEffects.SetEarlyDataLimit(AMaxBytes: Int32): THandshakeEffect;
 begin
   Result := Default(THandshakeEffect);
   Result.Kind := THandshakeEffectKind.SetEarlyDataLimit;
-  Result.Outbound := AMaxBytes; // the outbound 0-RTT byte budget from the ticket
+  Result.MaxBytes := AMaxBytes; // the outbound 0-RTT byte budget from the ticket
 end;
 
 class function THandshakeEffects.RevertWriteToPlaintext: THandshakeEffect;
@@ -214,11 +278,13 @@ begin
   Result.Kind := THandshakeEffectKind.RevertWriteToPlaintext;
 end;
 
-class function THandshakeEffects.SetEarlyReadEpoch(AActive: Boolean): THandshakeEffect;
+class function THandshakeEffects.SetEarlyReadEpoch(AActive: Boolean;
+  AMaxBytes: Int32): THandshakeEffect;
 begin
   Result := Default(THandshakeEffect);
   Result.Kind := THandshakeEffectKind.SetEarlyReadEpoch;
-  Result.Resumed := AActive; // the early-data read window is open (True) or closed (False)
+  Result.Active := AActive; // the early-data read window is open (True) or closed (False)
+  Result.MaxBytes := AMaxBytes; // the accepted early-data byte budget from the ticket
 end;
 
 class function THandshakeEffects.RaiseEvent(AEvent: TTlsEventKind): THandshakeEffect;
@@ -229,40 +295,54 @@ begin
 end;
 
 class function THandshakeEffects.AwaitCertificateVerdict(
-  const AChain: TArray<TBytes>; const AHostName: string;
-  const AStaple: TBytes): THandshakeEffect;
+  const AChain, AValidatedPath: TArray<TBytes>; const AHostName: string;
+  const AStaple: TBytes; APosture: TRevocationPosture): THandshakeEffect;
 begin
   Result := Default(THandshakeEffect);
   Result.Kind := THandshakeEffectKind.AwaitCertificateVerdict;
   Result.Chain := AChain;
-  Result.Text := AHostName;
-  Result.Bytes := AStaple;
+  Result.ValidatedPath := AValidatedPath;
+  Result.HostName := AHostName;
+  Result.Staple := AStaple;
+  Result.RevocationPosture := APosture;
 end;
 
 class function THandshakeEffects.PeerCertificateChain(
-  const AChain: TArray<TBytes>): THandshakeEffect;
+  const AChain, AValidatedPath: TArray<TBytes>): THandshakeEffect;
 begin
   Result := Default(THandshakeEffect);
   Result.Kind := THandshakeEffectKind.PeerCertificateChain;
   Result.Chain := AChain;
+  Result.ValidatedPath := AValidatedPath;
 end;
 
 class function THandshakeEffects.RequestedCertificateAuthorities(
-  const AAuthorities: TArray<TBytes>): THandshakeEffect;
+  const AAuthorities: TArray<TBytes>; const ASchemes: TArray<UInt16>): THandshakeEffect;
 begin
   Result := Default(THandshakeEffect);
   Result.Kind := THandshakeEffectKind.RequestedCertificateAuthorities;
-  Result.Chain := AAuthorities;
+  Result.Authorities := AAuthorities;
+  Result.Schemes := ASchemes;
+end;
+
+class function THandshakeEffects.PskIdentity(const AIdentity: TBytes): THandshakeEffect;
+begin
+  Result := Default(THandshakeEffect);
+  Result.Kind := THandshakeEffectKind.PskIdentity;
+  Result.Identity := AIdentity;
 end;
 
 class function THandshakeEffects.ConnectionParams(ACipherSuite, ANamedGroup: UInt16;
-  AResumed: Boolean; const AServerName: string): THandshakeEffect;
+  AResumed, AExtendedMasterSecret: Boolean; const AServerName: string;
+  const AFacts: TNegotiationFacts): THandshakeEffect;
 begin
   Result := Default(THandshakeEffect);
   Result.Kind := THandshakeEffectKind.ConnectionParams;
+  Result.Facts := AFacts;
   Result.CipherSuite := ACipherSuite;
   Result.NamedGroup := ANamedGroup;
   Result.Resumed := AResumed;
+  Result.ExtendedMasterSecret := AExtendedMasterSecret;
   Result.ServerName := AServerName;
 end;
 
@@ -272,12 +352,21 @@ begin
   Result.Kind := THandshakeEffectKind.HandshakeEstablished;
 end;
 
-class function THandshakeEffects.Fail(
+class function THandshakeEffects.SendWarningAlert(
   AAlert: TTlsAlertDescription): THandshakeEffect;
+begin
+  Result := Default(THandshakeEffect);
+  Result.Kind := THandshakeEffectKind.SendWarningAlert;
+  Result.Alert := AAlert;
+end;
+
+class function THandshakeEffects.Fail(AAlert: TTlsAlertDescription;
+  const AReason: string): THandshakeEffect;
 begin
   Result := Default(THandshakeEffect);
   Result.Kind := THandshakeEffectKind.Fail;
   Result.Alert := AAlert;
+  Result.Reason := AReason;
 end;
 
 class function THandshakeEffects.EchAccepted: THandshakeEffect;
@@ -309,8 +398,25 @@ class function THandshakeEffects.EchRejected(const ARetryConfigs: TBytes;
 begin
   Result := Default(THandshakeEffect);
   Result.Kind := THandshakeEffectKind.EchRejected;
-  Result.Bytes := ARetryConfigs;
-  Result.Resumed := AIsRetryAttempt;
+  Result.RetryConfigs := ARetryConfigs;
+  Result.IsRetry := AIsRetryAttempt;
+end;
+
+class function THandshakeEffects.TryFromException(const AError: Exception;
+  out AEffect: THandshakeEffect): Boolean;
+begin
+  Result := True;
+  // EPeerInput before EFatalAlert to preserve the original per-site order; EDecodeError is an
+  // EFatalAlert subclass, so it carries its own decode_error through the second branch
+  if AError is EPeerInputTlsLibException then
+    AEffect := Fail(TTlsAlertDescription.IllegalParameter, AError.Message)
+  else if AError is EFatalAlertTlsLibException then
+    AEffect := Fail(EFatalAlertTlsLibException(AError).AlertDescription, AError.Message)
+  else
+  begin
+    AEffect := Default(THandshakeEffect);
+    Result := False;
+  end;
 end;
 
 end.

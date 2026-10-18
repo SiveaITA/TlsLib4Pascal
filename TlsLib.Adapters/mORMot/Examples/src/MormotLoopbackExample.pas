@@ -41,15 +41,23 @@ uses
   mormot.core.unicode,
   mormot.net.sock,
   TlpDataEncoding,
+  TlpTlsAlert,
+  TlpTrustPolicy,
+  TlpTlsLibExceptions,
   TlsLibMormotTls;
 
 const
   PORT = '28443';
+  MUTUAL_PORT = '28453';
   HOST = '127.0.0.1';
   PINGHEX = '70696e672066726f6d20746865206d6f724d6f7420636c69656e74';
 
 var
-  GLeafFile, GKeyFile, GRootFile: RawUtf8;
+  GRootFile: RawUtf8;
+  GLeafPfx: RawByteString;
+  // the dual-EKU chain the mutual-TLS check serves and authenticates with
+  GMutualRootFile: RawUtf8;
+  GMutualPfx: RawByteString;
   GReady: TEvent;
   GServerError: string;
   GVector: string;
@@ -63,6 +71,8 @@ type
   public
     class function Find: string; static;
     class function FieldHex(const AName: string): string; static;
+    // a field of another vector file in the same folder as the main one
+    class function FieldHexFrom(const AFile, AName: string): string; static;
     class procedure WriteDer(const AName, AHex: string; out APath: RawUtf8); static;
   end;
 
@@ -70,6 +80,181 @@ type
   protected
     procedure Execute; override;
   end;
+
+  // a server resolver that accepts everything; only its registration matters here
+  TAcceptingServerResolver = class sealed(TObject)
+  public
+    function Resolve(const ACtx: TCertificateVerdictContext;
+      out ARejectAlert: TTlsAlertDescription): Boolean;
+  end;
+
+  // a server that requires a client certificate and serves two connections in turn, counting the
+  // ones it could echo
+  TMutualServerThread = class(TThread)
+  strict private
+  var
+    FServed, FAttempts: Integer;
+    FRejection: string;
+  protected
+    procedure Execute; override;
+  public
+    property Served: Integer read FServed;
+    // how the server reports turning the second client away
+    property Rejection: string read FRejection;
+    // connections that reached the server, so a missing one is not read as a rejection
+    property Attempts: Integer read FAttempts;
+  end;
+
+  TMutualTlsCheck = class sealed(TObject)
+  strict private
+    class function Echo(AWithIdentity: Boolean; out AError: string;
+      out AReceive: TNetResult): Boolean; static;
+  public
+    // a client that presents the PKCS#12 identity authenticates to a server requiring a
+    // certificate, and one that presents none is turned away
+    class procedure Run; static;
+  end;
+
+  // method targets for the peer-verification hooks the adapter must refuse (never invoked)
+  TUnusedHooks = class sealed(TObject)
+  public
+    procedure PeerValidate(Socket: TNetSocket; Context: PNetTlsContext; TLS: pointer);
+    function EachPeerVerify(Socket: TNetSocket; Context: PNetTlsContext; wasok: boolean;
+      TLS, Peer: pointer): boolean;
+    procedure AfterPeerValidate(Socket: TNetSocket; Context: PNetTlsContext; TLS, Peer: pointer);
+    function AcceptServerName(Context: PNetTlsContext; TLS: pointer;
+      ServerName: PUtf8Char): pointer;
+  end;
+
+  // the adapter fails loudly on a TNetTlsContext input it cannot honour, instead of silently
+  // dropping a host's own peer-verification rules
+  TRefusalChecks = class sealed(TObject)
+  strict private
+    class function RefusesNaming(var ACtx: TNetTlsContext; AServer: Boolean;
+      const AField: string): Boolean; static;
+  public
+    class function AllRefused: Boolean; static;
+  end;
+
+function TAcceptingServerResolver.Resolve(const ACtx: TCertificateVerdictContext;
+  out ARejectAlert: TTlsAlertDescription): Boolean;
+begin
+  ARejectAlert := TTlsAlertDescription.BadCertificate;
+  Result := True;
+end;
+
+procedure TUnusedHooks.PeerValidate(Socket: TNetSocket; Context: PNetTlsContext; TLS: pointer);
+begin
+end;
+
+function TUnusedHooks.EachPeerVerify(Socket: TNetSocket; Context: PNetTlsContext;
+  wasok: boolean; TLS, Peer: pointer): boolean;
+begin
+  Result := True;
+end;
+
+procedure TUnusedHooks.AfterPeerValidate(Socket: TNetSocket; Context: PNetTlsContext;
+  TLS, Peer: pointer);
+begin
+end;
+
+function TUnusedHooks.AcceptServerName(Context: PNetTlsContext; TLS: pointer;
+  ServerName: PUtf8Char): pointer;
+begin
+  Result := nil;
+end;
+
+class function TRefusalChecks.RefusesNaming(var ACtx: TNetTlsContext; AServer: Boolean;
+  const AField: string): Boolean;
+begin
+  // the refusal must name the offending field: a bare "some error" could be an unrelated failure
+  // (a blank client context is refused for lacking trust, a nil socket fails a send)
+  Result := False;
+  try
+    if AServer then
+      NewTlsLib4PascalTls.AfterBind(nil, ACtx, 'localhost')
+    else
+      NewTlsLib4PascalTls.AfterConnection(nil, ACtx, 'localhost');
+  except
+    on E: Exception do
+      Result := Pos(AField, E.Message) > 0;
+  end;
+end;
+
+class function TRefusalChecks.AllRefused: Boolean;
+var
+  LHooks: TUnusedHooks;
+  LCtx: TNetTlsContext;
+  LDummy: Integer;
+begin
+  Result := False;
+  LHooks := TUnusedHooks.Create;
+  try
+    InitNetTlsContext(LCtx);
+    LCtx.OnPeerValidate := LHooks.PeerValidate;
+    if not RefusesNaming(LCtx, False, 'OnPeerValidate') then
+      Exit;
+    InitNetTlsContext(LCtx);
+    LCtx.OnEachPeerVerify := LHooks.EachPeerVerify;
+    if not RefusesNaming(LCtx, False, 'OnEachPeerVerify') then
+      Exit;
+    InitNetTlsContext(LCtx);
+    LCtx.OnAfterPeerValidate := LHooks.AfterPeerValidate;
+    if not RefusesNaming(LCtx, False, 'OnAfterPeerValidate') then
+      Exit;
+    InitNetTlsContext(LCtx);
+    LCtx.HostNamesCsv := 'localhost';
+    if not RefusesNaming(LCtx, False, 'HostNamesCsv') then
+      Exit;
+    InitNetTlsContext(LCtx);
+    LCtx.CertificateBin := 'x';
+    LCtx.CertificateFile := 'cert.pem';
+    if not RefusesNaming(LCtx, False, 'CertificateBin') then
+      Exit;
+    InitNetTlsContext(LCtx);
+    LCtx.CertificateRaw := @LDummy;
+    if not RefusesNaming(LCtx, False, 'CertificateRaw') then
+      Exit;
+    InitNetTlsContext(LCtx);
+    LCtx.PrivateKeyRaw := @LDummy;
+    if not RefusesNaming(LCtx, False, 'PrivateKeyRaw') then
+      Exit;
+    // a cipher-string expression is not a suite name: refused, never skipped
+    InitNetTlsContext(LCtx);
+    LCtx.CipherList := 'HIGH';
+    if not RefusesNaming(LCtx, False, 'CipherList') then
+      Exit;
+    // a server fails at bind time, before it accepts anything, and is pointed at a built config
+    InitNetTlsContext(LCtx);
+    LCtx.OnEachPeerVerify := LHooks.EachPeerVerify;
+    if not RefusesNaming(LCtx, True, 'OnEachPeerVerify') then
+      Exit;
+    InitNetTlsContext(LCtx);
+    LCtx.OnEachPeerVerify := LHooks.EachPeerVerify;
+    if not RefusesNaming(LCtx, True, 'SetTlsLibMormotServerConfig') then
+      Exit;
+    InitNetTlsContext(LCtx);
+    LCtx.OnAcceptServerName := LHooks.AcceptServerName;
+    if not RefusesNaming(LCtx, True, 'OnAcceptServerName') then
+      Exit;
+    // controls: a blank client context fails for lack of trust and names none of the refused
+    // fields, and a blank server context binds
+    InitNetTlsContext(LCtx);
+    if RefusesNaming(LCtx, False, 'OnPeerValidate') or
+      RefusesNaming(LCtx, False, 'OnEachPeerVerify') or
+      RefusesNaming(LCtx, False, 'HostNamesCsv') then
+      Exit;
+    InitNetTlsContext(LCtx);
+    try
+      NewTlsLib4PascalTls.AfterBind(nil, LCtx, 'localhost');
+    except
+      Exit;
+    end;
+    Result := True;
+  finally
+    LHooks.Free;
+  end;
+end;
 
 class function TVectorLocator.SearchFrom(const AStart: string): string;
 const
@@ -102,6 +287,11 @@ begin
 end;
 
 class function TVectorLocator.FieldHex(const AName: string): string;
+begin
+  Result := FieldHexFrom(ExtractFileName(GVector), AName);
+end;
+
+class function TVectorLocator.FieldHexFrom(const AFile, AName: string): string;
 var
   LLines: TStringList;
   LI: Integer;
@@ -111,7 +301,7 @@ begin
   LPrefix := AName + '=';
   LLines := TStringList.Create;
   try
-    LLines.LoadFromFile(GVector);
+    LLines.LoadFromFile(ExtractFilePath(GVector) + AFile);
     for LI := 0 to LLines.Count - 1 do
       if Pos(LPrefix, LLines[LI]) = 1 then
         Exit(Copy(LLines[LI], System.Length(LPrefix) + 1, MaxInt));
@@ -147,16 +337,23 @@ var
   LLastErr, LCipher: RawUtf8;
   LBuf: TBytes;
   LLen: Integer;
+  LDoBind, LAsync: Boolean;
+  LTimeoutMs, LRetry: Integer;
 begin
+  LDoBind := True;
+  LAsync := False;
+  LTimeoutMs := 3000;
+  LRetry := 0;
   try
     FillCharFast(LCtx, SizeOf(LCtx), 0);
-    LCtx.CertificateFile := GLeafFile;
-    LCtx.PrivateKeyFile := GKeyFile;
-    if NewSocket(HOST, PORT, nlTcp, {dobind=}True, 3000, 3000, 3000, 0,
+    // the server identity as an in-memory PKCS#12: no key file, so the bytes are read as one
+    LCtx.CertificateBin := GLeafPfx;
+    LCtx.PrivatePassword := 'tlslib';
+    if NewSocket(HOST, PORT, nlTcp, LDoBind, LTimeoutMs, LTimeoutMs, LTimeoutMs, LRetry,
       LListener) <> nrOK then
       raise Exception.Create('server bind failed');
     GReady.SetEvent;
-    if LListener.Accept(LClient, LAddr, {async=}False) <> nrOK then
+    if LListener.Accept(LClient, LAddr, LAsync) <> nrOK then
       raise Exception.Create('accept failed');
     LTls := NewTlsLib4PascalTls;
     LTls.AfterAccept(LClient, LCtx, @LLastErr, @LCipher);
@@ -173,25 +370,186 @@ begin
   end;
 end;
 
+procedure TMutualServerThread.Execute;
+var
+  LListener, LClient: TNetSocket;
+  LAddr: TNetAddr;
+  LCtx: TNetTlsContext;
+  LTls: INetTls;
+  LLastErr, LCipher: RawUtf8;
+  LBuf: TBytes;
+  LLen, LI: Integer;
+  LDoBind, LAsync: Boolean;
+  LTimeoutMs, LRetry: Integer;
+begin
+  LDoBind := True;
+  LAsync := False;
+  LTimeoutMs := 3000;
+  LRetry := 0;
+  try
+    FillCharFast(LCtx, SizeOf(LCtx), 0);
+    LCtx.CertificateBin := GMutualPfx;
+    LCtx.PrivatePassword := 'tlslib';
+    // the test root vouches for clients, and a certificate is required
+    LCtx.CACertificatesFile := GMutualRootFile;
+    LCtx.ClientCertificateAuthentication := True;
+    if NewSocket(HOST, MUTUAL_PORT, nlTcp, LDoBind, LTimeoutMs, LTimeoutMs, LTimeoutMs, LRetry,
+      LListener) <> nrOK then
+      raise Exception.Create('mutual server bind failed');
+    GReady.SetEvent;
+    for LI := 0 to 1 do
+    begin
+      // bounded, so a client that never arrives ends the thread instead of blocking its free
+      if LListener.WaitFor(5000, [neRead]) <> [neRead] then
+        Break;
+      if LListener.Accept(LClient, LAddr, LAsync) <> nrOK then
+        Break;
+      Inc(FAttempts);
+      LTls := NewTlsLib4PascalTls;
+      try
+        LTls.AfterAccept(LClient, LCtx, @LLastErr, @LCipher);
+        SetLength(LBuf, 4096);
+        LLen := System.Length(LBuf);
+        if LTls.Receive(@LBuf[0], LLen) = nrOK then
+        begin
+          LTls.Send(@LBuf[0], LLen);
+          Inc(FServed);
+        end;
+      except
+        // a client turned away mid-handshake is the expected outcome for the no-certificate leg
+        FRejection := Utf8ToString(LLastErr);
+      end;
+      LTls := nil;
+    end;
+  except
+    on E: Exception do
+    begin
+      GServerError := E.ClassName + ': ' + E.Message;
+      GReady.SetEvent;
+    end;
+  end;
+end;
+
+class function TMutualTlsCheck.Echo(AWithIdentity: Boolean; out AError: string;
+  out AReceive: TNetResult): Boolean;
+var
+  LCtx: TNetTlsContext;
+  LSock: TNetSocket;
+  LTls: INetTls;
+  LPing, LBack: TBytes;
+  LLen: Integer;
+  LDoBind: Boolean;
+  LTimeoutMs, LRetry: Integer;
+begin
+  LDoBind := False;
+  LTimeoutMs := 3000;
+  LRetry := 0;
+  Result := False;
+  AError := '';
+  AReceive := nrUnknownError;
+  FillCharFast(LCtx, SizeOf(LCtx), 0);
+  LCtx.CACertificatesFile := GMutualRootFile;
+  if AWithIdentity then
+  begin
+    LCtx.CertificateBin := GMutualPfx;
+    LCtx.PrivatePassword := 'tlslib';
+  end;
+  if NewSocket(HOST, MUTUAL_PORT, nlTcp, LDoBind, LTimeoutMs, LTimeoutMs, LTimeoutMs, LRetry, LSock) <> nrOK then
+    raise Exception.Create('mutual client connect failed');
+  LTls := NewTlsLib4PascalTls;
+  try
+    LTls.AfterConnection(LSock, LCtx, 'localhost');
+    // TLS 1.3 lets the client finish before the server judges its certificate: the answer is
+    // the echo, which a rejected client never gets
+    LPing := TDataEncoding.HexDecode(PINGHEX);
+    LLen := System.Length(LPing);
+    LTls.Send(@LPing[0], LLen);
+    SetLength(LBack, 4096);
+    LLen := System.Length(LBack);
+    AReceive := LTls.Receive(@LBack[0], LLen);
+    Result := (AReceive = nrOK) and (LLen = System.Length(LPing));
+  except
+    on E: Exception do
+    begin
+      Result := False;
+      AError := E.Message;
+    end;
+  end;
+  LTls := nil;
+end;
+
+class procedure TMutualTlsCheck.Run;
+var
+  LServer: TMutualServerThread;
+  LPfx: TBytes;
+  LError: string;
+  LReceive: TNetResult;
+begin
+  LPfx := TDataEncoding.HexDecode(TVectorLocator.FieldHexFrom('ClientAuthChain.txt', 'leaf_pfx'));
+  SetString(GMutualPfx, PAnsiChar(@LPfx[0]), System.Length(LPfx));
+  TVectorLocator.WriteDer('mutual_root',
+    TVectorLocator.FieldHexFrom('ClientAuthChain.txt', 'root_cert'), GMutualRootFile);
+  GReady.ResetEvent;
+  LServer := TMutualServerThread.Create(True);
+  LServer.FreeOnTerminate := False;
+  try
+    LServer.Start;
+    GReady.WaitFor(5000);
+    if GServerError <> '' then
+      raise Exception.Create('mutual server: ' + GServerError);
+    if not Echo(True, LError, LReceive) then
+      raise Exception.Create('a client presenting the PFX identity was not served: ' + LError);
+    if Echo(False, LError, LReceive) then
+      raise Exception.Create('a client with no certificate was served');
+    // the adapter reports a peer alert as a fatal error and an idle peer as a retry, so this
+    // is the rejection itself and not a timeout
+    if (LError <> '') or (LReceive <> nrFatalError) then
+      raise Exception.Create('the client with no certificate was not rejected by the peer: ' +
+        LError);
+    LServer.WaitFor;
+    if GServerError <> '' then
+      raise Exception.Create('mutual server: ' + GServerError);
+    if LServer.Served <> 1 then
+      raise Exception.CreateFmt('the server served %d clients, expected 1', [LServer.Served]);
+    if LServer.Attempts <> 2 then
+      raise Exception.CreateFmt('the server saw %d clients, expected 2', [LServer.Attempts]);
+    // the server ended the handshake with its own alert and says why, not a transport failure
+    if Pos('client authentication is required but none was sent', LServer.Rejection) = 0 then
+      raise Exception.Create('the server did not reject the client with an alert: ' +
+        LServer.Rejection);
+  finally
+    LServer.Free;
+  end;
+end;
+
 class function TMormotLoopbackExample.Run: Integer;
 var
   LServer: TServerThread;
   LCtx: TNetTlsContext;
   LSock: TNetSocket;
   LTls: INetTls;
-  LPing, LEcho: TBytes;
+  LPing, LEcho, LPfx: TBytes;
   LLen: Integer;
-  LOk: Boolean;
+  LOk, LRefused: Boolean;
+  LResolver: TAcceptingServerResolver;
+  LDoBind: Boolean;
+  LTimeoutMs, LRetry: Integer;
 begin
+  LDoBind := False;
+  LTimeoutMs := 3000;
+  LRetry := 0;
   Result := 1;
   GServerError := '';
   GVector := TVectorLocator.Find;
   GReady := TEvent.Create(nil, True, False, '');
+  LResolver := TAcceptingServerResolver.Create;
   try
-    TVectorLocator.WriteDer('leaf', TVectorLocator.FieldHex('leaf_cert'), GLeafFile);
-    TVectorLocator.WriteDer('key', TVectorLocator.FieldHex('leaf_key'), GKeyFile);
+    LPfx := TDataEncoding.HexDecode(TVectorLocator.FieldHex('leaf_pfx'));
+    SetString(GLeafPfx, PAnsiChar(@LPfx[0]), System.Length(LPfx));
     TVectorLocator.WriteDer('root', TVectorLocator.FieldHex('root_cert'), GRootFile);
 
+    // a process-wide server resolver must leave a server that requests no client certificate usable
+    SetTlsLibMormotServerVerdictResolver(LResolver.Resolve, 1000);
     LServer := TServerThread.Create(True);
     LServer.FreeOnTerminate := False;
     LServer.Start;
@@ -201,7 +559,9 @@ begin
 
     FillCharFast(LCtx, SizeOf(LCtx), 0);
     LCtx.CACertificatesFile := GRootFile;
-    if NewSocket(HOST, PORT, nlTcp, {dobind=}False, 3000, 3000, 3000, 0, LSock) <> nrOK then
+    // the client offers one suite, so a negotiated AES-256 proves the list was honoured
+    LCtx.CipherList := 'TLS_AES_256_GCM_SHA384';
+    if NewSocket(HOST, PORT, nlTcp, LDoBind, LTimeoutMs, LTimeoutMs, LTimeoutMs, LRetry, LSock) <> nrOK then
       raise Exception.Create('client connect failed');
     LTls := NewTlsLib4PascalTls;
     // connect to 127.0.0.1 but verify the certificate for 'localhost' (its SAN)
@@ -215,23 +575,34 @@ begin
     LTls.Receive(@LEcho[0], LLen);
 
     LServer.WaitFor;
+    SetTlsLibMormotServerVerdictResolver(nil, 0);
     if GServerError <> '' then
       raise Exception.Create('server: ' + GServerError);
 
     LOk := (LLen = System.Length(LPing)) and CompareMem(@LEcho[0], @LPing[0], LLen)
-      and (LTls.GetCipherName = 'TLSv1.3');
+      and (Pos('TLSv1.3', LTls.GetCipherName) > 0)
+      and (Pos('TLS_AES_256_GCM_SHA384', LTls.GetCipherName) > 0);
     if LOk then
-    begin
-      Writeln('mORMot loopback PASS: handshake + echo over ', LTls.GetCipherName);
-      Result := 0;
-    end
+      Writeln('mORMot loopback PASS: handshake + echo over ', LTls.GetCipherName,
+        ' + client PFX identity authenticated')
     else
       Writeln('mORMot loopback FAIL: echo/version mismatch');
     LServer.Free;
+    TMutualTlsCheck.Run;
+    LRefused := TRefusalChecks.AllRefused;
+    if LRefused then
+      Writeln('mORMot refusal checks PASS: unsupported context inputs fail loudly')
+    else
+      Writeln('mORMot refusal checks FAIL: an unsupported context input was accepted');
+    // success only when both verdicts are in and good
+    if LOk and LRefused then
+      Result := 0;
   except
     on E: Exception do
       Writeln('mORMot loopback FAIL: ', E.ClassName, ': ', E.Message);
   end;
+  SetTlsLibMormotServerVerdictResolver(nil, 0);
+  LResolver.Free;
   GReady.Free;
 end;
 

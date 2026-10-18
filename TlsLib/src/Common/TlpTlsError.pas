@@ -19,23 +19,47 @@ uses
   TlpTlsAlert;
 
 type
+  /// <summary>Where the error came from: Local is one this side produced (its alert was sent,
+  /// unless our close_notify or a failed seal prevented it), Peer one the peer sent (its alert
+  /// was received), Transport a transport failure under the connection (no alert was sent or
+  /// received, so Alert and AlertByte are placeholders). Unknown is the zero value: no failure
+  /// recorded yet.</summary>
+  TTlsErrorOrigin = (Unknown, Local, Peer, Transport);
+
   /// <summary>
-  /// The structured, public-facing error surfaced to callers: the alert that
-  /// was (or would be) sent and a human-readable message that must not leak
-  /// internal state.
+  /// The structured, public-facing error surfaced to callers: the alert this
+  /// side sent or would send (Local) or the peer sent (Peer), unless Origin is
+  /// Transport, and a human-readable message that must not leak internal state.
   /// </summary>
   TTlsError = record
   strict private
     FAlert: TTlsAlert;
     FMessage: string;
+    FOrigin: TTlsErrorOrigin;
+    FAlertByte: Byte;
   public
-    class function Create(const AAlert: TTlsAlert;
-      const AMessage: string): TTlsError; static;
+    class function Create(const AAlert: TTlsAlert; const AMessage: string): TTlsError;
+      overload; static;
+    class function Create(const AAlert: TTlsAlert; const AMessage: string;
+      AOrigin: TTlsErrorOrigin): TTlsError; overload; static;
     /// <summary>A fatal error carrying the given alert description and message.</summary>
     class function CreateFatal(ADescription: TTlsAlertDescription;
+      const AMessage: string): TTlsError; overload; static;
+    class function CreateFatal(ADescription: TTlsAlertDescription;
+      const AMessage: string; AOrigin: TTlsErrorOrigin): TTlsError; overload; static;
+    /// <summary>A fatal error for a peer-sent alert, carrying the RAW wire description byte so the
+    /// diagnostic stays honest even for a code this library does not map (e.g. no_certificate or a
+    /// future code): Alert maps the byte when known, else it is a placeholder internal_error, but
+    /// AlertByte is always the byte the peer actually sent.</summary>
+    class function CreatePeerFatal(ADescriptionByte: Byte;
       const AMessage: string): TTlsError; static;
     property Alert: TTlsAlert read FAlert;
     property Message: string read FMessage;
+    property Origin: TTlsErrorOrigin read FOrigin;
+    /// <summary>The on-wire alert description byte: for a peer alert the code the peer sent (even
+    /// when unmapped); otherwise the byte of Alert.Description; a placeholder when Origin is
+    /// Transport.</summary>
+    property AlertByte: Byte read FAlertByte;
   end;
 
 implementation
@@ -45,14 +69,43 @@ implementation
 class function TTlsError.Create(const AAlert: TTlsAlert;
   const AMessage: string): TTlsError;
 begin
+  Result := TTlsError.Create(AAlert, AMessage, TTlsErrorOrigin.Unknown);
+end;
+
+class function TTlsError.Create(const AAlert: TTlsAlert; const AMessage: string;
+  AOrigin: TTlsErrorOrigin): TTlsError;
+begin
   Result.FAlert := AAlert;
   Result.FMessage := AMessage;
+  Result.FOrigin := AOrigin;
+  Result.FAlertByte := AAlert.Description.ToByte;
 end;
 
 class function TTlsError.CreateFatal(ADescription: TTlsAlertDescription;
   const AMessage: string): TTlsError;
 begin
-  Result := TTlsError.Create(TTlsAlert.CreateFatal(ADescription), AMessage);
+  Result := TTlsError.CreateFatal(ADescription, AMessage, TTlsErrorOrigin.Unknown);
+end;
+
+class function TTlsError.CreateFatal(ADescription: TTlsAlertDescription;
+  const AMessage: string; AOrigin: TTlsErrorOrigin): TTlsError;
+begin
+  Result := TTlsError.Create(TTlsAlert.CreateFatal(ADescription), AMessage, AOrigin);
+end;
+
+class function TTlsError.CreatePeerFatal(ADescriptionByte: Byte;
+  const AMessage: string): TTlsError;
+var
+  LDescription: TTlsAlertDescription;
+begin
+  // map the byte when we know it (so Alert.Description stays meaningful), else a placeholder;
+  // AlertByte carries the peer's actual code either way, so an unmapped alert is not misreported
+  // as our own internal_error
+  if not TTlsAlertDescription.TryFromByte(ADescriptionByte, LDescription) then
+    LDescription := TTlsAlertDescription.InternalError;
+  Result := TTlsError.Create(TTlsAlert.CreateFatal(LDescription), AMessage,
+    TTlsErrorOrigin.Peer);
+  Result.FAlertByte := ADescriptionByte;
 end;
 
 end.

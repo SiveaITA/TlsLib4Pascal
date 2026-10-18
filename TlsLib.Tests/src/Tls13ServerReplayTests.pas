@@ -29,10 +29,7 @@ uses
 {$ENDIF FPC}
   TlpTlsAlert,
   TlpTlsVersion,
-  TlpISecretBuffer,
-  TlpSecretBuffer,
   TlpICryptoProvider,
-  TlpCryptoDomainTypes,
   TlpINamedGroup,
   TlpNegotiationTypes,
   TlpNegotiationPolicy,
@@ -42,7 +39,6 @@ uses
   TlpITlsExtension,
   TlpExtensionBlockCodec,
   TlpRecordLayer,
-  TlpITlsEngine,
   TlpHandshakeMessage,
   TlpHandshakeMessages,
   TlpIHandshakeChannel,
@@ -54,45 +50,25 @@ uses
   TlpTlsCredential,
   TlpCredentialResolvers,
   MockCryptoProvider,
-  Tls13ClientReplayTests,
-  TlsLibTestBase;
+  MockNamedGroups,
+  MockSink,
+  MockRecordInstaller,
+  TlsLibHandshakeTestBase;
 
 type
-  /// <summary>A named group whose Encapsulate yields fixed (share, secret) for RFC replay.</summary>
-  TReplayServerGroup = class(TInterfacedObject, INamedGroup)
-  strict private
-    FServerShare, FShared: TBytes;
-  public
-    constructor Create(const AServerShare, AShared: TBytes);
-    function Code: UInt16;
-    function Name: string;
-    function Kind: TNamedGroupKind;
-    function Composition: TNamedGroupComposition;
-    procedure GenerateKeyPair(out APriv: ISecretBuffer; out APubShare: TBytes);
-    procedure Encapsulate(const APeerPub: TBytes; out ACiphertext: TBytes;
-      out ASharedSecret: ISecretBuffer);
-    procedure Decapsulate(const APriv: ISecretBuffer; const ACiphertext: TBytes;
-      out ASharedSecret: ISecretBuffer);
-    function ValidatePeerShare(const AShare: TBytes): Boolean;
-  end;
-
-  TTestTls13ServerReplay = class(TTlsLibAlgorithmTestCase)
+  TTestTls13ServerReplay = class(TTlsLibHandshakeTestCase)
   private
     FHs, FSched, FKeys: TStringList;
     FLayer: TRecordLayer;
     FDriver: THandshakeDriver;
     FSm: IHandshakeMachine;
     function Msg(const AName: string): TTlsHandshakeMessage;
-    /// <summary>Rebuilds FDriver over AProvider, releasing any driver from a prior
+    /// <summary>Rebuilds FDriver over ACryptoProvider, releasing any driver from a prior
     /// arrange first so a re-arranged test never leaks the previous graph.</summary>
-    procedure BuildDriver(const AProvider: ICryptoProvider);
+    procedure BuildDriver(const ACryptoProvider: ICryptoProvider);
     /// <summary>Arranges a server whose RSA credential can sign any rsa_pss_rsae_*
     /// variant (schemes listed [sha384, sha256, sha512]); it really signs, no override.</summary>
     procedure ArrangeMultiSchemeRsa;
-    function CollectSendHandshake(const AEffects: TArray<THandshakeEffect>): TArray<TBytes>;
-    /// <summary>The alert of the first Fail effect in AEffects, or False if none.</summary>
-    function FailAlertOf(const AEffects: TArray<THandshakeEffect>;
-      out AAlert: TTlsAlertDescription): Boolean;
     procedure Arrange;
     /// <summary>Synthesizes a framed ClientHello offering AGroup and AKeyShare; when
     /// AIncludeSchemes is set it carries signature_algorithms = ASchemes.</summary>
@@ -103,93 +79,31 @@ type
       out AAlert: TTlsAlertDescription): Boolean;
   protected
     procedure SetUp; override;
-    procedure TearDown; override;
   published
     procedure TestRfc8448ServerFlightByteExact;
     procedure TestExporterAvailableInHalfRtt;
     procedure TestBadClientFinishedFailsClosed;
     procedure TestServerSigSchemeIncompatibleRejected;
     procedure TestServerSigSchemeMissingRejected;
+    procedure TestNonPskWithoutSupportedGroupsRejected;
     procedure TestServerNegotiatesRsaPssSchemeFromCredentialSet;
   end;
 
 implementation
-
-{ TReplayServerGroup }
-
-constructor TReplayServerGroup.Create(const AServerShare, AShared: TBytes);
-begin
-  inherited Create;
-  FServerShare := AServerShare;
-  FShared := AShared;
-end;
-
-function TReplayServerGroup.Code: UInt16;
-begin
-  Result := TNamedGroupCatalog.X25519;
-end;
-
-function TReplayServerGroup.Name: string;
-begin
-  Result := 'X25519';
-end;
-
-function TReplayServerGroup.Kind: TNamedGroupKind;
-begin
-  Result := TNamedGroupKind.Ecdhe;
-end;
-
-function TReplayServerGroup.Composition: TNamedGroupComposition;
-begin
-  Result := TNamedGroupComposition.From(TKeyAgreementAlgorithm.X25519);
-end;
-
-procedure TReplayServerGroup.GenerateKeyPair(out APriv: ISecretBuffer;
-  out APubShare: TBytes);
-begin
-  APriv := TSecretBuffer.Allocate(32);
-  APubShare := System.Copy(FServerShare);
-end;
-
-procedure TReplayServerGroup.Encapsulate(const APeerPub: TBytes;
-  out ACiphertext: TBytes; out ASharedSecret: ISecretBuffer);
-begin
-  ACiphertext := System.Copy(FServerShare);
-  ASharedSecret := TSecretBuffer.From(FShared);
-end;
-
-procedure TReplayServerGroup.Decapsulate(const APriv: ISecretBuffer;
-  const ACiphertext: TBytes; out ASharedSecret: ISecretBuffer);
-begin
-  ASharedSecret := TSecretBuffer.From(FShared);
-end;
-
-function TReplayServerGroup.ValidatePeerShare(const AShare: TBytes): Boolean;
-begin
-  Result := True;
-end;
 
 { TTestTls13ServerReplay }
 
 procedure TTestTls13ServerReplay.SetUp;
 begin
   inherited SetUp;
-  FHs := LoadVectorFields('Rfc8448/HandshakeMessages.txt');
-  FSched := LoadVectorFields('Rfc8448/Tls13KeySchedule.txt');
-  FKeys := LoadVectorFields('Certs/SignatureKeys.txt');
+  FDriver := nil;
+  FSm := nil;
+  FHs := Own<TStringList>(LoadVectorFields('Rfc8448/HandshakeMessages.txt'));
+  FSched := Own<TStringList>(LoadVectorFields('Rfc8448/Tls13KeySchedule.txt'));
+  FKeys := Own<TStringList>(LoadVectorFields('Certs/SignatureKeys.txt'));
   // FDriver wraps FLayer, so Own both: the base disposes newest-first, freeing the driver
   // before the layer it references (a re-arrange never leaves a dangling driver either)
   FLayer := Own<TRecordLayer>(TRecordLayer.Create);
-end;
-
-procedure TTestTls13ServerReplay.TearDown;
-begin
-  // FHs/FSched/FKeys are reassigned in SetUp before use, so a plain free is safe here; FLayer and
-  // FDriver are Own'd (freed by the base) - a fixture must never free an Own'd field
-  FHs.Free;
-  FSched.Free;
-  FKeys.Free;
-  inherited TearDown;
 end;
 
 function TTestTls13ServerReplay.Msg(const AName: string): TTlsHandshakeMessage;
@@ -207,47 +121,14 @@ begin
   end;
 end;
 
-function TTestTls13ServerReplay.CollectSendHandshake(
-  const AEffects: TArray<THandshakeEffect>): TArray<TBytes>;
-var
-  LEffect: THandshakeEffect;
-  LCount: Int32;
-begin
-  Result := nil;
-  LCount := 0;
-  for LEffect in AEffects do
-    if LEffect.Kind = THandshakeEffectKind.SendHandshake then
-    begin
-      SetLength(Result, LCount + 1);
-      Result[LCount] := LEffect.Bytes;
-      Inc(LCount);
-    end;
-end;
-
-function TTestTls13ServerReplay.FailAlertOf(
-  const AEffects: TArray<THandshakeEffect>;
-  out AAlert: TTlsAlertDescription): Boolean;
-var
-  LEffect: THandshakeEffect;
-begin
-  Result := False;
-  AAlert := TTlsAlertDescription.CloseNotify;
-  for LEffect in AEffects do
-    if LEffect.Kind = THandshakeEffectKind.Fail then
-    begin
-      AAlert := LEffect.Alert;
-      Exit(True);
-    end;
-end;
-
-procedure TTestTls13ServerReplay.BuildDriver(const AProvider: ICryptoProvider);
+procedure TTestTls13ServerReplay.BuildDriver(const ACryptoProvider: ICryptoProvider);
 begin
   // a test may arrange more than once; Own accumulates, and the base disposes every driver at
   // TearDown. A superseded driver holds only non-owning refs to FLayer, so it is inert until then
   FDriver := Own<THandshakeDriver>(THandshakeDriver.Create(
     THandshakeChannel.Create(FLayer) as IHandshakeChannel,
-    TRecordLayerInstaller.Create(FLayer) as IRecordEpochInstaller, AProvider,
-    TSilentSink.Create as IHandshakeSink));
+    TRecordLayerInstaller.Create(FLayer) as IRecordEpochInstaller, ACryptoProvider,
+    TMockHandshakeSink.Create as IHandshakeSink));
 end;
 
 procedure TTestTls13ServerReplay.Arrange;
@@ -256,6 +137,7 @@ var
   LServerHello: TBytes;
   LServerShare: TBytes;
   LCred: TTlsCredential;
+  LReplay: ITls13ServerReplay;
 begin
   // the server's key_share pubshare and 32-byte random come straight from the RFC
   // ServerHello (the mock KEM returns this share and the recorded shared secret)
@@ -267,25 +149,30 @@ begin
   LParams := Default(TServerHandshakeParams);
   LParams.Clock := TSystemClock.Create;
   // a fixed HasHardwareAes=True makes the suite choice deterministically AES-128-GCM
-  LParams.Provider := TFixedAesProvider.Create(Provider, True);
-  LParams.Policy := TNegotiationPolicy.CreateDefault(LParams.Provider);
-  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(LParams.Provider);
+  LParams.Crypto := TFixedAesProvider.Create(Crypto, True);
+  LParams.Inspector := Pkix.Certificates;
+  LParams.Policy := TNegotiationPolicy.CreateDefault(LParams.Crypto);
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(LParams.Crypto);
   LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
-  LParams.Group := TReplayServerGroup.Create(LServerShare,
+  LParams.Group := TFixedSecretGroup.Create(LServerShare,
     DecodeHex(FSched.Values['shared_secret'])) as INamedGroup;
   // the ServerHello random sits after type(1) length(3) legacy_version(2)
   LParams.ServerRandom := System.Copy(LServerHello, 6, 32);
-  LParams.EncryptedExtensionsOverride := DecodeHex(FHs.Values['encrypted_ext']);
-  // inject the RFC 8448 Certificate + CertificateVerify verbatim for byte-exact replay
-  LParams.CertificateOverride := DecodeHex(FHs.Values['certificate']);
-  LParams.CertificateVerifyOverride := DecodeHex(FHs.Values['cert_verify']);
   // the RFC 8448 server signs with rsa_pss_rsae_sha256, which the RFC client offers;
-  // the CertificateVerify is replayed verbatim, so the key only drives scheme selection
+  // the Certificate and CertificateVerify are replayed verbatim, so the credential only drives
+  // scheme selection
   LCred := Default(TTlsCredential);
-  LCred.PrivateKey := Provider.Signing.ImportSigningKey(DecodeHex(FKeys.Values['rsa_key']));
+  LCred.CertificateChain := TArray<TBytes>.Create(DecodeHex(FKeys.Values['rsa_cert']));
+  LCred.PrivateKey := Crypto.Signing.ImportSigningKey(DecodeHex(FKeys.Values['rsa_key']), nil);
   LParams.CredentialResolver := TSniCredentialResolver.ForCredential(LCred);
   FSm := TTls13ServerStateMachine.Create(LParams);
-  BuildDriver(LParams.Provider);
+  // inject the RFC 8448 EncryptedExtensions + Certificate + CertificateVerify verbatim
+  // for byte-exact replay
+  LReplay := FSm as ITls13ServerReplay;
+  LReplay.SetVerbatimEncryptedExtensions(DecodeHex(FHs.Values['encrypted_ext']));
+  LReplay.SetVerbatimCertificate(DecodeHex(FHs.Values['certificate']));
+  LReplay.SetVerbatimCertificateVerify(DecodeHex(FHs.Values['cert_verify']));
+  BuildDriver(LParams.Crypto);
   FSm.Start;
 end;
 
@@ -293,12 +180,15 @@ procedure TTestTls13ServerReplay.TestRfc8448ServerFlightByteExact;
 var
   LEffects: TArray<THandshakeEffect>;
   LFlight: TArray<TBytes>;
+  LEffect: THandshakeEffect;
+  LAlert: TTlsAlertDescription;
+  LEstablished: Boolean;
 begin
   Arrange;
 
   // the ClientHello drives the whole server flight
   LEffects := FSm.ProcessMessage(Msg('client_hello'));
-  LFlight := CollectSendHandshake(LEffects);
+  LFlight := AllSendHandshake(LEffects);
   CheckEquals(5, System.Length(LFlight),
     'the server sends ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished');
   // the reconstructed ServerHello is byte-exact (so its transcript matches the RFC)
@@ -314,6 +204,12 @@ begin
   // the RFC client Finished verifies against the server-side transcript, and the
   // handshake is established
   LEffects := FSm.ProcessMessage(Msg('client_finished'));
+  CheckFalse(FailAlertOf(LEffects, LAlert), 'the genuine client Finished is not refused');
+  LEstablished := False;
+  for LEffect in LEffects do
+    if LEffect.Kind = THandshakeEffectKind.HandshakeEstablished then
+      LEstablished := True;
+  CheckTrue(LEstablished, 'accepting the client Finished establishes the handshake');
   FDriver.ApplyAll(LEffects);
 end;
 
@@ -328,7 +224,7 @@ begin
   // now in half-RTT (its Finished sent, the client Finished not yet processed)
   FSm.ProcessMessage(Msg('client_hello'));
   CheckTrue(FSm.CanExportKeyingMaterial, 'the exporter is available in half-RTT');
-  LExport := FSm.ExportKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), True, 32);
+  LExport := FSm.ExportKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), 32);
   CheckEquals(32, System.Length(LExport),
     'the machine exports keying material in half-RTT');
   FSm.ProcessMessage(Msg('client_finished'));
@@ -437,6 +333,52 @@ begin
     'a missing signature_algorithms is missing_extension');
 end;
 
+procedure TTestTls13ServerReplay.TestNonPskWithoutSupportedGroupsRejected;
+var
+  LCodec: IExtensionBlockCodec;
+  LContext: TExtensionContext;
+  LHello: TTlsClientHello;
+  LFramed: TBytes;
+  LReader: THandshakeMessageReader;
+  LMessage: TTlsHandshakeMessage;
+  LAlert: TTlsAlertDescription;
+begin
+  // a non-PSK ClientHello that omits both supported_groups and key_share: the present/absent XOR
+  // passes (both absent), so without the RFC 9846 9.2 guard it would fail later at group selection
+  // with handshake_failure instead of missing_extension. signature_algorithms is present so the
+  // only defect is the missing supported_groups.
+  LCodec := TExtensionBlockCodec.Create(TCoreExtensions.CreateDefaultRegistry)
+    as IExtensionBlockCodec;
+  LContext := TExtensionContext.Create;
+  try
+    LContext.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls13);
+    LContext.SignatureSchemes :=
+      TArray<UInt16>.Create(TSignatureSchemes.RsaPssRsaeSha256);
+    LHello.Random := nil;
+    SetLength(LHello.Random, 32);
+    LHello.LegacySessionId := nil;
+    LHello.CipherSuites := TArray<UInt16>.Create(TCipherSuites13.Aes128GcmSha256);
+    LHello.Extensions := LCodec.ProduceBlock(LContext,
+      TTlsExtensionContextKind.ClientHello);
+  finally
+    LContext.Free;
+  end;
+  LFramed := THandshakeFraming.Frame(TTlsHandshakeType.ClientHello,
+    THandshakeMessages.EncodeClientHello(LHello));
+  LReader := THandshakeMessageReader.Create;
+  try
+    LReader.Append(LFramed, 0, System.Length(LFramed));
+    LReader.NextMessage(LMessage);
+  finally
+    LReader.Free;
+  end;
+
+  CheckTrue(ClientHelloAlert(LMessage, LAlert),
+    'a non-PSK ClientHello without supported_groups aborts the handshake');
+  CheckTrue(LAlert = TTlsAlertDescription.MissingExtension,
+    'a non-PSK ClientHello without supported_groups is missing_extension');
+end;
+
 procedure TTestTls13ServerReplay.ArrangeMultiSchemeRsa;
 var
   LParams: TServerHandshakeParams;
@@ -446,20 +388,21 @@ begin
   LFill := DecodeHex(StringOfChar('a', 64)); // 32 bytes; the mock KEM ignores its value
   LParams := Default(TServerHandshakeParams);
   LParams.Clock := TSystemClock.Create;
-  LParams.Provider := Provider;
-  LParams.Policy := TNegotiationPolicy.CreateDefault(Provider);
-  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Provider);
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.Policy := TNegotiationPolicy.CreateDefault(Crypto);
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Crypto);
   LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
-  LParams.Group := TReplayServerGroup.Create(LFill, LFill) as INamedGroup;
+  LParams.Group := TFixedSecretGroup.Create(LFill, LFill) as INamedGroup;
   LParams.ServerRandom := LFill;
   // one RSA key; its capable schemes are the three rsa_pss_rsae_* variants, and the
-  // machine signs for real (no CertificateVerifyOverride)
+  // machine signs for real (no verbatim CertificateVerify is set)
   LCred := Default(TTlsCredential);
   LCred.CertificateChain := TArray<TBytes>.Create(DecodeHex(FKeys.Values['rsa_cert']));
-  LCred.PrivateKey := Provider.Signing.ImportSigningKey(DecodeHex(FKeys.Values['rsa_key']));
+  LCred.PrivateKey := Crypto.Signing.ImportSigningKey(DecodeHex(FKeys.Values['rsa_key']), nil);
   LParams.CredentialResolver := TSniCredentialResolver.ForCredential(LCred);
   FSm := TTls13ServerStateMachine.Create(LParams);
-  BuildDriver(Provider);
+  BuildDriver(Crypto);
   FSm.Start;
 end;
 
@@ -476,7 +419,7 @@ var
     LCv: TBytes;
   begin
     ArrangeMultiSchemeRsa;
-    LFlight := CollectSendHandshake(FSm.ProcessMessage(BuildClientHello(True, ASchemes)));
+    LFlight := AllSendHandshake(FSm.ProcessMessage(BuildClientHello(True, ASchemes)));
     CheckEquals(5, System.Length(LFlight), 'the server emits its full flight');
     LCv := LFlight[3]; // ServerHello, EncryptedExtensions, Certificate, CertificateVerify
     Result := THandshakeMessages.DecodeCertificateVerify(

@@ -16,8 +16,8 @@
 /// with zero OpenSSL. THTTPSend keeps the socket alive, so both requests run over ONE reused TLS
 /// connection - the strongest proof that our records carry ordinary application traffic. It runs
 /// TWICE against the same host: leg A verifies against a pinned root (CertCAFile), leg B verifies
-/// against the OS system-trust store harvested and validated entirely by TlsLib4Pascal
-/// (SetTlsLibSynapseSystemTrust, no pinned file) - proving a caller can drop the bundled PEM and
+/// against the OS system-trust store, verified entirely by TlsLib4Pascal
+/// (UseSystemTrust, no pinned file) - proving a caller can drop the bundled PEM and
 /// lean on the platform anchors instead. This is a network-gated demo, NOT part of any test gate:
 /// it needs outbound HTTPS; the pinned root is refreshed only if Let's Encrypt rotates (the leaf
 /// rotates ~90 days but always chains to it). Run returns 0 when both legs PASS, 1 on FAIL, 2 when
@@ -129,7 +129,7 @@ begin
     LHttp := THTTPSend.Create;
     try
       if AUseSystemTrust then
-        // no pinned file: verify against the OS system-trust store our validator harvests
+        // no pinned file: verify against the OS system-trust store
         (LHttp.Sock.SSL as TSSLTlsLib).UseSystemTrust := True
       else
       begin
@@ -198,11 +198,11 @@ var
   LPinned, LSystem: Integer;
 begin
   // leg A: pinned-root trust (the bundled ISRG PEM)
-  LPinned := RunOnce({AUseSystemTrust=}False, 'pinned-root');
+  LPinned := RunOnce(False, 'pinned-root');
   if LPinned = 2 then
     Exit(2); // network unreachable - SKIP the whole demo
   // leg B: OS system-trust, no pinned file
-  LSystem := RunOnce({AUseSystemTrust=}True, 'system-trust');
+  LSystem := RunOnce(True, 'system-trust');
   if LSystem = 2 then
     Exit(2);
   if (LPinned = 0) and (LSystem = 0) then

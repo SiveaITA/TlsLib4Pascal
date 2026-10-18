@@ -4,7 +4,7 @@
 
 TlsLib4Pascal is a fully managed, from-scratch **TLS 1.2 + TLS 1.3** stack for **Delphi** and
 **FPC / Lazarus** — no OpenSSL, no platform TLS engine, no external runtime dependency beyond its
-sibling Pascal libraries. **Post-quantum hybrid key exchange (X25519MLKEM768) is on by default.**
+sibling Pascal libraries. **Post-quantum hybrid key exchange (X25519MLKEM768) is offered by every preset, and preferred under Hardened and Strict.**
 Certificate path validation, the cryptographic primitives, and the CSPRNG come from
 CryptoLib4Pascal; TlsLib4Pascal owns the wire protocol, the handshake, and the trust policy.
 
@@ -32,7 +32,7 @@ engine — the difference is only who drives the socket.
 
 | Tier | Use it when | Entry point |
 |---|---|---|
-| **1 — Batteries-included facade** | You just want a config or an engine with safe defaults, fast. | `TTlsLib.NewClientConfig` / `NewServerConfig` (unit `TlpTlsLib`) |
+| **1 — Batteries-included facade** | You just want a config with safe defaults, fast. | `TTlsLib.NewClientConfig` / `NewServerConfig` (unit `TlpTlsLib`) |
 | **2 — `TTlsStream` over your transport** | You own the socket and want a `TStream` that speaks TLS over it. | `TTlsStream` (unit `TlpTlsStream`) over an `ITlsTransport` |
 | **3 — Drop-in adapter** | You already use mORMot / Indy / Synapse / fcl-net and want to swap in TLS with one line. | the adapter unit for your stack |
 | *(0 — raw sans-IO engine)* | *You drive an async/event framework and want no I/O assumptions at all.* | `ITlsEngine` via `TTlsEngineFactory` |
@@ -48,17 +48,24 @@ contents track evolving best practice.
 
 | Preset | Versions | Groups | For |
 |---|---|---|---|
-| **Compatible** *(default)* | TLS 1.3 + hardened TLS 1.2 | X25519, **X25519MLKEM768**, P-256/384/521 | The broad default. Interops widely; still PQ-hybrid capable and AEAD-only. |
-| **Hardened** | TLS 1.3 only | **X25519MLKEM768** (preferred), X25519, P-256 | Modern peers only; post-quantum hybrid preferred. |
-| **Strict** | TLS 1.3 only | **X25519MLKEM768**, X25519 only | Locked-down posture: constant-time group allowlist, tight certificate limits, resumption off. |
+| **Compatible** *(default)* | TLS 1.3 + hardened TLS 1.2 | X25519, **X25519MLKEM768**, **SecP256r1MLKEM768**, P-256/384/521 | The broad default. Interops widely; still PQ-hybrid capable and AEAD-only. |
+| **Hardened** | TLS 1.3 only | **X25519MLKEM768** (preferred), **SecP256r1MLKEM768**, X25519, P-256 | Modern peers only; post-quantum hybrid preferred. Requests an OCSP staple. |
+| **Strict** | TLS 1.3 only | **X25519MLKEM768**, X25519, secp256r1 | Locked-down posture: fixed group allowlist, tight certificate limits, resumption off. Requests an OCSP staple. |
 
 ```pascal
-uses TlpTlsPresets, TlpDefaultCryptoProvider, TlpICryptoProvider;
+uses SysUtils, TlpTlsPresets, TlpDefaultCryptoProvider, TlpDefaultPkixProvider, TlpICryptoProvider,
+  TlpIPkixProvider, TlpITlsConfig, TlpCertificateVerifierSource;
 
-var P: ICryptoProvider;
+var
+  Crypto: ICryptoProvider;
+  Pkix: IPkixProvider;
+  LConfig: ITlsClientConfig;
+  caPem: TBytes;               // your CA bundle, PEM or DER
 begin
-  P := TDefaultCryptoProvider.Create as ICryptoProvider;
-  LConfig := TTlsPresets.Compatible(P).Client.WithTrustAnchors(caPem).Build;
+  Crypto := TDefaultCryptoProvider.Create as ICryptoProvider;
+  Pkix := TDefaultPkixProvider.Create as IPkixProvider;
+  LConfig := TTlsPresets.Compatible(Crypto, Pkix).Client
+    .WithServerVerification(TServerVerification.WebPki(caPem).Build).Build;
 end;
 ```
 
@@ -79,7 +86,10 @@ if you use it:
 | `TlsLib4PascalPackage` | The core library + default provider. **Requires none of the below.** |
 | `TlsLib.Trust.System` | OS system-trust harvest + delegate ([system-trust.md](system-trust.md)). |
 | `TlsLib.Trust.Bundle` | A PEM/DER CA-bundle loader (`FromPem` / `FromPemFile`). |
-| `TlpSocketHttpFetcher` *(unit in `TlsLib.Net/`)* | The reference socket `IHttpFetcher` for live OCSP/CRL — a loose unit, not a package. |
+| `TlsLib.Crypto.System` | Opt-in OS-native crypto primitives for the handshake. |
+| `TlpSocketHttpFetcher` *(package `TlsLib.Net`, `TlsLib.Net/src/`)* | The reference socket `IHttpFetcher` for live OCSP/CRL (http, and https with a supplied TLS config), configured through `TSocketHttpFetcherSettings` (clock, `IHostResolver`, destination policy, forward proxy by absolute-form or CONNECT). |
+| `TlpNetSocket` *(package `TlsLib.Net`, `TlsLib.Net/src/`)* | The reference TCP `ITcpConnector` / `ITcpListener` (interfaces in `TlpINetSocket`) whose streams run a `TTlsConnection` directly; also the default `TSystemHostResolver` (the `IHostResolver` interface is in `TlpINetSocket`). |
+| `TlpEchConfigFromSvcb` *(package `TlsLib.Net`, `TlsLib.Net/src/`)* | Extracts the ECH config list from DNS HTTPS/SVCB RDATA (`TryFromServiceBinding`, or the raising `FromServiceBinding`). |
 | `TlsLib.Adapter.*` | The mORMot / Indy / Synapse / fcl-net drop-in adapters (package name is singular — `TlsLib.Adapter.mORMot`, `…Indy`, `…Synapse`, `…FclNet`). |
 
 See [Getting started](getting-started.md) for how to add these on Delphi and FPC/Lazarus.

@@ -16,7 +16,8 @@ unit TlpDer;
 interface
 
 uses
-  SysUtils;
+  SysUtils,
+  TlpBinaryPrimitives;
 
 type
   /// <summary>
@@ -34,7 +35,7 @@ type
     /// <summary>Whether the ALen bytes at AOffset equal the expected OID value bytes.</summary>
     class function OidMatches(const ADer: TBytes; AOffset, ALen: Int32;
       const AExpected: array of Byte): Boolean; static;
-    /// <summary>The DER length encoding of ALen (short form, or 0x81 / 0x82 long form).</summary>
+    /// <summary>The DER length encoding of ALen (short form, or the minimal long form 0x81-0x84).</summary>
     class function EncodeLength(ALen: Int32): TBytes; static;
     /// <summary>A tag-length-value: ATag, the encoded length of AContent, then AContent.</summary>
     class function Tlv(ATag: Byte; const AContent: TBytes): TBytes; static;
@@ -50,14 +51,15 @@ implementation
 class function TDer.ReadTlv(const ADer: TBytes; AOffset: Int32; out ATag: Byte;
   out AContentOffset, AContentLen, ANext: Int32): Boolean;
 var
-  LLen, LN, LI: Int32;
+  LLen: Int64;
+  LN, LI: Int32;
 begin
   Result := False;
   ATag := 0;
   AContentOffset := 0;
   AContentLen := 0;
   ANext := 0;
-  if (AOffset < 0) or (AOffset + 2 > System.Length(ADer)) then
+  if (AOffset < 0) or (Int64(AOffset) + 2 > System.Length(ADer)) then
     Exit;
   ATag := ADer[AOffset];
   LLen := ADer[AOffset + 1];
@@ -65,17 +67,24 @@ begin
     AContentOffset := AOffset + 2
   else
   begin
-    LN := LLen and $7F;
-    if (LN = 0) or (LN > 4) or (AOffset + 2 + LN > System.Length(ADer)) then
+    LN := Int32(LLen) and $7F;
+    if (LN = 0) or (LN > 4) or (Int64(AOffset) + 2 + LN > System.Length(ADer)) then
       Exit;
+    // accumulate in Int64 so a 4-byte length cannot wrap
     LLen := 0;
     for LI := 0 to LN - 1 do
       LLen := (LLen shl 8) or ADer[AOffset + 2 + LI];
+    // reject a non-minimal long form (X.690 10.1, DER)
+    if ((LN = 1) and (LLen < $80)) or ((LN >= 2) and (ADer[AOffset + 2] = 0)) then
+      Exit;
     AContentOffset := AOffset + 2 + LN;
   end;
-  AContentLen := LLen;
+  // a length whose content end would overflow Int32 is rejected, not wrapped into a passing range
+  if (LLen < 0) or (LLen > Int64(High(Int32)) - AContentOffset) then
+    Exit;
+  AContentLen := Int32(LLen);
   ANext := AContentOffset + AContentLen;
-  Result := (AContentLen >= 0) and (ANext <= System.Length(ADer));
+  Result := ANext <= System.Length(ADer);
 end;
 
 class function TDer.OidMatches(const ADer: TBytes; AOffset, ALen: Int32;
@@ -93,13 +102,22 @@ begin
 end;
 
 class function TDer.EncodeLength(ALen: Int32): TBytes;
+var
+  LWide: TBytes;
+  LN: Int32;
 begin
   if ALen < $80 then
-    Result := TBytes.Create(Byte(ALen))
-  else if ALen < $100 then
-    Result := TBytes.Create($81, Byte(ALen))
-  else
-    Result := TBytes.Create($82, Byte(ALen shr 8), Byte(ALen and $FF));
+    Exit(TBytes.Create(Byte(ALen)));
+  // long form: the fewest big-endian octets that hold the length (X.690 8.1.3.5, 10.1)
+  LWide := nil;
+  SetLength(LWide, 4);
+  TBinaryPrimitives.WriteUInt32BigEndian(LWide, 0, UInt32(ALen));
+  LN := 4;
+  while LWide[4 - LN] = 0 do
+    System.Dec(LN);
+  SetLength(Result, 1 + LN);
+  Result[0] := Byte($80 or LN);
+  System.Move(LWide[4 - LN], Result[1], LN);
 end;
 
 class function TDer.Tlv(ATag: Byte; const AContent: TBytes): TBytes;

@@ -25,7 +25,7 @@ package TlsLib.Crypto.System;
 {$IMAGEBASE $400000}
 {$DEFINE RELEASE}
 {$ENDIF IMPLICITBUILDING}
-{$DESCRIPTION 'Optional OS-native crypto acceleration facets for TlsLib4Pascal'}
+{$DESCRIPTION 'Optional OS-native crypto facets for TlsLib4Pascal'}
 {$RUNONLY}
 {$IMPLICITBUILD ON}
 
@@ -36,7 +36,11 @@ requires
 contains
   TlpSystemCryptoTypes in '..\..\src\TlpSystemCryptoTypes.pas',
   TlpICryptoBackendReport in '..\..\src\TlpICryptoBackendReport.pas',
+  TlpISystemSigningKey in '..\..\src\TlpISystemSigningKey.pas',
   TlpSystemCryptoExceptions in '..\..\src\TlpSystemCryptoExceptions.pas',
+  TlpHkdfComposition in '..\..\src\TlpHkdfComposition.pas',
+  TlpSignatureEncoding in '..\..\src\TlpSignatureEncoding.pas',
+  TlpEcPrivateScalar in '..\..\src\TlpEcPrivateScalar.pas',
   TlpSystemCryptoBase in '..\..\src\TlpSystemCryptoBase.pas',
   TlpWindowsSystemCrypto in '..\..\src\TlpWindowsSystemCrypto.pas',
   TlpSystemCryptoStrictness in '..\..\src\TlpSystemCryptoStrictness.pas',

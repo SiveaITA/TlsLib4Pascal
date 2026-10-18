@@ -18,9 +18,7 @@
 /// </summary>
 unit TlpTlsSignatureBuilder;
 
-{$IFDEF FPC}
-{$MODE DELPHI}
-{$ENDIF FPC}
+{$I ..\Include\TlsLib.inc}
 
 interface
 
@@ -31,16 +29,16 @@ uses
   TlpDataEncoding;
 
 type
-  /// <summary>A value type - build it on the stack, feed it, read Value. AProvider is only consulted
+  /// <summary>A value type - build it on the stack, feed it, read Value. ACryptoProvider is only consulted
   /// by AddBytesDigest (in-memory byte inputs); pass nil when only files/scalars are contributed.</summary>
   TTlsSignatureBuilder = record
   strict private
   var
-    FProvider: ICryptoProvider;
+    FCrypto: ICryptoProvider;
     FBuffer: string;
     procedure Append(const APart: string);
   public
-    class function Create(const AProvider: ICryptoProvider): TTlsSignatureBuilder; static;
+    class function Create(const ACryptoProvider: ICryptoProvider): TTlsSignatureBuilder; static;
     procedure AddText(const AName, AValue: string);
     procedure AddFlag(const AName: string; AValue: Boolean);
     procedure AddCardinal(const AName: string; AValue: Cardinal);
@@ -55,8 +53,8 @@ type
     /// <summary>Identity of an of-object callback (its code+data pair); see AddPointer's rule.</summary>
     procedure AddMethod(const AName: string; const AMethod: TMethod);
     /// <summary>A file by path + size + mtime - a stat, never a read; a rotated file changes it.
-    /// FPC/Unix mtime is second-granularity, so a same-size in-place rewrite within one second of
-    /// the last can be missed.</summary>
+    /// A filesystem timestamp can be as coarse as one second, so a same-size in-place rewrite
+    /// within a second of the last can be missed.</summary>
     procedure AddFile(const AName, APath: string);
     /// <summary>An in-memory byte input by its SHA-256 (needs a provider); empty is a stable marker.</summary>
     procedure AddBytesDigest(const AName: string; const AData: TBytes);
@@ -75,9 +73,9 @@ const
 { TTlsSignatureBuilder }
 
 class function TTlsSignatureBuilder.Create(
-  const AProvider: ICryptoProvider): TTlsSignatureBuilder;
+  const ACryptoProvider: ICryptoProvider): TTlsSignatureBuilder;
 begin
-  Result.FProvider := AProvider;
+  Result.FCrypto := ACryptoProvider;
   Result.FBuffer := '';
 end;
 
@@ -140,7 +138,7 @@ begin
     Append(AName + PairSep + '<empty>');
     Exit;
   end;
-  LHash := FProvider.Primitives.CreateHash(THashAlgorithm.SHA_256);
+  LHash := FCrypto.Primitives.CreateHash(THashAlgorithm.SHA_256);
   LHash.Update(AData, 0, System.Length(AData));
   LDigest := LHash.DoFinal;
   Append(AName + PairSep + TDataEncoding.HexEncode(LDigest));

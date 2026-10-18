@@ -45,7 +45,6 @@ type
     procedure Update(const AData: TBytes; AOffset, ALength: Int32); overload;
     procedure Activate(const AHash: IHash);
     function IsActive: Boolean;
-    procedure ReplaceWithMessageHash(const AFreshHash: IHash);
     procedure SeedWithMessageHash(const AFreshHash: IHash; const ACh1Hash: TBytes);
     function CurrentHash: TBytes;
     function HashPrefixExcludingBinders(const APartialClientHello: TBytes): TBytes;
@@ -56,7 +55,7 @@ type
 implementation
 
 const
-  MessageHashType = Byte(254); // the message_hash handshake type (RFC 8446 4.4.1)
+  MessageHashType = Byte(254); // the message_hash handshake type (RFC 9846 4.1)
 
 resourcestring
   SAlreadyActive = 'the transcript hash is already bound to a hash';
@@ -107,14 +106,6 @@ end;
 function TTranscriptHash.IsActive: Boolean;
 begin
   Result := FHash <> nil;
-end;
-
-procedure TTranscriptHash.ReplaceWithMessageHash(const AFreshHash: IHash);
-begin
-  if FHash = nil then
-    raise EInvalidOperationTlsLibException.CreateRes(@SNotActive);
-  // snapshot Hash(ClientHello1) before restarting from the fresh hash
-  SeedWithMessageHash(AFreshHash, FHash.Clone.DoFinal);
 end;
 
 procedure TTranscriptHash.SeedWithMessageHash(const AFreshHash: IHash;

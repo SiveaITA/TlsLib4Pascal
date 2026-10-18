@@ -73,12 +73,6 @@ def load_run(path):
         return {}
 
 
-def load_tests(path):
-    # {name: result}, each result a dict with actual / expected / is_unexpected / error
-    # (see testresult.go). Returning the whole dict keeps the error string for the fail-open check.
-    return load_run(path).get("tests", {})
-
-
 def actual(result):
     return result.get("actual", "")
 
@@ -105,27 +99,31 @@ def cmd_gate(config_path, gate_path, audit_path):
     out_of_scope = globs_for(disabled, "[out-of-scope]")
     policy = globs_for(disabled, "[policy-difference]")
     deferred = globs_for(disabled, "[deferred]")
-    force_run = globs_for(disabled, *FORCE_RUN_BUCKETS)  # policy + deferred
+    force_run = globs_for(disabled, *FORCE_RUN_BUCKETS)  # policy-difference only
     untagged = [g for g in disabled if not any(disabled[g].startswith(t) for t in BUCKETS)]
 
     gate_run = load_run(gate_path)
     gate = gate_run.get("tests", {})
-    audit = load_tests(audit_path)
+    audit_run = load_run(audit_path)
+    audit = audit_run.get("tests", {})
     # BoGo sets interrupted=True when the run was cut short (signal / abort) - a precise
-    # truncation signal that needs no magic count. A missing/corrupt file loads as {} -> True.
-    interrupted = bool(gate_run.get("interrupted", True))
+    # truncation signal that needs no magic count. A missing/corrupt gate file loads as {} -> True.
+    # The audit file may be the empty stub run-bogo.sh writes when nothing is force-run, so it
+    # counts only when it says it was cut short
+    interrupted = bool(gate_run.get("interrupted", True)) or bool(audit_run.get("interrupted", False))
 
     passed = sorted(n for n, r in gate.items() if actual(r) == "PASS")
-    # genuine TLS 1.0/1.1 tests that failed/were-skipped are out of scope (not unexpected)
+    # out-of-scope old-version results, unless the shim accepted what it must reject
     old_version = sorted(n for n, r in gate.items()
-                         if actual(r) in ("FAIL", "SKIP") and is_old_version(n))
+                         if actual(r) in ("FAIL", "SKIP") and is_old_version(n)
+                         and not r.get("error", "").lstrip().startswith("unexpected success"))
     old_set = set(old_version)
     failed = sorted(n for n, r in gate.items() if actual(r) == "FAIL" and n not in old_set)
     # no -allow-unimplemented on the gate pass, so an unimplemented in-scope test is a SKIP
     unimplemented = sorted(n for n, r in gate.items()
                            if actual(r) == "SKIP" and n not in old_set)
 
-    # stale: a force-run disable (policy OR deferred) that now PASSES (its reason is gone)
+    # stale: a force-run [policy-difference] disable that now PASSES (its reason is gone)
     stale = sorted(n for n, r in audit.items()
                    if actual(r) == "PASS" and matches_any(n, force_run))
     # dead: a force-run glob that matched no force-run test (renamed/removed test)
@@ -150,8 +148,10 @@ def cmd_gate(config_path, gate_path, audit_path):
           f"-> out-of-scope {len(out_of_scope)}, "
           f"policy-difference {len(policy)}, deferred {len(deferred)}")
     print(f"  DISABLED old TLS 1.0/1.1 (RFC 8996, by rule): {len(old_version)}")
+    still_differ = sum(1 for r in audit.values()
+                       if actual(r) == "FAIL" and not is_fail_open(r))
     print(f"  policy-difference disables force-run this gate: "
-          f"{sum(1 for n in audit)} re-confirmed still-differ")
+          f"{still_differ} re-confirmed still-differ")
     print("  NOTE: [deferred]/[out-of-scope] globs are NOT force-run (an unsupported scheme "
           "passes a negative test spuriously); a fully-dead one is not auto-detected (no test list).")
     print("--------------------------------------------------------------------")

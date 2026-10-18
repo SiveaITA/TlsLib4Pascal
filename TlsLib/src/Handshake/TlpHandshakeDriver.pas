@@ -19,10 +19,12 @@ uses
   SysUtils,
   TlpICryptoProvider,
   TlpIRecordProtection,
+  TlpIKeySchedule,
   TlpTlsVersion,
   TlpRecordProtectionFactory,
   TlpITlsEngine,
   TlpTlsAlert,
+  TlpTlsLibExceptions,
   TlpIHandshakeChannel,
   TlpIHandshakeMachine,
   TlpHandshakeEffect;
@@ -32,7 +34,7 @@ type
   /// Applies the pure state machine's effects to the real world: it frames and
   /// sends handshake messages (and the middlebox CCS) through the channel, turns
   /// an epoch's derived traffic keys into installed record protection (via the
-  /// factory into the P1 record layer), and reports events, completion, cert
+  /// factory into the record layer), and reports events, completion, cert
   /// verdicts, and failures to the sink. The state machine has already resolved
   /// which traffic secret each install uses; the driver only frames, builds, and
   /// installs.
@@ -42,7 +44,7 @@ type
   var
     FChannel: IHandshakeChannel;
     FInstaller: IRecordEpochInstaller;
-    FProvider: ICryptoProvider;
+    FCrypto: ICryptoProvider;
     FSink: IHandshakeSink;
     // resolved once from the sink; nil when the sink does not track the version
     FVersionSink: IHandshakeVersionSink;
@@ -51,10 +53,12 @@ type
     // resolved once from the sink; nil when the sink does not track connection info
     FConnectionInfoSink: IHandshakeConnectionInfoSink;
     FEchStatusSink: IEchStatusSink;
+    // resolved once from the sink; nil when the sink does not handle warning alerts
+    FWarningAlertSink: IWarningAlertSink;
     procedure ApplyInstallKeys(const AEffect: THandshakeEffect);
   public
     constructor Create(const AChannel: IHandshakeChannel;
-      const AInstaller: IRecordEpochInstaller; const AProvider: ICryptoProvider;
+      const AInstaller: IRecordEpochInstaller; const ACryptoProvider: ICryptoProvider;
       const ASink: IHandshakeSink);
 
     procedure Apply(const AEffect: THandshakeEffect);
@@ -63,16 +67,19 @@ type
 
 implementation
 
+resourcestring
+  SVerdictUndeliverable = 'the handshake parked for a certificate verdict that nothing can deliver';
+
 { THandshakeDriver }
 
 constructor THandshakeDriver.Create(const AChannel: IHandshakeChannel;
-  const AInstaller: IRecordEpochInstaller; const AProvider: ICryptoProvider;
+  const AInstaller: IRecordEpochInstaller; const ACryptoProvider: ICryptoProvider;
   const ASink: IHandshakeSink);
 begin
   inherited Create;
   FChannel := AChannel;
   FInstaller := AInstaller;
-  FProvider := AProvider;
+  FCrypto := ACryptoProvider;
   FSink := ASink;
   if not Supports(ASink, IHandshakeVersionSink, FVersionSink) then
     FVersionSink := nil;
@@ -82,6 +89,8 @@ begin
     FConnectionInfoSink := nil;
   if not Supports(ASink, IEchStatusSink, FEchStatusSink) then
     FEchStatusSink := nil;
+  if not Supports(ASink, IWarningAlertSink, FWarningAlertSink) then
+    FWarningAlertSink := nil;
 end;
 
 procedure THandshakeDriver.ApplyInstallKeys(const AEffect: THandshakeEffect);
@@ -92,9 +101,10 @@ begin
   // driver needs no up-front suite (a live client does not know the version or suite
   // until the ServerHello)
   LProtection := TRecordProtectionFactory.Build(AEffect.Version, AEffect.Keys,
-    FProvider.Primitives.CreateAead(AEffect.Aead));
-  // the negotiated version rides every key install; surface it for connection info
-  if FVersionSink <> nil then
+    FCrypto.Primitives.CreateAead(AEffect.Aead));
+  // the negotiated version rides every key install; surface it for connection info, except on the
+  // early-data install, whose version is not negotiated (the hello effect or handshake install reports it)
+  if (FVersionSink <> nil) and (AEffect.Epoch <> TTlsEpoch.EarlyData) then
     FVersionSink.OnVersionNegotiated(AEffect.Version);
   if AEffect.Side = TRecordSide.ReadSide then
   begin
@@ -107,7 +117,7 @@ begin
       FInstaller.InstallReadProtection(LProtection);
   end
   else
-    FInstaller.InstallWriteProtection(LProtection);
+    FInstaller.InstallWriteProtection(LProtection, AEffect.Epoch);
 end;
 
 procedure THandshakeDriver.Apply(const AEffect: THandshakeEffect);
@@ -119,38 +129,49 @@ begin
       FChannel.SendChangeCipherSpec;
     THandshakeEffectKind.InstallKeys:
       ApplyInstallKeys(AEffect);
+    THandshakeEffectKind.NegotiatedVersion:
+      if FVersionSink <> nil then
+        FVersionSink.OnVersionNegotiated(AEffect.Version);
     THandshakeEffectKind.SelectAlpn:
-      FSink.OnAlpnSelected(AEffect.Text);
+      FSink.OnAlpnSelected(AEffect.Bytes);
     THandshakeEffectKind.PeerOcspStaple:
       FSink.OnOcspStapleReceived(AEffect.Bytes);
     THandshakeEffectKind.SetRecordSizeLimit:
       FInstaller.SetRecordSizeLimit(AEffect.Outbound, AEffect.Inbound);
     THandshakeEffectKind.SkipEarlyData:
-      FInstaller.SetEarlyDataSkip(AEffect.Inbound);
+      FInstaller.SetEarlyDataSkip(AEffect.MaxBytes);
     THandshakeEffectKind.SetEarlyDataLimit:
-      FInstaller.SetEarlyDataLimit(AEffect.Outbound);
+      FInstaller.SetEarlyDataLimit(AEffect.MaxBytes);
     THandshakeEffectKind.RevertWriteToPlaintext:
       FInstaller.RevertWriteToPlaintext;
     THandshakeEffectKind.SetEarlyReadEpoch:
-      FInstaller.SetEarlyReadEpoch(AEffect.Resumed);
+      FInstaller.SetEarlyReadEpoch(AEffect.Active, AEffect.MaxBytes);
     THandshakeEffectKind.RaiseEvent:
       FSink.OnHandshakeEvent(AEffect.Event);
     THandshakeEffectKind.AwaitCertificateVerdict:
-      // a sink that does not handle async verdicts never sees this effect, because the
-      // machine emits it only when async verdicts were enabled through the config
+      // the machine emits this only when async verdicts were enabled through the config; a
+      // sink that cannot carry the park would leave the handshake parked with nothing able to
+      // resume it, so it fails closed instead of wedging
       if FVerdictSink <> nil then
-        FVerdictSink.OnCertificateVerdictNeeded(AEffect.Chain, AEffect.Text,
-          AEffect.Bytes);
+        FVerdictSink.OnCertificateVerdictNeeded(AEffect.Chain, AEffect.ValidatedPath,
+          AEffect.HostName, AEffect.Staple, AEffect.RevocationPosture)
+      else
+        FSink.OnHandshakeFailed(TTlsAlertDescription.InternalError, SVerdictUndeliverable);
     THandshakeEffectKind.PeerCertificateChain:
       if FConnectionInfoSink <> nil then
-        FConnectionInfoSink.OnPeerCertificateChain(AEffect.Chain);
+        FConnectionInfoSink.OnPeerCertificateChain(AEffect.Chain, AEffect.ValidatedPath);
     THandshakeEffectKind.RequestedCertificateAuthorities:
       if FConnectionInfoSink <> nil then
-        FConnectionInfoSink.OnRequestedCertificateAuthorities(AEffect.Chain);
+        FConnectionInfoSink.OnRequestedCertificateAuthorities(AEffect.Authorities,
+          AEffect.Schemes);
+    THandshakeEffectKind.PskIdentity:
+      if FConnectionInfoSink <> nil then
+        FConnectionInfoSink.OnPskIdentity(AEffect.Identity);
     THandshakeEffectKind.ConnectionParams:
       if FConnectionInfoSink <> nil then
         FConnectionInfoSink.OnConnectionParams(AEffect.CipherSuite,
-          AEffect.NamedGroup, AEffect.Resumed, AEffect.ServerName);
+          AEffect.NamedGroup, AEffect.Resumed, AEffect.ExtendedMasterSecret,
+          AEffect.ServerName, AEffect.Facts);
     THandshakeEffectKind.HandshakeEstablished:
       FSink.OnHandshakeEstablished;
     THandshakeEffectKind.EchAccepted:
@@ -167,11 +188,16 @@ begin
         FEchStatusSink.OnEchServerRejected;
     THandshakeEffectKind.EchRejected:
       if FEchStatusSink <> nil then
-        FEchStatusSink.OnEchRejected(AEffect.Bytes, AEffect.Resumed)
+        FEchStatusSink.OnEchRejected(AEffect.RetryConfigs, AEffect.IsRetry)
       else
-        FSink.OnHandshakeFailed(TTlsAlertDescription.EchRequired);
+        FSink.OnHandshakeFailed(TTlsAlertDescription.EchRequired, SEchRejected);
+    THandshakeEffectKind.SendWarningAlert:
+      // a sink that does not handle warning alerts never sees this effect; only the engine
+      // bridge does, and it writes the alert under the current epoch and stays live
+      if FWarningAlertSink <> nil then
+        FWarningAlertSink.OnWarningAlert(AEffect.Alert);
     THandshakeEffectKind.Fail:
-      FSink.OnHandshakeFailed(AEffect.Alert);
+      FSink.OnHandshakeFailed(AEffect.Alert, AEffect.Reason);
   end;
 end;
 

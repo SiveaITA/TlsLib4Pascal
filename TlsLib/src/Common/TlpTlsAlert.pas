@@ -16,7 +16,7 @@ unit TlpTlsAlert;
 interface
 
 type
-  /// <summary>TLS alert level (RFC 8446).</summary>
+  /// <summary>TLS alert level (RFC 9846).</summary>
   TTlsAlertLevel = (Warning = 1, Fatal = 2);
 
   /// <summary>The on-wire byte for an alert level.</summary>
@@ -27,7 +27,7 @@ type
   end;
 
   /// <summary>
-  /// TLS alert description (RFC 8446). The ordinal is the on-wire code, so Ord()
+  /// TLS alert description (RFC 9846). The ordinal is the on-wire code, so Ord()
   /// yields the byte directly. The enum is sparse - use the round-trip helpers
   /// rather than casting a raw byte.
   /// </summary>
@@ -52,12 +52,14 @@ type
     InternalError = 80,
     InappropriateFallback = 86,
     UserCanceled = 90,
+    NoRenegotiation = 100,
     MissingExtension = 109,
     UnsupportedExtension = 110,
     UnrecognizedName = 112,
     BadCertificateStatusResponse = 113,
     UnknownPskIdentity = 115,
     CertificateRequired = 116,
+    GeneralError = 117,
     NoApplicationProtocol = 120,
     EchRequired = 121);
 
@@ -131,12 +133,14 @@ begin
     80: ADescription := TTlsAlertDescription.InternalError;
     86: ADescription := TTlsAlertDescription.InappropriateFallback;
     90: ADescription := TTlsAlertDescription.UserCanceled;
+    100: ADescription := TTlsAlertDescription.NoRenegotiation;
     109: ADescription := TTlsAlertDescription.MissingExtension;
     110: ADescription := TTlsAlertDescription.UnsupportedExtension;
     112: ADescription := TTlsAlertDescription.UnrecognizedName;
     113: ADescription := TTlsAlertDescription.BadCertificateStatusResponse;
     115: ADescription := TTlsAlertDescription.UnknownPskIdentity;
     116: ADescription := TTlsAlertDescription.CertificateRequired;
+    117: ADescription := TTlsAlertDescription.GeneralError;
     120: ADescription := TTlsAlertDescription.NoApplicationProtocol;
     121: ADescription := TTlsAlertDescription.EchRequired;
   else

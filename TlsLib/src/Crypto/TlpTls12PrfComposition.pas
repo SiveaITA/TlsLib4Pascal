@@ -21,6 +21,7 @@ uses
   TlpCryptoDomainTypes,
   TlpICryptoProvider,
   TlpISecretBuffer,
+  TlpSecretBuffer,
   TlpSecureMemory;
 
 type
@@ -39,7 +40,7 @@ type
   public
     constructor Create(const APrimitives: ICryptoPrimitives; AHash: THashAlgorithm);
     function Compute(const ASecret: ISecretBuffer; const ALabel: string;
-      const ASeed: TBytes; ALength: Int32): TBytes;
+      const ASeed: TBytes; ALength: Int32): ISecretBuffer;
   end;
 
 implementation
@@ -55,10 +56,11 @@ begin
 end;
 
 function TTls12PrfComposition.Compute(const ASecret: ISecretBuffer;
-  const ALabel: string; const ASeed: TBytes; ALength: Int32): TBytes;
+  const ALabel: string; const ASeed: TBytes; ALength: Int32): ISecretBuffer;
 var
-  LSeed, LA, LBlock: TBytes;
+  LSeed, LA, LBlock, LInput, LNext: TBytes;
   LPos, LCopy: Int32;
+  LOut: PByte;
 
   function HmacOf(const AData: TBytes): TBytes;
   var
@@ -71,24 +73,36 @@ var
   end;
 
 begin
-  Result := nil;
-  SetLength(Result, ALength);
+  // the PRF output is key material (master secret, key block), so it lands in a wiped buffer
+  // rather than a bare byte array the caller must scrub
+  Result := TSecretBuffer.Allocate(ALength);
+  LOut := Result.DataPtr;
   LSeed := TArrayUtilities.Concat(TEncoding.ASCII.GetBytes(ALabel), ASeed);
-  LA := LSeed; // A(0) = seed
   try
+    LA := HmacOf(LSeed); // A(1) = HMAC(secret, seed); computed so LA never aliases the seed
     LPos := 0;
     while LPos < ALength do
     begin
-      LA := HmacOf(LA); // A(i) = HMAC(secret, A(i-1))
-      LBlock := HmacOf(TArrayUtilities.Concat(LA, LSeed));
+      LInput := TArrayUtilities.Concat(LA, LSeed);
+      try
+        LBlock := HmacOf(LInput);
+      finally
+        TSecureMemory.WipeBytes(LInput);
+      end;
       try
         LCopy := System.Length(LBlock);
         if LCopy > ALength - LPos then
           LCopy := ALength - LPos;
-        Move(LBlock[0], Result[LPos], LCopy);
+        Move(LBlock[0], (LOut + LPos)^, LCopy);
         Inc(LPos, LCopy);
       finally
         TSecureMemory.WipeBytes(LBlock);
+      end;
+      if LPos < ALength then
+      begin
+        LNext := HmacOf(LA); // A(i+1) = HMAC(secret, A(i))
+        TSecureMemory.WipeBytes(LA);
+        LA := LNext;
       end;
     end;
   finally

@@ -30,7 +30,7 @@ type
   /// per leaf certificate - an EC P-256 leaf (ECDSA CertificateVerify) and an RSA-2048 leaf
   /// (RSA-PSS CertificateVerify in 1.3, ECDHE-RSA in 1.2), the Let's-Encrypt-style case that
   /// the EC-only rows never exercised. An ECDSA leaf also offers its own curve in
-  /// supported_groups (RFC 8422 5.4). Peer verification is disabled, so the figure reflects
+  /// supported_groups (RFC 8422 5.3). Peer verification is disabled, so the figure reflects
   /// the handshake proper (ECDHE key exchange + the certificate signature) rather than PKIX.
   ///
   /// Caveat by design: the handshake cost is dominated by the asymmetric crypto, which
@@ -52,7 +52,9 @@ uses
   TlpNegotiationTypes,
   TlpCryptoDomainTypes,
   TlpICryptoProvider,
+  TlpIPkixProvider,
   TlpDefaultCryptoProvider,
+  TlpDefaultPkixProvider,
   TlsBenchmarkData,
   TlsLibHandshakePeer,
   OpenSslHandshakePeer;
@@ -83,7 +85,8 @@ type
 
 class function TTlsHandshakeBenchmark.Run(ALogProc: TBenchmarkLogProc): Int32;
 var
-  LProvider: ICryptoProvider;
+  LCrypto: ICryptoProvider;
+  LPkix: IPkixProvider;
   LCredential: TTlsBenchmarkCredential;
   LOpenSslAvailable: Boolean;
   LDeferred: TArray<string>;
@@ -120,15 +123,15 @@ var
   end;
 
   // the leaf's own curve, read from the certificate, so the OpenSSL groups list can include
-  // it (RFC 8422 5.4) exactly as the TlsLib peer does; 0 for a non-ECDSA leaf
+  // it (RFC 8422 5.3) exactly as the TlsLib peer does; 0 for a non-ECDSA leaf
   function CertGroupCode: UInt16;
   var
-    LKind: TCertKeyKind;
+    LKind: TSignatureKeyKind;
     LCurve: UInt16;
   begin
     Result := 0;
-    if LProvider.Certificates.KeyKind(LCredential.LeafCertDer, LKind, LCurve)
-      and (LKind = TCertKeyKind.Ecdsa) then
+    if LPkix.Certificates.KeyKind(LCredential.LeafCertDer, LKind, LCurve)
+      and (LKind = TSignatureKeyKind.Ecdsa) then
       Result := LCurve;
   end;
 
@@ -139,7 +142,7 @@ var
   begin
     Result := -1.0;
     try
-      LPeer := TTlsLibHandshakePeer.Create(LProvider, LCredential, AWire, ACurve);
+      LPeer := TTlsLibHandshakePeer.Create(LCrypto, LPkix, LCredential, AWire, ACurve);
       try
         for LWarm := 1 to BENCH_HS_WARMUP do
           LPeer.RunOneHandshake;
@@ -178,7 +181,8 @@ var
 
 begin
   Result := BENCH_LABEL_COL_WIDTH + 5 * BENCH_HS_VALUE_COL_WIDTH;
-  LProvider := TDefaultCryptoProvider.Create as ICryptoProvider;
+  LCrypto := TDefaultCryptoProvider.Create as ICryptoProvider;
+  LPkix := TDefaultPkixProvider.Create as IPkixProvider;
   LOpenSslAvailable := TOpenSslHandshakePeer.IsAvailable;
   LDeferred := nil;
 

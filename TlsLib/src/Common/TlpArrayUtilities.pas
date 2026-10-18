@@ -38,11 +38,20 @@ type
     /// data. The constant-time twin is
     /// <see cref="TSecureMemory.ConstantTimeAreEqual" />.</summary>
     class function AreEqual(const AA, AB: TBytes): Boolean; static;
+    /// <summary>Unsigned byte-wise lexicographic order: negative, zero or positive as AA sorts
+    /// before, equal to or after AB. A shorter array that is a prefix of a longer one sorts
+    /// first. The constant-time twin is
+    /// <see cref="TSecureMemory.ConstantTimeCompareLexicographic" />.</summary>
+    class function CompareLexicographic(const AA, AB: TBytes): Int32; static;
 
     /// <summary>Appends AValue, growing AItems by one.</summary>
     class procedure Append<T>(var AItems: TArray<T>; const AValue: T); static;
     /// <summary>A fresh array holding every element of AA followed by AB.</summary>
     class function Concat<T>(const AA, AB: TArray<T>): TArray<T>; overload; static;
+    /// <summary>A deep copy of an array of arrays: a new outer array whose every inner array is
+    /// itself copied, so the result shares no storage with A (unlike a shallow System.Copy, which
+    /// copies only the outer array and leaves the inner arrays aliased).</summary>
+    class function DeepCopy<T>(const A: TArray<TArray<T>>): TArray<TArray<T>>; static;
     /// <summary>Removes every element whose key equals AKey, compacting in place.</summary>
     class procedure RemoveKey<T, TKey>(var AItems: TArray<T>;
       const AKeyOf: TKeyOf<T, TKey>; const AKey: TKey); static;
@@ -52,9 +61,6 @@ type
     /// <summary>The index of the first element whose key is AKey, or -1.</summary>
     class function IndexOfKey<T, TKey>(const AItems: TArray<T>;
       const AKeyOf: TKeyOf<T, TKey>; const AKey: TKey): Int32; static;
-    /// <summary>Whether any element's key is AKey.</summary>
-    class function ContainsKey<T, TKey>(const AItems: TArray<T>;
-      const AKeyOf: TKeyOf<T, TKey>; const AKey: TKey): Boolean; static;
   end;
 
 implementation
@@ -94,6 +100,23 @@ begin
   Result := True;
 end;
 
+class function TArrayUtilities.CompareLexicographic(const AA, AB: TBytes): Int32;
+var
+  LI, LCommon: Int32;
+begin
+  LCommon := System.Length(AA);
+  if System.Length(AB) < LCommon then
+    LCommon := System.Length(AB);
+  for LI := 0 to LCommon - 1 do
+    if AA[LI] <> AB[LI] then
+    begin
+      if AA[LI] < AB[LI] then
+        Exit(-1);
+      Exit(1);
+    end;
+  Result := System.Length(AA) - System.Length(AB);
+end;
+
 class procedure TArrayUtilities.Append<T>(var AItems: TArray<T>; const AValue: T);
 begin
   SetLength(AItems, Length(AItems) + 1);
@@ -112,6 +135,17 @@ begin
     Result[LI] := AA[LI];
   for LI := 0 to LLenB - 1 do
     Result[LLenA + LI] := AB[LI];
+end;
+
+class function TArrayUtilities.DeepCopy<T>(
+  const A: TArray<TArray<T>>): TArray<TArray<T>>;
+var
+  LI: Int32;
+begin
+  Result := nil;
+  SetLength(Result, System.Length(A));
+  for LI := 0 to System.High(A) do
+    Result[LI] := System.Copy(A[LI]);
 end;
 
 class procedure TArrayUtilities.RemoveKey<T, TKey>(var AItems: TArray<T>;
@@ -155,12 +189,6 @@ begin
   for LI := 0 to Length(AItems) - 1 do
     if LComparer.Equals(AKeyOf(AItems[LI]), AKey) then
       Exit(LI);
-end;
-
-class function TArrayUtilities.ContainsKey<T, TKey>(const AItems: TArray<T>;
-  const AKeyOf: TKeyOf<T, TKey>; const AKey: TKey): Boolean;
-begin
-  Result := IndexOfKey<T, TKey>(AItems, AKeyOf, AKey) >= 0;
 end;
 
 class function TArrayUtilities.Concat(const AArrays: array of TBytes): TBytes;

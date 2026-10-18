@@ -17,7 +17,6 @@ interface
 
 uses
   SysUtils,
-  TlpArrayUtilities,
   TlpTlsLibExceptions,
   TlpWireReader,
   TlpWireVectorMarker,
@@ -25,9 +24,10 @@ uses
   TlpWireWriter;
 
 type
-  /// <summary>The handshake message types (RFC 8446 4; RFC 5246 7.4 for the
+  /// <summary>The handshake message types (RFC 9846 4; RFC 5246 7.4 for the
   /// TLS 1.2-only ServerKeyExchange / ServerHelloDone / ClientKeyExchange).</summary>
   TTlsHandshakeType = (
+    HelloRequest = 0,
     ClientHello = 1,
     ServerHello = 2,
     NewSessionTicket = 4,
@@ -77,13 +77,17 @@ type
   /// record layer delivers: a message may span several fragments and several
   /// messages may be coalesced in one. Bounded - a declared body length beyond
   /// MaxMessageLength is a fatal decode_error before any of it is buffered
-  /// (RFC 8446, DoS resistance). Single-threaded; the caller serializes.
+  /// (a local DoS bound). Single-threaded; the caller serializes.
   /// </summary>
   THandshakeMessageReader = class sealed(TObject)
   strict private
   var
+    // un-consumed bytes are [FHead, FTail); keeps small-fragment reassembly linear
     FBuffer: TBytes;
+    FHead: Int32;
+    FTail: Int32;
     FMaxMessageLength: Int32;
+    FMaxCertificateMessageLength: Int32;
     FMaxTotalLength: Int32;
   public
     constructor Create;
@@ -99,7 +103,14 @@ type
     function HasPartial: Boolean;
 
     /// <summary>The largest handshake message body accepted (default 2^16).</summary>
-    property MaxMessageLength: Int32 read FMaxMessageLength write FMaxMessageLength;
+    property MaxMessageLength: Int32 read FMaxMessageLength;
+    /// <summary>The largest Certificate-message body accepted, so a caller's configured chain
+    /// budget bounds the uncompressed Certificate the same way the compressed path is bounded.
+    /// Applies only to the Certificate and CompressedCertificate handshake types; every other
+    /// message keeps MaxMessageLength.
+    /// Defaults to MaxMessageLength.</summary>
+    property MaxCertificateMessageLength: Int32 read FMaxCertificateMessageLength
+      write FMaxCertificateMessageLength;
     /// <summary>The hard cap on un-consumed reassembly bytes (anti-DoS, default 2^17).</summary>
     property MaxTotalLength: Int32 read FMaxTotalLength write FMaxTotalLength;
   end;
@@ -111,11 +122,16 @@ const
 
 implementation
 
+const
+  ReassemblyMinCapacity = Int32(1024);
+  ReassemblyRetainCapacity = Int32(1 shl 16);
+
 resourcestring
   SHandshakeMessageTooLong =
     'handshake message body of %d byte(s) exceeds the %d-byte cap';
   SHandshakeReassemblyOverflow =
     'buffered handshake bytes (%d) exceed the %d-byte reassembly cap';
+  SHandshakeSliceOutOfRange = 'handshake input slice is outside the supplied buffer';
 
 { TTlsHandshakeTypeHelper }
 
@@ -129,6 +145,8 @@ class function TTlsHandshakeTypeHelper.TryFromByte(AValue: Byte;
 begin
   Result := True;
   case AValue of
+    0:
+      AType := TTlsHandshakeType.HelloRequest;
     1:
       AType := TTlsHandshakeType.ClientHello;
     2:
@@ -159,8 +177,8 @@ begin
       AType := TTlsHandshakeType.KeyUpdate;
     25:
       AType := TTlsHandshakeType.CompressedCertificate;
-    254:
-      AType := TTlsHandshakeType.MessageHash;
+    // message_hash (254) is a synthetic transcript-only type (RFC 9846 4.1) that must never
+    // arrive on the wire, so it is intentionally not decodable here
   else
     Result := False;
   end;
@@ -189,20 +207,53 @@ constructor THandshakeMessageReader.Create;
 begin
   inherited Create;
   FBuffer := nil;
+  FHead := 0;
+  FTail := 0;
   FMaxMessageLength := DefaultMaxHandshakeMessageLength;
+  FMaxCertificateMessageLength := DefaultMaxHandshakeMessageLength;
   FMaxTotalLength := DefaultMaxHandshakeReassembly;
 end;
 
 procedure THandshakeMessageReader.Append(const AData: TBytes;
   AOffset, ALength: Int32);
+var
+  LLive, LNeed, LCap: Int32;
 begin
   if ALength <= 0 then
     Exit;
-  FBuffer := TArrayUtilities.Concat(FBuffer, System.Copy(AData, AOffset, ALength));
+  // a caller error, not a peer fault: reject rather than read past the slice
+  if (AOffset < 0) or (Int64(AOffset) + ALength > System.Length(AData)) then
+    raise EArgumentTlsLibException.CreateRes(@SHandshakeSliceOutOfRange);
+  LLive := FTail - FHead;
   // bound un-consumed reassembly so a flood of messages cannot grow it without limit
-  if System.Length(FBuffer) > FMaxTotalLength then
+  if Int64(LLive) + ALength > FMaxTotalLength then
     raise EDecodeErrorTlsLibException.CreateResFmt(@SHandshakeReassemblyOverflow,
-      [System.Length(FBuffer), FMaxTotalLength]);
+      [Int64(LLive) + ALength, FMaxTotalLength]);
+  if Int64(FTail) + ALength > System.Length(FBuffer) then
+  begin
+    // reclaim the consumed prefix before growing
+    if FHead > 0 then
+    begin
+      if LLive > 0 then
+        System.Move(FBuffer[FHead], FBuffer[0], LLive);
+      FHead := 0;
+      FTail := LLive;
+    end;
+    LNeed := FTail + ALength;
+    if LNeed > System.Length(FBuffer) then
+    begin
+      LCap := System.Length(FBuffer);
+      if LCap < ReassemblyMinCapacity then
+        LCap := ReassemblyMinCapacity;
+      if LCap <= High(Int32) div 2 then
+        LCap := LCap * 2;
+      if LCap < LNeed then
+        LCap := LNeed;
+      System.SetLength(FBuffer, LCap);
+    end;
+  end;
+  System.Move(AData[AOffset], FBuffer[FTail], ALength);
+  Inc(FTail, ALength);
 end;
 
 function THandshakeMessageReader.NextMessage(
@@ -210,30 +261,46 @@ function THandshakeMessageReader.NextMessage(
 var
   LReader: TWireReader;
   LTypeByte: Byte;
-  LBodyLength, LTotal: Int32;
+  LBodyLength, LCap, LTotal: Int32;
 begin
   Result := False;
-  if System.Length(FBuffer) < HandshakeHeaderLength then
+  if FTail - FHead < HandshakeHeaderLength then
     Exit; // not even a header yet
-  LReader := TWireReader.Create(FBuffer);
+  LReader := TWireReader.Create(FBuffer, FHead, FTail - FHead);
   LTypeByte := LReader.ReadUInt8;
   LBodyLength := Int32(LReader.ReadUInt24);
-  if LBodyLength > FMaxMessageLength then
+  // the Certificate message carries the peer chain, so it is bounded by the configured chain
+  // budget, and so is its compressed form (smaller, so within the same budget); every other
+  // message keeps the tighter default cap
+  if (LTypeByte = TTlsHandshakeType.Certificate.ToByte) or
+    (LTypeByte = TTlsHandshakeType.CompressedCertificate.ToByte) then
+    LCap := FMaxCertificateMessageLength
+  else
+    LCap := FMaxMessageLength;
+  if LBodyLength > LCap then
     raise EDecodeErrorTlsLibException.CreateResFmt(@SHandshakeMessageTooLong,
-      [LBodyLength, FMaxMessageLength]);
+      [LBodyLength, LCap]);
   if LReader.Remaining < LBodyLength then
     Exit; // the body spans fragments not yet received
   AMessage.TypeByte := LTypeByte;
   AMessage.Body := LReader.ReadBytes(LBodyLength);
   LTotal := HandshakeHeaderLength + LBodyLength;
-  AMessage.Raw := System.Copy(FBuffer, 0, LTotal);
-  FBuffer := System.Copy(FBuffer, LTotal, System.Length(FBuffer) - LTotal);
+  AMessage.Raw := System.Copy(FBuffer, FHead, LTotal);
+  Inc(FHead, LTotal);
+  if FHead = FTail then
+  begin
+    FHead := 0;
+    FTail := 0;
+    // do not pin a buffer sized for one large message
+    if System.Length(FBuffer) > ReassemblyRetainCapacity then
+      FBuffer := nil;
+  end;
   Result := True;
 end;
 
 function THandshakeMessageReader.HasPartial: Boolean;
 begin
-  Result := System.Length(FBuffer) > 0;
+  Result := FTail > FHead;
 end;
 
 end.

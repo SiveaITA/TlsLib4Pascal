@@ -34,6 +34,12 @@ type
   /// <summary>An operation was attempted while in an invalid state.</summary>
   EInvalidOperationTlsLibException = class(EBaseTlsLibException);
 
+  /// <summary>The write epoch reached its AEAD record usage limit and could not be rekeyed
+  /// (TLS 1.2 has no KeyUpdate); the connection was closed and further writes are refused. Any
+  /// bytes sealed before the limit are already on the wire, so the caller must treat this as a
+  /// truncated write - the peer sees a clean close after them.</summary>
+  ERecordLimitTlsLibException = class(EBaseTlsLibException);
+
   /// <summary>A requested capability is not supported.</summary>
   ENotSupportedTlsLibException = class(EBaseTlsLibException);
 
@@ -94,14 +100,16 @@ type
 
   /// <summary>
   /// A fatal TLS error raised out of the blocking stream pump: it carries the
-  /// structured alert and message the engine (or the peer) produced, so a host
-  /// adapter can map it onto its own error convention.
+  /// structured alert and message the engine (or the peer) produced, or a transport
+  /// failure's message with no alert, so a host adapter can map it onto its own error
+  /// convention.
   /// </summary>
   ETlsStreamError = class(EBaseTlsLibException)
   strict private
     FAlert: TTlsAlertDescription;
     FHasAlert: Boolean;
   public
+    /// <summary>Carries AError's alert; HasAlert is False when AError.Origin is Transport.</summary>
     constructor Create(const AError: TTlsError); overload;
     constructor Create(ADescription: TTlsAlertDescription;
       const AMessage: string); overload;
@@ -110,30 +118,45 @@ type
     /// meaningless. Used for truncation and timeout, which are transport events, not TLS
     /// alerts - stamping a placeholder alert here misreports them as an on-the-wire alert.</summary>
     constructor Create(const AMessage: string); overload;
-    /// <summary>The alert that was (or would be) sent; valid only when HasAlert.</summary>
+    constructor CreateRes(ADescription: TTlsAlertDescription;
+      AResStringRec: PResStringRec); overload;
+    constructor CreateResFmt(ADescription: TTlsAlertDescription;
+      AResStringRec: PResStringRec; const AArgs: array of const); overload;
+    /// <summary>The alert this side sent or would send, or the peer's for a peer-sent
+    /// error; valid only when HasAlert.</summary>
     property Alert: TTlsAlertDescription read FAlert;
     property HasAlert: Boolean read FHasAlert;
   end;
 
   /// <summary>
-  /// The peer closed the transport (EOF) with the exchange unfinished and without a
-  /// close_notify - a possible truncation attack (RFC 8446 6.1). Distinct from a clean
-  /// close_notify shutdown, which the stream surfaces as an ordinary EOF. On a server this
-  /// is usually benign - a client that walked away mid-handshake - and belongs at info level.
+  /// The peer ended the exchange before the handshake completed - a transport EOF, or a
+  /// close_notify (which is not a clean shutdown until the handshake completes). After the
+  /// handshake, only an EOF without close_notify is a truncation (RFC 9846 6.1); a clean
+  /// close_notify is surfaced as an ordinary EOF. On a server this is usually benign - a peer
+  /// that walked away mid-handshake - and belongs at info level.
   /// </summary>
   ETlsTransportTruncated = class(ETlsStreamError);
 
   /// <summary>
+  /// The host socket's receive timeout elapsed during an application read with the peer
+  /// sending nothing. Retryable: the connection is intact and nothing was lost, so a host
+  /// reports it as its own "try again" verdict - never as a truncation or a fatal error.
+  /// </summary>
+  ETlsReadTimeout = class(ETlsStreamError);
+
+  /// <summary>
   /// The adapter's handshake read timeout elapsed with the peer sending nothing - a silent
   /// or dead connection reaped. Distinct from ETlsTransportTruncated (a peer close): this is
-  /// "we timed out", that is "the client closed". Also benign on a server.
+  /// "we timed out", that is "the client closed". Also benign on a server. NOT retryable: the
+  /// handshake cannot be resumed on the same stream, so it is a sibling of ETlsReadTimeout, not
+  /// a kind of it.
   /// </summary>
   ETlsHandshakeTimeout = class(ETlsStreamError);
 
-implementation
-
 resourcestring
   SEchRejected = 'the server rejected Encrypted Client Hello';
+
+implementation
 
 { EFatalAlertTlsLibException }
 
@@ -180,7 +203,7 @@ constructor ETlsStreamError.Create(const AError: TTlsError);
 begin
   inherited Create(AError.Message);
   FAlert := AError.Alert.Description;
-  FHasAlert := True;
+  FHasAlert := AError.Origin <> TTlsErrorOrigin.Transport;
 end;
 
 constructor ETlsStreamError.Create(ADescription: TTlsAlertDescription;
@@ -195,6 +218,22 @@ constructor ETlsStreamError.Create(const AMessage: string);
 begin
   inherited Create(AMessage);
   FHasAlert := False;
+end;
+
+constructor ETlsStreamError.CreateRes(ADescription: TTlsAlertDescription;
+  AResStringRec: PResStringRec);
+begin
+  inherited CreateRes(AResStringRec);
+  FAlert := ADescription;
+  FHasAlert := True;
+end;
+
+constructor ETlsStreamError.CreateResFmt(ADescription: TTlsAlertDescription;
+  AResStringRec: PResStringRec; const AArgs: array of const);
+begin
+  inherited CreateResFmt(AResStringRec, AArgs);
+  FAlert := ADescription;
+  FHasAlert := True;
 end;
 
 end.

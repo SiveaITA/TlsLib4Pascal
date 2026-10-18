@@ -38,6 +38,7 @@ type
     procedure TestUnknownByteRejected;
     procedure TestCreateFatalHelper;
     procedure TestErrorCreateFatal;
+    procedure TestErrorCarriesOrigin;
   end;
 
 implementation
@@ -61,6 +62,7 @@ begin
   CheckRoundTrip(TTlsAlertDescription.BadRecordMac, 20);
   CheckRoundTrip(TTlsAlertDescription.HandshakeFailure, 40);
   CheckRoundTrip(TTlsAlertDescription.DecodeError, 50);
+  CheckRoundTrip(TTlsAlertDescription.NoRenegotiation, 100);
   CheckRoundTrip(TTlsAlertDescription.UnsupportedExtension, 110);
   CheckRoundTrip(TTlsAlertDescription.NoApplicationProtocol, 120);
 end;
@@ -79,7 +81,7 @@ procedure TTestAlert.TestUnknownByteRejected;
 var
   LDecoded: TTlsAlertDescription;
 begin
-  // 1 and 255 are not assigned RFC 8446 alert codes
+  // 1 and 255 are not assigned RFC 9846 alert codes
   CheckFalse(TTlsAlertDescription.TryFromByte(1, LDecoded), 'code 1 unknown');
   CheckFalse(TTlsAlertDescription.TryFromByte(255, LDecoded), 'code 255 unknown');
 end;
@@ -104,6 +106,20 @@ begin
   CheckEquals(Ord(TTlsAlertDescription.HandshakeFailure),
     Ord(LError.Alert.Description), 'description');
   CheckEquals('handshake failed', LError.Message, 'message');
+  CheckEquals(Ord(TTlsErrorOrigin.Unknown), Ord(LError.Origin),
+    'origin defaults to unknown');
+end;
+
+procedure TTestAlert.TestErrorCarriesOrigin;
+var
+  LFatal, LPlain: TTlsError;
+begin
+  LFatal := TTlsError.CreateFatal(TTlsAlertDescription.HandshakeFailure,
+    'peer alert', TTlsErrorOrigin.Peer);
+  CheckEquals(Ord(TTlsErrorOrigin.Peer), Ord(LFatal.Origin), 'CreateFatal keeps the origin');
+  LPlain := TTlsError.Create(TTlsAlert.CreateFatal(TTlsAlertDescription.CloseNotify),
+    'local', TTlsErrorOrigin.Local);
+  CheckEquals(Ord(TTlsErrorOrigin.Local), Ord(LPlain.Origin), 'Create keeps the origin');
 end;
 
 initialization

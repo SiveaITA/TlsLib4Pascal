@@ -18,6 +18,7 @@ interface
 uses
   SysUtils,
   TlpCryptoDomainTypes,
+  TlpIKeyExchangePrivateKey,
   TlpISecretBuffer;
 
 type
@@ -30,7 +31,7 @@ type
   /// </summary>
   INamedGroup = interface(IInterface)
     ['{2EBC7B08-44E0-4664-A3A2-B43C2A9B7492}']
-    /// <summary>The group's wire codepoint (RFC 8446 4.2.7 NamedGroup).</summary>
+    /// <summary>The group's wire codepoint (RFC 9846 4.3.7 NamedGroup).</summary>
     function Code: UInt16;
     /// <summary>The group's registered name (e.g. "X25519").</summary>
     function Name: string;
@@ -47,9 +48,9 @@ type
     function Composition: TNamedGroupComposition;
 
     /// <summary>
-    /// Produces a fresh key pair: the private key and the public share to send.
+    /// Produces a fresh key pair: the private key handle and the public share to send.
     /// </summary>
-    procedure GenerateKeyPair(out APriv: ISecretBuffer; out APubShare: TBytes);
+    procedure GenerateKeyPair(out APriv: IKeyExchangePrivateKey; out APubShare: TBytes);
 
     /// <summary>
     /// Against a peer's public share, produces the ciphertext to send back and
@@ -62,17 +63,19 @@ type
     /// From the private key and the peer's ciphertext, recovers the shared
     /// secret.
     /// </summary>
-    procedure Decapsulate(const APriv: ISecretBuffer; const ACiphertext: TBytes;
+    procedure Decapsulate(const APriv: IKeyExchangePrivateKey; const ACiphertext: TBytes;
       out ASharedSecret: ISecretBuffer);
 
     /// <summary>Whether a peer's public share is well-formed and safe to use.</summary>
     function ValidatePeerShare(const AShare: TBytes): Boolean;
   end;
 
+  INamedGroupRegistryBuilder = interface;
+
   /// <summary>
-  /// An injectable registry of named groups, keyed by wire codepoint; entries can
-  /// be pruned to harden a profile or added for a new group without touching the
-  /// core.
+  /// An injectable, immutable registry of named groups keyed by wire codepoint. To prune a group to
+  /// harden a profile or add one for a new group without touching the core, start from ToBuilder
+  /// and build a new registry.
   /// </summary>
   INamedGroupRegistry = interface(IInterface)
     ['{BF4ACB64-108E-488F-BF30-C49DCF140421}']
@@ -82,10 +85,18 @@ type
     function Contains(ACode: UInt16): Boolean;
     /// <summary>The group registered for ACode; False (AGroup nil) when none.</summary>
     function TryGet(ACode: UInt16; out AGroup: INamedGroup): Boolean;
+    /// <summary>A builder holding this registry's groups, for deriving a changed registry.</summary>
+    function ToBuilder: INamedGroupRegistryBuilder;
+  end;
+
+  /// <summary>Assembles a named-group registry; Build snapshots the entries.</summary>
+  INamedGroupRegistryBuilder = interface(IInterface)
+    ['{EF739F7D-58F5-4B56-B8FA-45F459F0037E}']
     /// <summary>Registers AGroup unless its code is already present.</summary>
     procedure Add(const AGroup: INamedGroup);
     /// <summary>Removes the group registered for ACode, if any.</summary>
     procedure Prune(ACode: UInt16);
+    function Build: INamedGroupRegistry;
   end;
 
 implementation

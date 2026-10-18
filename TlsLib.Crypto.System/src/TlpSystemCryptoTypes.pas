@@ -22,9 +22,9 @@ type
   /// the OS module versus the portable library - graceful fallback is never silent.
   /// </summary>
   TCryptoBackend = (
-    /// <summary>The portable (CryptoLib-backed) implementation.</summary>
+    /// <summary>The portable implementation.</summary>
     Portable,
-    /// <summary>The OS/system module (e.g. Windows CNG).</summary>
+    /// <summary>The OS/system module.</summary>
     System,
     /// <summary>Assembled in portable code over system primitives - the secret passes
     /// through the module but the construction is not a module service (e.g. HKDF built
@@ -36,16 +36,16 @@ type
   TCryptoBackendReason = (
     /// <summary>It is system-backed (or composed) - not a fallback.</summary>
     NotFallback,
-    /// <summary>The OS module is absent on this host (e.g. no bcrypt.dll).</summary>
+    /// <summary>The OS module is absent on this host.</summary>
     NoModule,
     /// <summary>The module lacks this algorithm on this host/version.</summary>
     NotPresent,
     /// <summary>The provider has no native implementation for it (a forwarded facet, or a
-    /// facet/algorithm not yet natively backed).</summary>
+    /// facet/algorithm with no native backing).</summary>
     NoNativeImpl);
 
-  /// <summary>The six provider facets, for whole-facet backend reporting.</summary>
-  TCryptoFacet = (Primitives, Signing, Certificates, PathValidation, Revocation, Hpke);
+  /// <summary>The provider facets, for whole-facet backend reporting.</summary>
+  TCryptoFacet = (Primitives, Signing, Hpke);
 
   /// <summary>One backend answer: which implementation serves the operation, and - when
   /// it is a portable fallback - why.</summary>

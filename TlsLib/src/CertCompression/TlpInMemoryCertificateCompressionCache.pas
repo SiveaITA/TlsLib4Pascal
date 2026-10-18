@@ -39,13 +39,10 @@ type
     FLock: TCriticalSection;
     class function KeyOf(const AKey: TBytes): string; static;
     procedure EvictToCapacity;
-    /// <summary>Rebuilds FOrder from its own still-live, de-duplicated entries (keeping
-    /// insertion order) so the ordering structure stays bounded at O(FCapacity) even when
-    /// AddOrSetValue overwrites keep FByKey small and EvictToCapacity rarely fires.</summary>
-    procedure CompactOrder;
   public
     /// <summary>A cache holding up to ACapacity entries (default when 0 or less).</summary>
-    constructor Create(ACapacity: Int32 = 0);
+    constructor Create; overload;
+    constructor Create(ACapacity: Int32); overload;
     destructor Destroy; override;
 
     function TryGet(const AKey: TBytes; out ACompressed: TBytes): Boolean;
@@ -58,11 +55,13 @@ implementation
 
 const
   DefaultCertCompressionCacheCapacity = Int32(64);
-  // compact FOrder once it holds more than this multiple of the live capacity in (mostly
-  // dead) entries; keeps the ordering structure bounded at O(FCapacity)
-  OrderSlackFactor = Int32(2);
 
 { TInMemoryCertificateCompressionCache }
+
+constructor TInMemoryCertificateCompressionCache.Create;
+begin
+  Create(0);
+end;
 
 constructor TInMemoryCertificateCompressionCache.Create(ACapacity: Int32);
 begin
@@ -78,11 +77,7 @@ end;
 
 destructor TInMemoryCertificateCompressionCache.Destroy;
 begin
-  if FByKey <> nil then
-  begin
-    FByKey.Clear;
-    FByKey.Free;
-  end;
+  FByKey.Free;
   FOrder.Free;
   FLock.Free;
   inherited Destroy;
@@ -101,33 +96,7 @@ begin
   while (FByKey.Count > FCapacity) and (FOrder.Count > 0) do
   begin
     LKey := FOrder.Dequeue;
-    FByKey.Remove(LKey); // stale order entries (already overwritten) drop harmlessly
-  end;
-end;
-
-procedure TInMemoryCertificateCompressionCache.CompactOrder;
-var
-  LKey: string;
-  LKept: TQueue<string>;
-  LSeen: TDictionary<string, Boolean>;
-begin
-  LKept := TQueue<string>.Create;
-  LSeen := TDictionary<string, Boolean>.Create;
-  try
-    while FOrder.Count > 0 do
-    begin
-      LKey := FOrder.Dequeue;
-      if FByKey.ContainsKey(LKey) and not LSeen.ContainsKey(LKey) then
-      begin
-        LKept.Enqueue(LKey);
-        LSeen.Add(LKey, True);
-      end;
-    end;
-    while LKept.Count > 0 do
-      FOrder.Enqueue(LKept.Dequeue);
-  finally
-    LKept.Free;
-    LSeen.Free;
+    FByKey.Remove(LKey);
   end;
 end;
 
@@ -154,13 +123,15 @@ begin
   LKey := KeyOf(AKey);
   FLock.Enter;
   try
-    FByKey.AddOrSetValue(LKey, ACompressed);
-    FOrder.Enqueue(LKey);
-    EvictToCapacity;
-    // FOrder gains a (possibly dup/soon-dead) entry per Put; overwrites keep FByKey small
-    // so eviction may never fire - bound FOrder by compacting away dead/dup entries
-    if FOrder.Count > FCapacity * OrderSlackFactor then
-      CompactOrder;
+    // each key sits in FOrder once, so an overwrite must not enqueue again
+    if FByKey.ContainsKey(LKey) then
+      FByKey[LKey] := ACompressed
+    else
+    begin
+      FByKey.Add(LKey, ACompressed);
+      FOrder.Enqueue(LKey);
+      EvictToCapacity;
+    end;
   finally
     FLock.Leave;
   end;

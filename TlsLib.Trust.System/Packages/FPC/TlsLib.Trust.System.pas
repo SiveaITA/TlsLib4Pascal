@@ -11,7 +11,8 @@ uses
   TlpSystemTrustExceptions, TlpSystemTrustBase, TlpUnixSystemTrust, 
   TlpWindowsSystemTrust, TlpAppleSystemTrust, TlpOSSystemTrust, 
   TlpSystemTrustFacade, TlpFileSystemTrust, TlpAndroidSystemTrust, 
-  TlpPosixDynLib, TlpOSLiveRevocation;
+  TlpOSLiveRevocation, TlpIPlatformChainEngine,
+  TlpOSDelegateVerifier, TlpPosixPrivilege;
 
 implementation
 

@@ -21,7 +21,7 @@ uses
 
 type
   /// <summary>
-  /// The handshake message an extension block belongs to (RFC 8446 4.2). Only
+  /// The handshake message an extension block belongs to (RFC 9846 4.3). Only
   /// ClientHello is a request the peer originates unprompted; every other kind is
   /// a response and may carry only extensions the ClientHello offered.
   /// </summary>
@@ -65,7 +65,7 @@ type
     HelloRetryGroup: UInt16;
     SignatureSchemes: TArray<UInt16>;
     SignatureSchemesCert: TArray<UInt16>;
-    /// <summary>certificate_authorities (RFC 8446 4.2.4 / RFC 5246 7.4.4): the DER-encoded
+    /// <summary>certificate_authorities (RFC 9846 4.3.4 / RFC 5246 7.4.4): the DER-encoded
     /// DistinguishedName issuers a server names in its CertificateRequest. Set outbound to
     /// emit them; populated inbound on the client from a received CertificateRequest.</summary>
     CertificateAuthorities: TArray<TBytes>;
@@ -74,8 +74,8 @@ type
     /// empty server_name in the ServerHello (TLS 1.2) or EncryptedExtensions (TLS 1.3) when the
     /// client offered a host_name.</summary>
     ServerNameAck: Boolean;
-    AlpnProtocols: TArray<string>;
-    SelectedAlpn: string;
+    AlpnProtocols: TArray<TBytes>;
+    SelectedAlpn: TBytes;
     Cookie: TBytes;
     RecordSizeLimit: Int32;
     CertCompressionAlgorithms: TArray<UInt16>;
@@ -87,10 +87,10 @@ type
     /// handshake) and set true inbound when the peer's extension is present. TLS 1.2-only
     /// secure-renegotiation signalling, even though renegotiation itself is never done.</summary>
     RenegotiationInfo: Boolean;
-    /// <summary>psk_key_exchange_modes (RFC 8446 4.2.9): the modes the client offers
+    /// <summary>psk_key_exchange_modes (RFC 9846 4.3.9): the modes the client offers
     /// (0 = psk_ke, 1 = psk_dhe_ke).</summary>
     PskModes: TBytes;
-    /// <summary>pre_shared_key (RFC 8446 4.2.11) ClientHello identities, one opaque ticket each.</summary>
+    /// <summary>pre_shared_key (RFC 9846 4.3.11) ClientHello identities, one opaque ticket each.</summary>
     OfferedPskIdentities: TArray<TBytes>;
     /// <summary>The obfuscated_ticket_age accompanying each offered identity.</summary>
     OfferedPskAges: TArray<UInt32>;
@@ -100,7 +100,7 @@ type
     PskSelected: Boolean;
     /// <summary>The index into the offered identities the server selected.</summary>
     SelectedPskIdentity: UInt16;
-    /// <summary>early_data (RFC 8446 4.2.10): present (empty) in the ClientHello offering 0-RTT.</summary>
+    /// <summary>early_data (RFC 9846 4.3.10): present (empty) in the ClientHello offering 0-RTT.</summary>
     EarlyDataOffered: Boolean;
     /// <summary>early_data present (empty) in EncryptedExtensions accepting 0-RTT.</summary>
     EarlyDataAccepted: Boolean;
@@ -114,8 +114,9 @@ type
     /// resume (empty when only indicating support, and always empty on a server echo).</summary>
     SessionTicket: TBytes;
     /// <summary>ec_point_formats (RFC 8422 5.1.2): set true outbound to list support for
-    /// the uncompressed point format (a client offering ECC suites, or a 1.2 server that
-    /// selected an ECC suite), and set true inbound when the peer's extension is present.</summary>
+    /// the uncompressed point format (a client offering ECC suites; the 1.2 server does not echo
+    /// it, as the receiver treats absence as uncompressed-only, RFC 8422 5.1.2, 5.2), and set
+    /// true inbound when the peer's extension is present.</summary>
     EcPointFormatsOffered: Boolean;
     /// <summary>status_request (RFC 6066): set true outbound in the ClientHello to offer
     /// acceptance of a stapled OCSP response, and set true inbound (server side) when the
@@ -125,6 +126,13 @@ type
     /// (echoed as an empty status_request in the ServerHello), and set true inbound on the
     /// client when that echo is present so it expects a CertificateStatus message.</summary>
     StatusRequestResponsePending: Boolean;
+    /// <summary>encrypted_client_hello (RFC 9849 5): the extension_data to emit for the current
+    /// message kind - the outer/inner form in a ClientHello, the 8-byte confirmation in a
+    /// HelloRetryRequest, or retry_configs in EncryptedExtensions. Empty to omit the extension.
+    /// The ECH machinery builds this body; the extension only frames it.</summary>
+    EchExtensionData: TBytes;
+    /// <summary>Set true inbound when the peer's encrypted_client_hello was present.</summary>
+    EchPresent: Boolean;
 
     /// <summary>Records that an extension type was offered in the ClientHello.</summary>
     procedure MarkOffered(AExtensionType: UInt16);

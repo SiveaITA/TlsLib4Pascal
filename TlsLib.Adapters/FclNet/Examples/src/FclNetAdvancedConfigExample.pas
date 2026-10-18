@@ -45,14 +45,19 @@ uses
   TlpINegotiation,
   TlpCipherSuiteRegistry,
   TlpICryptoProvider,
+  TlpIPkixProvider,
+  TlpDefaultPkixProvider,
   TlpDefaultCryptoProvider,
   TlpITlsConfig,
   TlpITlsConfigBuilder,
+  TlpCertificateVerifierSource,
   TlpTlsPresets,
+  TlpTlsCredential,
   TlsLibFclNetTls;
 
 const
   PORT = 28447;
+  ACCEPT_POLL_MS = 100;
   PING = 'ping from the fclnet advanced-config client';
 
 var
@@ -103,47 +108,52 @@ end;
 
 // an ordered, bound TLS 1.2 cipher-suite preference: only these suites may be negotiated and the
 // Add order is the preference order (server-preference is the model, so the server's order wins)
-function OrderedSuites(const AProvider: ICryptoProvider): ICipherSuiteRegistry;
+function OrderedSuites(const ACryptoProvider: ICryptoProvider): ICipherSuiteRegistry;
 var
-  LAll, LOrdered: ICipherSuiteRegistry;
+  LAll: ICipherSuiteRegistry;
+  LOrdered: ICipherSuiteRegistryBuilder;
   LSuite: TTlsCipherSuite;
 begin
-  LAll := TCipherSuiteRegistry.CreateDualVersion(AProvider);
-  LOrdered := TCipherSuiteRegistry.Create;
+  LAll := TCipherSuiteRegistry.CreateDualVersion(ACryptoProvider);
+  LOrdered := TCipherSuiteRegistryBuilder.Create as ICipherSuiteRegistryBuilder;
   if LAll.TryGet(TCipherSuites12.EcdheEcdsaAes256GcmSha384, LSuite) then LOrdered.Add(LSuite);
   if LAll.TryGet(TCipherSuites12.EcdheEcdsaChaCha20Poly1305Sha256, LSuite) then LOrdered.Add(LSuite);
   if LAll.TryGet(TCipherSuites12.EcdheEcdsaAes128GcmSha256, LSuite) then LOrdered.Add(LSuite);
-  Result := LOrdered;
+  Result := LOrdered.Build;
 end;
 
 function BuildClientConfig: ITlsClientConfig;
 var
-  LProvider: ICryptoProvider;
+  LCrypto: ICryptoProvider;
+  LPkix: IPkixProvider;
   LClient: ITlsClientConfigBuilder;
 begin
-  LProvider := TDefaultCryptoProvider.Create as ICryptoProvider;
-  LClient := TTlsPresets.Compatible(LProvider).Client;
+  LCrypto := TDefaultCryptoProvider.Create as ICryptoProvider;
+  LPkix := TDefaultPkixProvider.Create as IPkixProvider;
+  LClient := TTlsPresets.Compatible(LCrypto, LPkix).Client;
   LClient.WithSupportedVersions(TArray<UInt16>.Create(TlsWireVersionTls12));
-  // X25519 for the ECDHE, plus the leaf's P-256 curve (RFC 8422 5.4)
+  // X25519 for the ECDHE, plus the leaf's P-256 curve (RFC 8422 5.3)
   LClient.WithPreferredGroups(TArray<UInt16>.Create(TNamedGroupCatalog.X25519,
     TNamedGroupCatalog.Secp256r1));
-  LClient.WithCipherSuites(OrderedSuites(LProvider));
-  LClient.WithTrustAnchors(GRootDer);
+  LClient.WithCipherSuites(OrderedSuites(LCrypto));
+  LClient.WithServerVerification(TServerVerification.WebPki(GRootDer).Build);
   Result := LClient.Build;
 end;
 
 function BuildServerConfig: ITlsServerConfig;
 var
-  LProvider: ICryptoProvider;
+  LCrypto: ICryptoProvider;
+  LPkix: IPkixProvider;
   LServer: ITlsServerConfigBuilder;
 begin
-  LProvider := TDefaultCryptoProvider.Create as ICryptoProvider;
-  LServer := TTlsPresets.Compatible(LProvider).Server;
+  LCrypto := TDefaultCryptoProvider.Create as ICryptoProvider;
+  LPkix := TDefaultPkixProvider.Create as IPkixProvider;
+  LServer := TTlsPresets.Compatible(LCrypto, LPkix).Server;
   LServer.WithSupportedVersions(TArray<UInt16>.Create(TlsWireVersionTls12));
   LServer.WithPreferredGroups(TArray<UInt16>.Create(TNamedGroupCatalog.X25519,
     TNamedGroupCatalog.Secp256r1));
-  LServer.WithCipherSuites(OrderedSuites(LProvider));
-  LServer.WithCredential(GLeafDer, GKeyDer);
+  LServer.WithCipherSuites(OrderedSuites(LCrypto));
+  LServer.WithCredential(TTlsCredential.Load(LCrypto, LPkix, GLeafDer, GKeyDer));
   Result := LServer.Build;
 end;
 
@@ -152,8 +162,10 @@ type
   strict private
     FError: string;
     FReady: TEvent;
+    FServer: TInetServer;
     procedure MakeHandler(Sender: TObject; out AHandler: TSocketHandler);
     procedure HandleConnect(Sender: TObject; AStream: TSocketStream);
+    procedure HandleIdle(Sender: TObject);
   protected
     procedure Execute; override;
   public
@@ -195,20 +207,26 @@ begin
   AStream.Free;
 end;
 
-procedure TServerThread.Execute;
-var
-  LServer: TInetServer;
+procedure TServerThread.HandleIdle(Sender: TObject);
 begin
-  LServer := TInetServer.Create('127.0.0.1', PORT);
+  if Terminated then
+    FServer.StopAccepting(False);
+end;
+
+procedure TServerThread.Execute;
+begin
+  FServer := TInetServer.Create('127.0.0.1', PORT);
   try
     try
-      LServer.ReuseAddress := True;
-      LServer.MaxConnections := 1;
-      LServer.OnCreateClientSocketHandler := MakeHandler;
-      LServer.OnConnect := HandleConnect;
-      LServer.Listen;
+      FServer.ReuseAddress := True;
+      FServer.MaxConnections := 1;
+      FServer.AcceptIdleTimeout := ACCEPT_POLL_MS;
+      FServer.OnIdle := HandleIdle;
+      FServer.OnCreateClientSocketHandler := MakeHandler;
+      FServer.OnConnect := HandleConnect;
+      FServer.Listen;
       FReady.SetEvent;
-      LServer.StartAccepting;
+      FServer.StartAccepting;
     except
       on E: Exception do
       begin
@@ -217,7 +235,7 @@ begin
       end;
     end;
   finally
-    LServer.Free;
+    FreeAndNil(FServer);
   end;
 end;
 
@@ -273,6 +291,7 @@ begin
       if LServer.Error <> '' then
         raise Exception.Create(LServer.Error);
     finally
+      LServer.Terminate;
       LServer.Free;
     end;
 

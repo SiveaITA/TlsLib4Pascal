@@ -25,18 +25,21 @@ uses
   Math,
   TlpTlsLibExceptions,
   TlpICryptoProvider,
+  TlpIPkixProvider,
   TlpITlsEngine,
   TlpNegotiationTypes,
   TlpHandshakeMessage,
   TlpHandshakeMessages,
   TlpRecordLayer,
   TlpCertificateCompression,
+  TlpCertificateLimits,
   TlpZlibCertificateCompression,
   TlpICertificateCompression,
   TlpEchConfig,
   TlpEchExtension,
   TlpEchOuterExtensions,
   InteropEngine,
+  TlsLibTestProviders,
   InteropCredentials,
   InteropUtils;
 
@@ -110,6 +113,7 @@ type
   strict private
   class var
     FProvider: ICryptoProvider;
+    FPkix: IPkixProvider;
     FCredentialFile: string;
     FRootFile: string;
     FCorpusDir: string;
@@ -293,7 +297,7 @@ begin
   LOptions.Role := TInteropRole.Server;
   LOptions.HasCredential := True;
   LOptions.Credential :=
-    TInteropCredentials.ServerCredentialFromFieldFile(FProvider, FCredentialFile);
+    TInteropCredentials.ServerCredentialFromFieldFile(FProvider, FPkix, FCredentialFile);
   AEngine := TInteropEngine.Build(FProvider, LOptions);
 end;
 
@@ -305,7 +309,7 @@ begin
   LOptions.Role := TInteropRole.Client;
   LOptions.ServerName := 'localhost';
   LOptions.CheckServerName := True;
-  LOptions.Trust := TInteropCredentials.TrustFromFieldFile(FProvider, FRootFile);
+  LOptions.Trust := TInteropCredentials.TrustFromFieldFile(FPkix, FRootFile);
   AEngine := TInteropEngine.Build(FProvider, LOptions);
 end;
 
@@ -414,7 +418,7 @@ begin
       begin
         LPlain := Filler(96, $41);
         LCompressors := TZlibCertificateCompression.DefaultCompressors;
-        LDeflated := LCompressors[0].Compress(LPlain);
+        LCompressors[0].TryCompress(LPlain, LDeflated);
         LCompressed.Algorithm := TCertificateCompressionAlgorithms.Zlib;
         LCompressed.UncompressedLength := System.Length(LPlain);
         LCompressed.Compressed := LDeflated;
@@ -646,6 +650,7 @@ begin
   SetLength(LBuf, 4096);
   while AEngine.TakeOutgoing(LBuf, 0) > 0 do ;
   while AEngine.ReadAppData(LBuf, 0, System.Length(LBuf)) > 0 do ;
+  while AEngine.ReadEarlyData(LBuf, 0, System.Length(LBuf)) > 0 do ;
   while AEngine.NextEvent(LEvent) do ;
 end;
 
@@ -685,7 +690,8 @@ begin
           TCertificateCompression.Decompress(
             TZlibCertificateCompression.DefaultDecompressors,
             LCompressed.Algorithm, LCompressed.Compressed,
-            LCompressed.UncompressedLength);
+            LCompressed.UncompressedLength,
+            TCertificateChainLimits.Defaults.MaxTotalChainLength);
         end;
       TFuzzTarget.Finished:
         THandshakeMessages.DecodeFinished(AInput);
@@ -927,27 +933,37 @@ var
   LTarget: TFuzzTarget;
   LSeeds: TArray<TBytes>;
   LInput: TBytes;
-  LI, LFindings: Int32;
+  LI, LFindings, LReached: Int32;
   LDetail: string;
-  LDeadline: UInt64;
+  LDeadline, LEnd, LNow: UInt64;
 begin
   // the scheduled soak: a far larger budget doing real coverage-growing mutation. A new
   // crasher is persisted to the regression corpus so it becomes a per-push replay input.
   // Never on the per-push path (a genuine new find would make an unrelated PR flaky).
   LFindings := 0;
+  LEnd := High(UInt64);
   if AMaxSeconds > 0 then
-    LDeadline := GetTickCount64 + UInt64(AMaxSeconds) * 1000
-  else
-    LDeadline := High(UInt64);
+    LEnd := GetTickCount64 + UInt64(AMaxSeconds) * 1000;
   Writeln('discovery: up to ', APerTarget, ' mutation(s) per target, wall-clock cap ',
     AMaxSeconds, 's');
   for LTarget := Low(TFuzzTarget) to High(TFuzzTarget) do
   begin
     LSeeds := FTargetSeeds[LTarget];
+    LNow := GetTickCount64;
+    if LEnd = High(UInt64) then
+      LDeadline := High(UInt64)
+    else if LNow >= LEnd then
+      LDeadline := LNow
+    else
+      // an equal share of the time left
+      LDeadline := LNow + (LEnd - LNow) div UInt64(Ord(High(TFuzzTarget)) - Ord(LTarget) + 1);
+    LReached := 0;
     for LI := 0 to APerTarget - 1 do
     begin
-      if GetTickCount64 >= LDeadline then
+      // at least one iteration per target
+      if (LReached > 0) and (GetTickCount64 >= LDeadline) then
         Break;
+      Inc(LReached);
       LInput := Mutate(LSeeds[Rnd(System.Length(LSeeds))]);
       AWatchdog.Arm(LInput, LI);
       if not Exercise(LTarget, LInput, LDetail) then
@@ -958,8 +974,7 @@ begin
       end;
       AWatchdog.Disarm;
     end;
-    if GetTickCount64 >= LDeadline then
-      Break;
+    Writeln('  ', TargetName(LTarget), ': ', LReached, ' iteration(s)');
   end;
   Result := LFindings;
 end;
@@ -1005,7 +1020,8 @@ begin
   FCorpusDir := LDataDir + PathDelim + 'Corpus';
   FRegressDir := FCorpusDir + PathDelim + 'regress';
   FFailuresDir := FCorpusDir + PathDelim + 'failures';
-  FProvider := TInteropEngine.DefaultProvider;
+  FProvider := TTlsLibTestProviders.Crypto;
+  FPkix := TTlsLibTestProviders.Pkix;
   LoadSeeds;
 
   // no silent caps: log every parser fuzzed and each tier's budget

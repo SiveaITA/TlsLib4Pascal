@@ -19,6 +19,7 @@ uses
   SysUtils,
   TlpCryptoDomainTypes,
   TlpICryptoProvider,
+  TlpArrayUtilities,
   TlpISecretBuffer,
   TlpWireReader,
   TlpIWireWriter,
@@ -34,6 +35,18 @@ type
   /// backend server that received an already-decrypted inner ClientHello.
   /// </summary>
   TEchStatus = (NotOffered, Greased, Accepted, Rejected, Backend);
+
+  /// <summary>
+  /// The part a server plays in Encrypted Client Hello (RFC 9849 sec. 7): Keyed holds ECH keys and
+  /// decrypts the outer's ech payload itself (client-facing and shared mode), Backend holds none and
+  /// accepts an already-decrypted inner forwarded by a split-mode client-facing server. A server
+  /// that serves no ECH has no role.
+  /// </summary>
+  TEchServerRole = (Keyed, Backend);
+
+  /// <summary>How a ClientHelloOuter carrying ECH is built: the first flight, an accepting
+  /// HelloRetryRequest retry (re-seal at seq=1), or a rejecting one (echo CH1's ech verbatim).</summary>
+  TEchChMode = (Initial, RetryAccept, RetryReject);
 
   /// <summary>
   /// One HPKE symmetric cipher suite advertised by an ECHConfig (RFC 9849 sec. 4):
@@ -75,8 +88,13 @@ type
   private
     /// <summary>The version, public_name, extension, and public_key checks a usable config
     /// must pass, independent of cipher-suite selection.</summary>
-    function IsStructurallyUsable(const AProvider: ICryptoProvider): Boolean;
+    function IsStructurallyUsable(const ACryptoProvider: ICryptoProvider): Boolean;
   public
+    /// <summary>Whether a client could ever use this config, judged without a crypto provider:
+    /// the supported version, a valid public_name, at least one cipher suite, no mandatory
+    /// extension (none is understood) and no duplicated extension type. A server publishing a
+    /// config that fails this would have every client skip it.</summary>
+    function IsServable: Boolean;
     /// <summary>Parses one ECHConfig from AReader (advancing past it) and captures its
     /// raw bytes. Raises EDecodeErrorTlsLibException on a malformed structure.</summary>
     class function Parse(var AReader: TWireReader): TEchConfig; static;
@@ -100,19 +118,19 @@ type
     /// <summary>The public_name as an ASCII string.</summary>
     function PublicName: string;
     /// <summary>
-    /// The first advertised cipher suite AProvider can instantiate (in advertised
+    /// The first advertised cipher suite ACryptoProvider can instantiate (in advertised
     /// order), joined with the config's KEM into a full HPKE suite. False when none is
     /// supported - which also means the KEM is unsupported.
     /// </summary>
-    function TrySelectSuite(const AProvider: ICryptoProvider;
+    function TrySelectSuite(const ACryptoProvider: ICryptoProvider;
       out ASuite: IHpkeSuite): Boolean;
     /// <summary>
-    /// Whether a client may offer ECH with this config (RFC 9849 sec. 4.1, 6.1): a
+    /// Whether a client may offer ECH with this config (RFC 9849 sec. 4, 4.2, 6.1, 6.1.7): a
     /// supported version, a valid public_name, no duplicate or unsupported-mandatory
     /// extension, and at least one KEM/KDF/AEAD suite the provider supports. An
     /// unusable config is skipped, never fatal.
     /// </summary>
-    function IsUsable(const AProvider: ICryptoProvider): Boolean;
+    function IsUsable(const ACryptoProvider: ICryptoProvider): Boolean;
     property Version: UInt16 read FVersion;
     property ConfigId: Byte read FConfigId;
     property KemId: UInt16 read FKemId;
@@ -126,13 +144,20 @@ type
   /// <summary>
   /// One server ECH key: an ECHConfig, its HPKE recipient key prepared once (build it with
   /// ICryptoProvider.Hpke.ImportRecipientKey), and whether it is advertised in retry_configs.
-  /// The operator adds and removes these to track what was published in DNS (RFC 9934),
+  /// The operator adds and removes these to track what was published in DNS (RFC 9848),
   /// rotating by swapping in a new store.
   /// </summary>
   TEchKeyEntry = record
     Config: TEchConfig;
     RecipientKey: IHpkeRecipientKey;
     IsRetry: Boolean;
+    /// <summary>
+    /// Whether ACryptoProvider can serve this entry as a server: a prepared key that belongs to
+    /// the config, a servable config with a valid public key, and EVERY advertised HPKE cipher
+    /// suite resolvable. The client, not the server, picks the HPKE suite from those the config
+    /// lists, so one the provider cannot build means ECH is declined for every client that picks it.
+    /// </summary>
+    function IsServableBy(const ACryptoProvider: ICryptoProvider): Boolean;
   end;
 
   /// <summary>
@@ -152,7 +177,7 @@ type
     /// first match in preference order). False when no config is usable.
     /// </summary>
     class function TrySelect(const AConfigs: TArray<TEchConfig>;
-      const AProvider: ICryptoProvider; out AConfig: TEchConfig;
+      const ACryptoProvider: ICryptoProvider; out AConfig: TEchConfig;
       out ASuite: IHpkeSuite): Boolean; static;
   end;
 
@@ -311,7 +336,7 @@ begin
   Result := TEncoding.ASCII.GetString(FPublicName);
 end;
 
-function TEchConfig.TrySelectSuite(const AProvider: ICryptoProvider;
+function TEchConfig.TrySelectSuite(const ACryptoProvider: ICryptoProvider;
   out ASuite: IHpkeSuite): Boolean;
 var
   LSuite: TEchCipherSuite;
@@ -319,48 +344,81 @@ begin
   Result := False;
   for LSuite in FCipherSuites do
   begin
-    ASuite := AProvider.Hpke.Suite(FKemId, LSuite.KdfId, LSuite.AeadId);
+    ASuite := ACryptoProvider.Hpke.Suite(FKemId, LSuite.KdfId, LSuite.AeadId);
     if ASuite <> nil then
       Exit(True);
   end;
 end;
 
-function TEchConfig.IsStructurallyUsable(
-  const AProvider: ICryptoProvider): Boolean;
+function TEchConfig.IsServable: Boolean;
 var
-  LExt: TEchConfigExtension;
-  LOther: TEchConfigExtension;
-  LI, LJ: Int32;
+  LSeen: TArray<UInt32>;
+  LI: Int32;
+  LType: UInt16;
 begin
   Result := False;
   if FVersion <> SupportedVersion then
     Exit;
   if not IsValidPublicName(FPublicName) then
     Exit;
-  // reject an unsupported mandatory extension (high bit set) or a duplicate type
+  if System.Length(FCipherSuites) = 0 then
+    Exit;
+  // reject an unsupported mandatory extension (high bit set) or a duplicate type. A bit per 16-bit
+  // type keeps the duplicate check linear however many extensions a config carries, and it is only
+  // allocated when there are two or more to compare
+  LSeen := nil;
+  if System.Length(FExtensions) > 1 then
+    SetLength(LSeen, 65536 div 32);
   for LI := 0 to System.High(FExtensions) do
   begin
-    LExt := FExtensions[LI];
-    if (LExt.ExtType and MandatoryExtensionBit) <> 0 then
+    LType := FExtensions[LI].ExtType;
+    if (LType and MandatoryExtensionBit) <> 0 then
       Exit;
-    for LJ := LI + 1 to System.High(FExtensions) do
-    begin
-      LOther := FExtensions[LJ];
-      if LOther.ExtType = LExt.ExtType then
-        Exit;
-    end;
+    if System.Length(LSeen) = 0 then
+      Continue;
+    if (LSeen[LType shr 5] and (UInt32(1) shl (LType and 31))) <> 0 then
+      Exit;
+    LSeen[LType shr 5] := LSeen[LType shr 5] or (UInt32(1) shl (LType and 31));
   end;
-  // the public_key must be a well-formed KEM key (a DNS-published config could carry a wrong
-  // length or an invalid EC point); an unusable one is skipped, never sealed against
-  Result := AProvider.Hpke.ValidatePublicKey(FKemId, FPublicKey);
+  Result := True;
 end;
 
-function TEchConfig.IsUsable(const AProvider: ICryptoProvider): Boolean;
+function TEchConfig.IsStructurallyUsable(
+  const ACryptoProvider: ICryptoProvider): Boolean;
+begin
+  Result := False;
+  if not IsServable then
+    Exit;
+  // the public_key must be a well-formed KEM key (a DNS-published config could carry a wrong
+  // length or an invalid EC point); an unusable one is skipped, never sealed against
+  Result := ACryptoProvider.Hpke.ValidatePublicKey(FKemId, FPublicKey);
+end;
+
+function TEchConfig.IsUsable(const ACryptoProvider: ICryptoProvider): Boolean;
 var
   LSuite: IHpkeSuite;
 begin
-  Result := IsStructurallyUsable(AProvider) and TrySelectSuite(AProvider, LSuite);
+  Result := IsStructurallyUsable(ACryptoProvider) and TrySelectSuite(ACryptoProvider, LSuite);
 end;
+
+{ TEchKeyEntry }
+
+function TEchKeyEntry.IsServableBy(const ACryptoProvider: ICryptoProvider): Boolean;
+var
+  LI: Int32;
+begin
+  Result := False;
+  if (RecipientKey = nil) or not Config.IsStructurallyUsable(ACryptoProvider) then
+    Exit;
+  for LI := 0 to System.High(Config.CipherSuites) do
+    if ACryptoProvider.Hpke.Suite(Config.KemId, Config.CipherSuites[LI].KdfId,
+      Config.CipherSuites[LI].AeadId) = nil then
+      Exit;
+  Result := (RecipientKey.Kem = Config.KemId) and
+    TArrayUtilities.AreEqual(RecipientKey.PublicKey, Config.PublicKey);
+end;
+
+{ TEchConfig }
 
 class function TEchConfig.IsAllDigitsOrHex(const ALabel: TBytes;
   AStart, ALen: Int32): Boolean;
@@ -454,7 +512,8 @@ begin
   LReader.ExpectEnd;
   // the list arrives from an unauthenticated server (EE retry_configs); each config carries a
   // 4-byte header (version + length) at minimum, so Remaining div 4 bounds the count - preallocate
-  // once and trim rather than growing one entry at a time (linear-time parsing, RFC 9849 sec. 10.12.4)
+  // once and trim rather than growing one entry at a time (linear-time parsing of an
+  // unauthenticated list)
   SetLength(Result, LList.Remaining div 4);
   LCount := 0;
   while not LList.EndReached do
@@ -483,15 +542,15 @@ begin
 end;
 
 class function TEchConfigList.TrySelect(const AConfigs: TArray<TEchConfig>;
-  const AProvider: ICryptoProvider; out AConfig: TEchConfig;
+  const ACryptoProvider: ICryptoProvider; out AConfig: TEchConfig;
   out ASuite: IHpkeSuite): Boolean;
 var
   LI: Int32;
 begin
   Result := False;
   for LI := 0 to System.High(AConfigs) do
-    if AConfigs[LI].IsStructurallyUsable(AProvider) and
-      AConfigs[LI].TrySelectSuite(AProvider, ASuite) then
+    if AConfigs[LI].IsStructurallyUsable(ACryptoProvider) and
+      AConfigs[LI].TrySelectSuite(ACryptoProvider, ASuite) then
     begin
       AConfig := AConfigs[LI];
       Exit(True);

@@ -14,7 +14,7 @@
 /// POST to a public test API (postman-echo.com) with its TLS handled entirely by TlsLib4Pascal -
 /// a real handshake against a real internet server and real HTTP/1.1 framing over our records,
 /// with zero OpenSSL. It runs TWICE against the same host: leg A verifies against a pinned root
-/// (CACertificatesFile), leg B verifies against the OS system-trust store harvested and validated
+/// (CACertificatesFile), leg B verifies against the OS system-trust store, verified
 /// entirely by TlsLib4Pascal (CASystemStores, no pinned file) - proving a caller can drop the
 /// bundled PEM and lean on the platform anchors instead. With a keep-alive request both verbs run
 /// over ONE reused TLS connection - the strongest proof that our records carry ordinary
@@ -107,7 +107,10 @@ var
   LRoot, LGetBody, LPostBody: string;
   LClient: THttpClientSocket;
   LGetStatus, LPostStatus: Integer;
+  LDoBind, LTls: Boolean;
 begin
+  LDoBind := False;
+  LTls := True;
   Result := 1;
   LGetBody := '';
   LPostBody := '';
@@ -115,7 +118,7 @@ begin
     LClient := THttpClientSocket.Create(TimeoutMs);
     try
       if AUseSystemTrust then
-        // no pinned file: verify against the OS system-trust store our validator harvests
+        // no pinned file: verify against the OS system-trust store
         LClient.TLS.CASystemStores := [scsRoot]
       else
       begin
@@ -124,7 +127,7 @@ begin
       end;
       // real verification: IgnoreCertificateErrors stays False (never our InsecureSkipVerify)
       // the handshake runs here and verifies the chain for Host (used for SNI too)
-      LClient.OpenBind(Host, Port, {dobind=}False, {tls=}True);
+      LClient.OpenBind(Host, Port, LDoBind, LTls);
       // both verbs over ONE kept-alive TLS connection
       LGetStatus := LClient.Get(GetPath, KeepAliveMs);
       LGetBody := Utf8ToString(LClient.Content);
@@ -177,11 +180,11 @@ begin
   // point mORMot's NewNetTls factory at our INetTls, so the client socket carries our TLS
   RegisterTlsLib4PascalTls;
   // leg A: pinned-root trust (the bundled ISRG PEM)
-  LPinned := RunOnce({AUseSystemTrust=}False, 'pinned-root');
+  LPinned := RunOnce(False, 'pinned-root');
   if LPinned = 2 then
     Exit(2); // network unreachable - SKIP the whole demo
   // leg B: OS system-trust, no pinned file
-  LSystem := RunOnce({AUseSystemTrust=}True, 'system-trust');
+  LSystem := RunOnce(True, 'system-trust');
   if LSystem = 2 then
     Exit(2);
   if (LPinned = 0) and (LSystem = 0) then

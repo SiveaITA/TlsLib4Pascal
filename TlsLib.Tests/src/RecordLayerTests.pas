@@ -28,23 +28,31 @@ uses
   TlpTlsAlert,
   TlpTlsLibExceptions,
   TlpTlsContentType,
+  TlpTlsVersion,
   TlpSecretBuffer,
   TlpICryptoProvider,
+  TlpAeadUtilities,
   TlpCryptoDomainTypes,
   TlpIRecordProtection,
   TlpRecordProtection,
   TlpRecordHeader,
   TlpRecordLayer,
+  MockCryptoProvider,
   TlsLibTestBase;
 
 type
   TTestRecordLayer = class(TTlsLibAlgorithmTestCase)
   private
     function MakeTls13(const AKey, AIv: TBytes): IRecordProtection;
+    function MakeTls13Capped(const AKey, AIv: TBytes;
+      AUsageLimit: UInt64): IRecordProtection;
+    function MakeTls12(const AKey, ASalt: TBytes): IRecordProtection;
     function DrainOne(const ALayer: TRecordLayer;
       out AFragment: TTlsRecordFragment): Boolean;
     function ExpectFatal(const ALayer: TRecordLayer; const AWire: TBytes;
       ADescription: TTlsAlertDescription): Boolean;
+    class function MakePayload(ALen: Int32; ASeed: Byte): TBytes; static;
+    function TakeAll(const ALayer: TRecordLayer): TBytes;
   published
     procedure TestPlaintextRecordRoundTrip;
     procedure TestRecordSpanningMultipleFeeds;
@@ -53,11 +61,37 @@ type
     procedure TestWriteRejectsOutOfRangeSlice;
     procedure TestProtected13LoopbackTwoRecords;
     procedure TestRecordOverflowOnOverlongLength;
-    procedure TestReassemblyCapTripsFatally;
+    procedure TestPartialMaxSizeRecordHeldThenSurfaces;
     procedure TestFramedBacklogBoundAndDiscard;
     procedure TestEmptyRecordFloodCapped;
+    procedure TestEmptyHandshakeRecordRejected;
+    procedure TestEmptyAlertRecordRejected;
+    procedure TestEmptyChangeCipherSpecRejected;
+    procedure TestEmptyApplicationDataStillAccepted;
+    procedure TestProtectedEmptyHandshakeRejected;
+    procedure TestWriteRefusesEmptyControlRecord;
+    procedure TestWriteRefusesProtectedChangeCipherSpec;
     procedure TestRecordSizeLimitRejectsOversizeInbound;
+    procedure TestRecordSizeLimitCountsInnerPlaintextNotContent;
+    procedure TestRecordSizeLimitInnerPlaintextBoundary;
+    procedure TestRecordSizeLimitExemptsAcceptedEarlyDataRecords;
+    procedure TestRecordSizeLimitExemptsPlaintextRecords;
+    procedure TestSkippedPlaintextEarlyDataAcceptsFullSizeRecord;
+    procedure TestPlaintextAlertBeforeFirstDecryptIsAcceptedInTls13;
+    procedure TestPlaintextFatalLevelCloseNotifyIsRefused;
+    procedure TestPlaintextHelloFlightDoesNotCloseTheAlertWindow;
+    procedure TestPlaintextAlertAfterAKeyChangeIsStillRefused;
+    procedure TestPlaintextCloseNotifyIsNeverHonoured;
+    procedure TestPlaintextAlertIsNotAcceptedInTls12;
+    procedure TestShortTls12RecordIsBadRecordMac;
+    procedure TestDecryptingRecordInSkipWindowIsJudgedStrictly;
+    procedure TestAcceptedEarlyDataBoundedAtBudget;
+    procedure TestAcceptedEarlyDataExactBudgetThenNormalFlow;
+    procedure TestWritePausesAppDataAtRekeyThreshold;
     procedure TestChangeCipherSpecDropped;
+    procedure TestChangeCipherSpecBeforeHelloRejected;
+    procedure TestTls12UnarmedChangeCipherSpecRejected;
+    procedure TestTls12OversizePlaintextRecordIsRecordOverflow;
     procedure TestChangeCipherSpecFloodCapped;
     procedure TestChangeCipherSpecAfterHandshakeRejected;
     procedure TestMalformedChangeCipherSpecRejected;
@@ -67,7 +101,18 @@ type
     procedure TestDoubleArmRejected;
     procedure TestUnknownContentTypeRejected;
     procedure TestPartialHeaderDoesNotOverRead;
+    procedure TestBadHeaderBehindFramedRecordIsRaisedAfterIt;
+    procedure TestBadHeaderWithNothingFramedFailsAtOnce;
+    procedure TestOverflowHeaderBehindFramedRecordIsRaisedAfterIt;
+    procedure TestLayerFailedAfterDeferredBadHeaderRaised;
+    procedure TestDiscardInboundClearsDeferredBadHeader;
     procedure TestTerminalAfterFatal;
+    procedure TestTakeOutgoingIntoBufferRetainsRemainder;
+    procedure TestTakeOutgoingIntoBufferGuardsBadOffset;
+    procedure TestTakeOutgoingInterleavedAppendDrainPreservesOrder;
+    procedure TestTakeOutgoingAppendAfterPartialDrainCompacts;
+    procedure TestTakeOutgoingReleasesAndRegrowsAfterLargeWrite;
+    procedure TestOutgoingRandomInterleaveMatchesReferenceQueue;
   end;
 
 implementation
@@ -77,7 +122,23 @@ implementation
 function TTestRecordLayer.MakeTls13(const AKey, AIv: TBytes): IRecordProtection;
 begin
   Result := TTls13RecordProtection.Create(TSecretBuffer.From(AKey),
-    TSecretBuffer.From(AIv), Provider.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM));
+    TSecretBuffer.From(AIv), Crypto.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM));
+end;
+
+function TTestRecordLayer.MakeTls13Capped(const AKey, AIv: TBytes;
+  AUsageLimit: UInt64): IRecordProtection;
+begin
+  // the AEAD reports a small usage limit so the rekey threshold is reached after a few records
+  Result := TTls13RecordProtection.Create(TSecretBuffer.From(AKey),
+    TSecretBuffer.From(AIv),
+    TCappedAead.Create(Crypto.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM),
+    AUsageLimit) as IAead);
+end;
+
+function TTestRecordLayer.MakeTls12(const AKey, ASalt: TBytes): IRecordProtection;
+begin
+  Result := TTls12RecordProtection.Create(TSecretBuffer.From(AKey),
+    TSecretBuffer.From(ASalt), Crypto.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM));
 end;
 
 function TTestRecordLayer.DrainOne(const ALayer: TRecordLayer;
@@ -116,7 +177,7 @@ begin
   try
     LPayload := DecodeHex('01020304050607');
     LSend.Write(TTlsContentType.Handshake, LPayload, 0, System.Length(LPayload));
-    LWire := LSend.TakeOutgoing;
+    LWire := TakeAll(LSend);
     LRecv.ProcessInput(LWire, 0, System.Length(LWire));
     CheckTrue(DrainOne(LRecv, LFrag), 'a fragment is delivered');
     CheckEquals(Ord(TTlsContentType.Handshake), Ord(LFrag.ContentType), 'content type');
@@ -133,22 +194,29 @@ var
   LSend, LRecv: TRecordLayer;
   LFrag: TTlsRecordFragment;
   LPayload, LWire: TBytes;
+  LNeeded, LI: Int32;
 begin
   // the framed backlog (complete records queued but not yet pulled) is bounded so a peer cannot
   // stage unbounded ciphertext while the caller is not pulling (e.g. parked / backpressured)
   LSend := TRecordLayer.Create;
   LRecv := TRecordLayer.Create;
   try
-    LPayload := DecodeHex('01020304050607'); // one small handshake record (~12 wire bytes)
+    // a max-size record, so the default backlog cap is reached in a handful of feeds
+    LPayload := nil;
+    SetLength(LPayload, TRecordLimits.MaxPlaintext);
     LSend.Write(TTlsContentType.Handshake, LPayload, 0, System.Length(LPayload));
-    LWire := LSend.TakeOutgoing;
+    LWire := TakeAll(LSend);
+    // records needed to reach the cap, derived from the (read-only) bound - never hard-coded
+    LNeeded := (LRecv.MaxFramedBacklog + System.Length(LWire) - 1) div System.Length(LWire);
 
-    LRecv.MaxFramedBacklog := 20; // two of these records exceed it
     CheckFalse(LRecv.InboundBacklogFull, 'an empty layer is not backlog-full');
+    for LI := 1 to LNeeded - 1 do
+    begin
+      LRecv.ProcessInput(LWire, 0, System.Length(LWire));
+      CheckFalse(LRecv.InboundBacklogFull, 'framed records below the cap are not backlog-full');
+    end;
     LRecv.ProcessInput(LWire, 0, System.Length(LWire));
-    CheckFalse(LRecv.InboundBacklogFull, 'one framed record is under the cap');
-    LRecv.ProcessInput(LWire, 0, System.Length(LWire));
-    CheckTrue(LRecv.InboundBacklogFull, 'two framed records reach the cap');
+    CheckTrue(LRecv.InboundBacklogFull, 'the framed backlog reaches the cap');
 
     // pulling one record relieves the backlog
     CheckTrue(LRecv.NextIncoming(LFrag), 'a framed record is pulled');
@@ -157,7 +225,7 @@ begin
     // discarding clears everything and resets the counter
     LRecv.DiscardInbound;
     CheckFalse(LRecv.InboundBacklogFull, 'discard clears the backlog');
-    CheckFalse(LRecv.NextIncoming(LFrag), 'discard drops the remaining framed record');
+    CheckFalse(LRecv.NextIncoming(LFrag), 'discard drops the remaining framed records');
   finally
     LSend.Free;
     LRecv.Free;
@@ -175,7 +243,7 @@ begin
   try
     LPayload := DecodeHex('cafebabedeadbeef1234');
     LSend.Write(TTlsContentType.ApplicationData, LPayload, 0, System.Length(LPayload));
-    LRecord := LSend.TakeOutgoing;
+    LRecord := TakeAll(LSend);
     // feed the single record in three slices; nothing surfaces until complete
     LRecv.ProcessInput(LRecord, 0, 3);
     CheckFalse(DrainOne(LRecv, LFrag), 'incomplete after slice 1');
@@ -204,7 +272,7 @@ begin
     LSend.Write(TTlsContentType.Handshake, LA, 0, System.Length(LA));
     LSend.Write(TTlsContentType.ApplicationData, LB, 0, System.Length(LB));
     // both records arrive coalesced in one buffer
-    LWire := LSend.TakeOutgoing;
+    LWire := TakeAll(LSend);
     LRecv.ProcessInput(LWire, 0, System.Length(LWire));
     CheckTrue(DrainOne(LRecv, LFrag), 'first record');
     CheckEquals(Ord(TTlsContentType.Handshake), Ord(LFrag.ContentType), 'first type');
@@ -235,7 +303,7 @@ begin
     for LI := 0 to System.Length(LPayload) - 1 do
       LPayload[LI] := Byte(LI and $FF);
     LSend.Write(TTlsContentType.ApplicationData, LPayload, 0, System.Length(LPayload));
-    LWire := LSend.TakeOutgoing;
+    LWire := TakeAll(LSend);
     LRecv.ProcessInput(LWire, 0, System.Length(LWire));
     LReassembled := nil;
     CheckTrue(DrainOne(LRecv, LFrag), 'first fragment');
@@ -292,7 +360,7 @@ begin
     LB := DecodeHex('576f726c64'); // "World"
     LSend.Write(TTlsContentType.ApplicationData, LA, 0, 5);
     LSend.Write(TTlsContentType.ApplicationData, LB, 0, 5);
-    LWire := LSend.TakeOutgoing;
+    LWire := TakeAll(LSend);
     LRecv.ProcessInput(LWire, 0, System.Length(LWire));
     CheckTrue(DrainOne(LRecv, LFrag), 'first protected record');
     CheckEqualBytes('first plaintext', LA, LFrag.Data);
@@ -318,20 +386,37 @@ begin
   end;
 end;
 
-procedure TTestRecordLayer.TestReassemblyCapTripsFatally;
+procedure TTestRecordLayer.TestPartialMaxSizeRecordHeldThenSurfaces;
 var
   LRecv: TRecordLayer;
-  LWire: TBytes;
+  LHeaderAndBody, LTail: TBytes;
+  LFrag: TTlsRecordFragment;
 begin
+  // there is no explicit reassembly cap: Parse rejects any over-ceiling record length before its
+  // bytes are retained, so the un-framed residual is bounded by one max-size record. A max-size
+  // record delivered one byte short is held without any spurious overflow, then completes and
+  // surfaces once its final byte arrives.
   LRecv := TRecordLayer.Create;
   try
-    LRecv.MaxInboundBuffer := 64;
-    // header claims 200 body bytes (within the record cap) but only 100 arrive:
-    // 105 buffered bytes exceed the 64-byte reassembly cap
-    LWire := ConcatBytes(DecodeHex('17030300C8'), // length 200
-      System.Copy(DecodeHex(StringOfChar('a', 200)), 0, 100));
-    CheckTrue(ExpectFatal(LRecv, LWire, TTlsAlertDescription.RecordOverflow),
-      'reassembly cap -> record_overflow');
+    // application_data at the ceiling for the (null) plaintext read epoch - MaxPlaintext, since it
+    // has no AEAD expansion (length 16384) - but delivered one body byte short
+    LHeaderAndBody := nil;
+    SetLength(LHeaderAndBody, 5 + (TRecordLimits.MaxPlaintext - 1));
+    LHeaderAndBody[0] := $17;
+    LHeaderAndBody[1] := $03;
+    LHeaderAndBody[2] := $03;
+    LHeaderAndBody[3] := Byte(TRecordLimits.MaxPlaintext shr 8);
+    LHeaderAndBody[4] := Byte(TRecordLimits.MaxPlaintext and $FF);
+    LRecv.ProcessInput(LHeaderAndBody, 0, System.Length(LHeaderAndBody));
+    CheckFalse(LRecv.NextIncoming(LFrag), 'the one-byte-short record is held, not surfaced');
+    // the final byte completes the record; it now surfaces (plaintext application_data is accepted
+    // by default - StrictApplicationData is off for the record layer's own framing tests)
+    LTail := nil;
+    SetLength(LTail, 1);
+    LRecv.ProcessInput(LTail, 0, 1);
+    CheckTrue(LRecv.NextIncoming(LFrag), 'the completed max-size record surfaces');
+    CheckEquals(TRecordLimits.MaxPlaintext, System.Length(LFrag.Data),
+      'the surfaced record carries the full max-size body');
   finally
     LRecv.Free;
   end;
@@ -347,10 +432,10 @@ var
 begin
   LRecv := TRecordLayer.Create;
   try
-    LRecv.MaxConsecutiveEmptyRecords := 3;
     LEmpty := DecodeHex('1703030000'); // application_data, length 0
     LFlood := nil;
-    for LI := 0 to 4 do
+    // one past the cap (the check is strictly-greater), derived from the read-only getter
+    for LI := 0 to LRecv.MaxConsecutiveEmptyRecords do
       LFlood := ConcatBytes(LFlood, LEmpty);
     // framing succeeds; the cap trips on the pull side, where a record's emptiness
     // is known only after it is decrypted under the active read epoch
@@ -365,6 +450,144 @@ begin
     CheckTrue(LRaised, 'a flood of empty records is capped');
   finally
     LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestEmptyHandshakeRecordRejected;
+var
+  LRecv: TRecordLayer;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    // RFC 9846 5.4 / RFC 5246 6.2.1: a zero-length handshake record is unexpected_message
+    CheckTrue(ExpectFatal(LRecv, DecodeHex('1603030000'),
+      TTlsAlertDescription.UnexpectedMessage), 'an empty handshake record is rejected');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestEmptyAlertRecordRejected;
+var
+  LRecv: TRecordLayer;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    CheckTrue(ExpectFatal(LRecv, DecodeHex('1503030000'),
+      TTlsAlertDescription.UnexpectedMessage), 'an empty alert record is rejected');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestEmptyChangeCipherSpecRejected;
+var
+  LRecv: TRecordLayer;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    LRecv.SetNegotiatedVersion(TTlsVersion.Tls13);
+    // a change_cipher_spec body must be a single 0x01; a zero-length one is unexpected_message
+    CheckTrue(ExpectFatal(LRecv, DecodeHex('1403030000'),
+      TTlsAlertDescription.UnexpectedMessage), 'an empty change_cipher_spec is rejected');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestEmptyApplicationDataStillAccepted;
+var
+  LRecv: TRecordLayer;
+  LFrag: TTlsRecordFragment;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    // an empty application_data record is legal (RFC 9846 5.4); it delivers nothing
+    LRecv.ProcessInput(DecodeHex('1703030000'), 0, 5);
+    CheckFalse(DrainOne(LRecv, LFrag),
+      'an empty application_data record is accepted and delivers nothing');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestProtectedEmptyHandshakeRejected;
+var
+  LRecv: TRecordLayer;
+  LKey, LIv, LWire: TBytes;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    LKey := DecodeHex('000102030405060708090a0b0c0d0e0f');
+    LIv := DecodeHex('000102030405060708090a0b');
+    // a protected record whose decrypted inner content is empty and inner type is handshake is
+    // forbidden (RFC 9846 5.4) - the reject must run after decrypt, on the TLSInnerPlaintext
+    LWire := MakeTls13(LKey, LIv).Protect(TTlsContentType.Handshake, nil, 0, 0);
+    LRecv.SetReadProtection(MakeTls13(LKey, LIv));
+    CheckTrue(ExpectFatal(LRecv, LWire, TTlsAlertDescription.UnexpectedMessage),
+      'a protected empty handshake record is rejected after decrypt');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestWriteRefusesEmptyControlRecord;
+var
+  LSend: TRecordLayer;
+
+  function EmptyWriteRaises(AType: TTlsContentType): Boolean;
+  begin
+    Result := False;
+    try
+      LSend.Write(AType, nil, 0, 0);
+    except
+      on E: EArgumentTlsLibException do
+        Result := True;
+    end;
+  end;
+
+begin
+  LSend := TRecordLayer.Create;
+  try
+    CheckTrue(EmptyWriteRaises(TTlsContentType.Handshake), 'empty handshake write refused');
+    CheckTrue(EmptyWriteRaises(TTlsContentType.Alert), 'empty alert write refused');
+    CheckTrue(EmptyWriteRaises(TTlsContentType.ChangeCipherSpec), 'empty CCS write refused');
+    // an empty application_data record is still emitted
+    LSend.Write(TTlsContentType.ApplicationData, nil, 0, 0);
+    CheckEqualBytes('an empty application_data record is emitted',
+      DecodeHex('1703030000'), TakeAll(LSend));
+  finally
+    LSend.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestWriteRefusesProtectedChangeCipherSpec;
+var
+  LSend: TRecordLayer;
+  LCcs: TBytes;
+  LRaised: Boolean;
+begin
+  LSend := TRecordLayer.Create;
+  try
+    LCcs := DecodeHex('01');
+    LSend.SetWriteProtection(MakeTls13(
+      DecodeHex('000102030405060708090a0b0c0d0e0f'),
+      DecodeHex('000102030405060708090a0b')));
+    LRaised := False;
+    try
+      LSend.Write(TTlsContentType.ChangeCipherSpec, LCcs, 0, 1);
+    except
+      on E: EInvalidOperationTlsLibException do
+        LRaised := True;
+    end;
+    CheckTrue(LRaised, 'a change_cipher_spec under a protected write epoch is refused');
+    // reverting to plaintext allows the legacy CCS again
+    LSend.RevertWriteToPlaintext;
+    LSend.Write(TTlsContentType.ChangeCipherSpec, LCcs, 0, 1);
+    CheckEqualBytes('a plaintext CCS is emitted after reverting',
+      DecodeHex('140303000101'), TakeAll(LSend));
+  finally
+    LSend.Free;
   end;
 end;
 
@@ -387,7 +610,7 @@ begin
     LBig := nil;
     SetLength(LBig, 200);
     LSend.Write(TTlsContentType.ApplicationData, LBig, 0, 200);
-    LWire := LSend.TakeOutgoing;
+    LWire := TakeAll(LSend);
     LRecv.ProcessInput(LWire, 0, System.Length(LWire));
     LRaised := False;
     try
@@ -403,6 +626,495 @@ begin
   end;
 end;
 
+procedure TTestRecordLayer.TestRecordSizeLimitCountsInnerPlaintextNotContent;
+var
+  LRecv: TRecordLayer;
+  LAead: IAead;
+  LKey, LIv, LInner, LHeader, LCipher, LRecord: TBytes;
+  LFrag: TTlsRecordFragment;
+  LCipherLen: Int32;
+  LRaised: Boolean;
+begin
+  LKey := DecodeHex('000102030405060708090a0b0c0d0e0f');
+  LIv := DecodeHex('101112131415161718191a1b');
+  // craft a TLS 1.3 record: 10 content bytes, the application_data inner type, then 100
+  // padding bytes. Content (10) is well under a 64-byte limit, but the TLSInnerPlaintext
+  // (111) is not - padding must not hide the overflow (RFC 8449).
+  LInner := nil;
+  SetLength(LInner, 111);
+  LInner[10] := Byte(Ord(TTlsContentType.ApplicationData)); // rest stay zero (padding)
+  LAead := Crypto.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
+  LAead.Init(TSecretBuffer.From(LKey));
+  LCipherLen := System.Length(LInner) + LAead.TagSize;
+  SetLength(LHeader, TRecordLimits.HeaderLength);
+  LHeader[0] := Byte(Ord(TTlsContentType.ApplicationData));
+  LHeader[1] := $03;
+  LHeader[2] := $03;
+  LHeader[3] := Byte(LCipherLen shr 8);
+  LHeader[4] := Byte(LCipherLen and $FF);
+  LCipher := TAeadUtilities.Seal(LAead, LIv, LHeader, LInner); // seq 0 => nonce = IV
+  SetLength(LRecord, System.Length(LHeader) + System.Length(LCipher));
+  System.Move(LHeader[0], LRecord[0], System.Length(LHeader));
+  System.Move(LCipher[0], LRecord[System.Length(LHeader)], System.Length(LCipher));
+
+  LRecv := TRecordLayer.Create;
+  try
+    LRecv.SetReadProtection(MakeTls13(LKey, LIv));
+    LRecv.SetRecordSizeLimit(TRecordLimits.MaxPlaintext, 64);
+    LRaised := False;
+    try
+      LRecv.ProcessInput(LRecord, 0, System.Length(LRecord));
+      DrainOne(LRecv, LFrag);
+    except
+      on E: EFatalAlertTlsLibException do
+        LRaised := Ord(E.AlertDescription) = Ord(TTlsAlertDescription.RecordOverflow);
+    end;
+    CheckTrue(LRaised,
+      'padding must not hide an over-limit record: TLSInnerPlaintext is measured, not content');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestRecordSizeLimitInnerPlaintextBoundary;
+var
+  LSend, LRecv: TRecordLayer;
+  LKey, LIv, LData, LWire: TBytes;
+  LFrag: TTlsRecordFragment;
+  LRaised: Boolean;
+begin
+  LSend := TRecordLayer.Create;
+  LRecv := TRecordLayer.Create;
+  try
+    LKey := DecodeHex('000102030405060708090a0b0c0d0e0f');
+    LIv := DecodeHex('101112131415161718191a1b');
+    LSend.SetWriteProtection(MakeTls13(LKey, LIv));
+    LRecv.SetReadProtection(MakeTls13(LKey, LIv));
+    // limit 64: 63 content bytes make an inner plaintext of exactly 64 (content + type) and
+    // must pass; 64 content bytes make 65 and must be record_overflow
+    LData := nil;
+    SetLength(LData, 64);
+    LSend.Write(TTlsContentType.ApplicationData, LData, 0, 63); // inner 64 == limit
+    LSend.Write(TTlsContentType.ApplicationData, LData, 0, 64); // inner 65 > limit
+    LWire := TakeAll(LSend);
+    LRecv.SetRecordSizeLimit(TRecordLimits.MaxPlaintext, 64);
+    LRecv.ProcessInput(LWire, 0, System.Length(LWire));
+    CheckTrue(DrainOne(LRecv, LFrag), 'the inner-plaintext-at-limit record is accepted');
+    CheckEquals(63, System.Length(LFrag.Data), 'the accepted record carries its content');
+    LRaised := False;
+    try
+      DrainOne(LRecv, LFrag);
+    except
+      on E: EFatalAlertTlsLibException do
+        LRaised := Ord(E.AlertDescription) = Ord(TTlsAlertDescription.RecordOverflow);
+    end;
+    CheckTrue(LRaised, 'the inner-plaintext-over-limit record is record_overflow');
+  finally
+    LSend.Free;
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestRecordSizeLimitExemptsAcceptedEarlyDataRecords;
+var
+  LSend, LRecv: TRecordLayer;
+  LKey, LIv, LData, LWire: TBytes;
+  LFrag: TTlsRecordFragment;
+  LRaised: Boolean;
+begin
+  // the early keys predate the limit this handshake sets in EncryptedExtensions (RFC 8449 4), so
+  // an accepted early record over the limit is not an overflow; once the window closes the
+  // limit applies again
+  LSend := TRecordLayer.Create;
+  LRecv := TRecordLayer.Create;
+  try
+    LKey := DecodeHex('000102030405060708090a0b0c0d0e0f');
+    LIv := DecodeHex('101112131415161718191a1b');
+    LSend.SetWriteProtection(MakeTls13(LKey, LIv));
+    LRecv.SetReadProtection(MakeTls13(LKey, LIv));
+    LData := nil;
+    SetLength(LData, 200);
+    LSend.Write(TTlsContentType.ApplicationData, LData, 0, 200); // inner 201 > limit 64
+    LSend.Write(TTlsContentType.ApplicationData, LData, 0, 200);
+    LWire := TakeAll(LSend);
+    LRecv.SetRecordSizeLimit(TRecordLimits.MaxPlaintext, 64);
+    LRecv.SetEarlyReadAccepted(True, 1000);
+    LRecv.ProcessInput(LWire, 0, System.Length(LWire));
+    CheckTrue(DrainOne(LRecv, LFrag), 'an over-limit accepted early record is accepted');
+    CheckEquals(200, System.Length(LFrag.Data), 'the early record carries its content');
+    CheckTrue(LFrag.Early, 'the record is taken as early data');
+    LRecv.SetEarlyReadAccepted(False, 0);
+    LRaised := False;
+    try
+      DrainOne(LRecv, LFrag);
+    except
+      on E: EFatalAlertTlsLibException do
+        LRaised := Ord(E.AlertDescription) = Ord(TTlsAlertDescription.RecordOverflow);
+    end;
+    CheckTrue(LRaised, 'the same record past the early window is record_overflow');
+  finally
+    LSend.Free;
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestRecordSizeLimitExemptsPlaintextRecords;
+var
+  LSend, LRecv: TRecordLayer;
+  LFrag: TTlsRecordFragment;
+  LPayload, LWire: TBytes;
+begin
+  // RFC 8449 4: only protected records are subject to record_size_limit. A plaintext read epoch
+  // (no read protection installed) must accept a record larger than the negotiated inbound limit.
+  LSend := TRecordLayer.Create;
+  LRecv := TRecordLayer.Create;
+  try
+    LPayload := nil;
+    SetLength(LPayload, 200); // larger than the 64-byte inbound limit set below
+    LSend.Write(TTlsContentType.Handshake, LPayload, 0, System.Length(LPayload));
+    LWire := TakeAll(LSend);
+    LRecv.SetRecordSizeLimit(TRecordLimits.MaxPlaintext, 64);
+    LRecv.ProcessInput(LWire, 0, System.Length(LWire));
+    CheckTrue(LRecv.NextIncoming(LFrag),
+      'an over-limit plaintext record is accepted (unprotected records are exempt)');
+    CheckEquals(200, System.Length(LFrag.Data), 'the full plaintext record surfaces');
+  finally
+    LSend.Free;
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestSkippedPlaintextEarlyDataAcceptsFullSizeRecord;
+var
+  LRecv: TRecordLayer;
+  LFrag: TTlsRecordFragment;
+  LWire, LHs: TBytes;
+  LBody: Int32;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    // HRR + 0-RTT: the client's full-size early-data record (16368 plaintext + 17 AEAD overhead)
+    // arrives under the null epoch and must be dropped, not refused as record_overflow
+    LRecv.SetEarlyDataSkip(1 shl 15);
+    LBody := TRecordLimits.MaxPlaintext + 1;
+    System.SetLength(LWire, TRecordLimits.HeaderLength + LBody);
+    LWire[0] := 23;
+    LWire[1] := 3;
+    LWire[2] := 3;
+    LWire[3] := Byte(LBody shr 8);
+    LWire[4] := Byte(LBody);
+    LRecv.ProcessInput(LWire, 0, System.Length(LWire));
+    CheckFalse(DrainOne(LRecv, LFrag), 'the full-size early-data record is dropped');
+    // a genuine handshake record then ends the skip window and surfaces
+    LHs := DecodeHex('160303000401000000');
+    LRecv.ProcessInput(LHs, 0, System.Length(LHs));
+    CheckTrue(DrainOne(LRecv, LFrag), 'the handshake record after the skip surfaces');
+    CheckTrue(LFrag.ContentType = TTlsContentType.Handshake, 'it is the handshake record');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestPlaintextAlertBeforeFirstDecryptIsAcceptedInTls13;
+var
+  LSend, LRecv: TRecordLayer;
+  LFrag: TTlsRecordFragment;
+  LKey, LIv, LAlert, LA, LWire: TBytes;
+begin
+  LSend := TRecordLayer.Create;
+  LRecv := TRecordLayer.Create;
+  try
+    LKey := DecodeHex('000102030405060708090a0b0c0d0e0f');
+    LIv := DecodeHex('101112131415161718191a1b');
+    LSend.SetWriteProtection(MakeTls13(LKey, LIv));
+    LRecv.SetReadProtection(MakeTls13(LKey, LIv));
+    LRecv.SetNegotiatedVersion(TTlsVersion.Tls13);
+    // a peer that failed before it could switch keys sends handshake_failure in plaintext: it
+    // surfaces as that alert, not as our bad_record_mac
+    LAlert := DecodeHex('1503030002022a');
+    LRecv.ProcessInput(LAlert, 0, System.Length(LAlert));
+    CheckTrue(DrainOne(LRecv, LFrag), 'the plaintext alert surfaces');
+    CheckTrue(LFrag.ContentType = TTlsContentType.Alert, 'it is an alert');
+    CheckEqualBytes('with the peer''s bytes', DecodeHex('022a'), LFrag.Data);
+    // once a record has decrypted under the epoch, plaintext is no longer expected
+    LA := DecodeHex('48656c6c6f');
+    LSend.Write(TTlsContentType.ApplicationData, LA, 0, 5);
+    LWire := TakeAll(LSend);
+    LRecv.ProcessInput(LWire, 0, System.Length(LWire));
+    CheckTrue(DrainOne(LRecv, LFrag), 'a protected record decrypts');
+    CheckTrue(ExpectFatal(LRecv, LAlert, TTlsAlertDescription.BadRecordMac),
+      'a plaintext alert after a decrypt is a bad_record_mac');
+  finally
+    LSend.Free;
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestPlaintextHelloFlightDoesNotCloseTheAlertWindow;
+var
+  LRecv: TRecordLayer;
+  LFrag: TTlsRecordFragment;
+  LHello, LAlert: TBytes;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    LRecv.SetNegotiatedVersion(TTlsVersion.Tls13);
+    // the hello flight arrives in plaintext; decoding it is not a decrypt
+    LHello := DecodeHex('1603030004' + '0e000000');
+    LRecv.ProcessInput(LHello, 0, System.Length(LHello));
+    CheckTrue(DrainOne(LRecv, LFrag), 'the plaintext handshake record surfaces');
+    LRecv.SetReadProtection(MakeTls13(DecodeHex('000102030405060708090a0b0c0d0e0f'),
+      DecodeHex('101112131415161718191a1b')));
+    // a peer failing before its first protected record may still alert in plaintext
+    LAlert := DecodeHex('1503030002022a');
+    LRecv.ProcessInput(LAlert, 0, System.Length(LAlert));
+    CheckTrue(DrainOne(LRecv, LFrag), 'the plaintext fatal alert surfaces');
+    CheckTrue(LFrag.ContentType = TTlsContentType.Alert, 'it is an alert');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestPlaintextAlertAfterAKeyChangeIsStillRefused;
+var
+  LSend, LRecv: TRecordLayer;
+  LFrag: TTlsRecordFragment;
+  LKey, LIv, LA, LWire: TBytes;
+begin
+  LSend := TRecordLayer.Create;
+  LRecv := TRecordLayer.Create;
+  try
+    LKey := DecodeHex('000102030405060708090a0b0c0d0e0f');
+    LIv := DecodeHex('101112131415161718191a1b');
+    LSend.SetWriteProtection(MakeTls13(LKey, LIv));
+    LRecv.SetReadProtection(MakeTls13(LKey, LIv));
+    LRecv.SetNegotiatedVersion(TTlsVersion.Tls13);
+    LA := DecodeHex('48656c6c6f');
+    LSend.Write(TTlsContentType.ApplicationData, LA, 0, 5);
+    LWire := TakeAll(LSend);
+    LRecv.ProcessInput(LWire, 0, System.Length(LWire));
+    CheckTrue(DrainOne(LRecv, LFrag), 'a protected record decrypts');
+    // a key change (a KeyUpdate, or the switch to application keys) does not reopen the plaintext
+    // window: an injected close_notify must not read as the peer's clean, authenticated close
+    LRecv.SetReadProtection(MakeTls13(DecodeHex('0f0e0d0c0b0a09080706050403020100'), LIv));
+    CheckTrue(ExpectFatal(LRecv, DecodeHex('15030300020100'), TTlsAlertDescription.BadRecordMac),
+      'a plaintext close_notify after a key change is refused');
+  finally
+    LSend.Free;
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestPlaintextCloseNotifyIsNeverHonoured;
+var
+  LRecv: TRecordLayer;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    LRecv.SetReadProtection(MakeTls13(DecodeHex('000102030405060708090a0b0c0d0e0f'),
+      DecodeHex('101112131415161718191a1b')));
+    LRecv.SetNegotiatedVersion(TTlsVersion.Tls13);
+    // before anything has decrypted only a FATAL plaintext alert is accepted; a warning level
+    // alert (close_notify) is unauthenticated and would forge a truncation (library policy; see
+    // RFC 9846 6.1)
+    CheckTrue(ExpectFatal(LRecv, DecodeHex('15030300020100'), TTlsAlertDescription.BadRecordMac),
+      'a plaintext close_notify is refused');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestPlaintextFatalLevelCloseNotifyIsRefused;
+var
+  LRecv: TRecordLayer;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    LRecv.SetReadProtection(MakeTls13(DecodeHex('000102030405060708090a0b0c0d0e0f'),
+      DecodeHex('101112131415161718191a1b')));
+    LRecv.SetNegotiatedVersion(TTlsVersion.Tls13);
+    // close_notify closes at any level, so a fatal-level one must not pass the fatal allowance
+    CheckTrue(ExpectFatal(LRecv, DecodeHex('15030300020200'), TTlsAlertDescription.BadRecordMac),
+      'a plaintext close_notify at fatal level is refused');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestPlaintextAlertIsNotAcceptedInTls12;
+var
+  LRecv: TRecordLayer;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    LRecv.SetReadProtection(MakeTls12(DecodeHex('000102030405060708090a0b0c0d0e0f'),
+      DecodeHex('10111213')));
+    LRecv.SetNegotiatedVersion(TTlsVersion.Tls12);
+    CheckTrue(ExpectFatal(LRecv, DecodeHex('1503030002022a'),
+      TTlsAlertDescription.BadRecordMac),
+      'TLS 1.2 keying changes at the change_cipher_spec, so a plaintext alert here is unprotected');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestShortTls12RecordIsBadRecordMac;
+var
+  LRecv: TRecordLayer;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    LRecv.SetReadProtection(MakeTls12(DecodeHex('000102030405060708090a0b0c0d0e0f'),
+      DecodeHex('10111213')));
+    // a body shorter than the explicit nonce and tag cannot authenticate: bad_record_mac, as a
+    // TLS 1.3 record of the same shape is
+    CheckTrue(ExpectFatal(LRecv, DecodeHex('170303000400010203'),
+      TTlsAlertDescription.BadRecordMac), 'a record shorter than the AEAD overhead');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestDecryptingRecordInSkipWindowIsJudgedStrictly;
+var
+  LSend, LRecv: TRecordLayer;
+  LKey, LIv, LA, LWire: TBytes;
+begin
+  LSend := TRecordLayer.Create;
+  LRecv := TRecordLayer.Create;
+  try
+    LKey := DecodeHex('000102030405060708090a0b0c0d0e0f');
+    LIv := DecodeHex('101112131415161718191a1b');
+    LSend.SetWriteProtection(MakeTls13(LKey, LIv));
+    LRecv.SetReadProtection(MakeTls13(LKey, LIv));
+    LRecv.StrictApplicationData := True;
+    LRecv.SetEarlyDataSkip(64);
+    LA := DecodeHex('48656c6c6f');
+    LSend.Write(TTlsContentType.ApplicationData, LA, 0, 5);
+    LWire := TakeAll(LSend);
+    // a record that decrypts under held keys is not skippable early data; before the handshake
+    // completes the strict path refuses it rather than delivering it
+    CheckTrue(ExpectFatal(LRecv, LWire, TTlsAlertDescription.UnexpectedMessage),
+      'a record that decrypts during the skip window is judged, not dropped');
+  finally
+    LSend.Free;
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestAcceptedEarlyDataBoundedAtBudget;
+var
+  LSend, LRecv: TRecordLayer;
+  LFrag: TTlsRecordFragment;
+  LKey, LIv, LA, LB, LFirst, LSecond: TBytes;
+begin
+  LSend := TRecordLayer.Create;
+  LRecv := TRecordLayer.Create;
+  try
+    LKey := DecodeHex('000102030405060708090a0b0c0d0e0f');
+    LIv := DecodeHex('101112131415161718191a1b');
+    LSend.SetWriteProtection(MakeTls13(LKey, LIv));
+    LRecv.SetReadProtection(MakeTls13(LKey, LIv));
+    LRecv.StrictApplicationData := True;
+    // the accepted 0-RTT window admits at most the ticket's max_early_data_size (8 here)
+    LRecv.SetEarlyReadAccepted(True, 8);
+    LA := DecodeHex('48656c6c6f'); // "Hello"
+    LB := DecodeHex('576f726c64'); // "World"
+    LSend.Write(TTlsContentType.ApplicationData, LA, 0, 5);
+    LFirst := TakeAll(LSend);
+    LSend.Write(TTlsContentType.ApplicationData, LB, 0, 5);
+    LSecond := TakeAll(LSend);
+    LRecv.ProcessInput(LFirst, 0, System.Length(LFirst));
+    CheckTrue(DrainOne(LRecv, LFrag), 'early data within the budget surfaces');
+    CheckEqualBytes('the first early record is delivered', LA, LFrag.Data);
+    // 5 + 5 exceeds the 8-byte budget: the server MUST terminate with unexpected_message
+    // (RFC 9846 4.7.1)
+    CheckTrue(ExpectFatal(LRecv, LSecond, TTlsAlertDescription.UnexpectedMessage),
+      'accepted early data beyond max_early_data_size is unexpected_message');
+  finally
+    LSend.Free;
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestAcceptedEarlyDataExactBudgetThenNormalFlow;
+var
+  LSend, LRecv: TRecordLayer;
+  LFrag: TTlsRecordFragment;
+  LKey, LIv, LA, LB, LC, LWire: TBytes;
+begin
+  LSend := TRecordLayer.Create;
+  LRecv := TRecordLayer.Create;
+  try
+    LKey := DecodeHex('000102030405060708090a0b0c0d0e0f');
+    LIv := DecodeHex('101112131415161718191a1b');
+    LSend.SetWriteProtection(MakeTls13(LKey, LIv));
+    LRecv.SetReadProtection(MakeTls13(LKey, LIv));
+    LRecv.StrictApplicationData := True;
+    LRecv.SetEarlyReadAccepted(True, 8);
+    LA := DecodeHex('48656c6c6f'); // "Hello" (5)
+    LB := DecodeHex('212121');     // "!!!" (3)
+    // 5 + 3 exactly fills the budget: both surface
+    LSend.Write(TTlsContentType.ApplicationData, LA, 0, 5);
+    LSend.Write(TTlsContentType.ApplicationData, LB, 0, 3);
+    LWire := TakeAll(LSend);
+    LRecv.ProcessInput(LWire, 0, System.Length(LWire));
+    CheckTrue(DrainOne(LRecv, LFrag), 'first early record within the budget');
+    CheckEqualBytes('first early plaintext', LA, LFrag.Data);
+    CheckTrue(LFrag.Early, 'a record inside the early window is tagged as early data');
+    CheckTrue(DrainOne(LRecv, LFrag), 'second early record exactly fills the budget');
+    CheckEqualBytes('second early plaintext', LB, LFrag.Data);
+    CheckTrue(LFrag.Early, 'the second early record is tagged too');
+    // the window closes at EndOfEarlyData and the handshake completes; ordinary application
+    // data then flows uncounted
+    LRecv.SetEarlyReadAccepted(False, 0);
+    LRecv.SetHandshakeComplete;
+    LC := DecodeHex('576f726c64'); // "World"
+    LSend.Write(TTlsContentType.ApplicationData, LC, 0, 5);
+    LWire := TakeAll(LSend);
+    LRecv.ProcessInput(LWire, 0, System.Length(LWire));
+    CheckTrue(DrainOne(LRecv, LFrag), 'application data flows after the early window closes');
+    CheckEqualBytes('post-early plaintext', LC, LFrag.Data);
+    CheckFalse(LFrag.Early, 'application data after the window closes is not early data');
+  finally
+    LSend.Free;
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestWritePausesAppDataAtRekeyThreshold;
+var
+  LSend: TRecordLayer;
+  LProt: IRecordProtection;
+  LData: TBytes;
+begin
+  LSend := TRecordLayer.Create;
+  try
+    // a capped AEAD whose usage limit is one past the rekey lead (17 = lead 16 + 1) reaches the
+    // rekey threshold after a single sealed record, without parking the sequence
+    LProt := MakeTls13Capped(DecodeHex('000102030405060708090a0b0c0d0e0f'),
+      DecodeHex('101112131415161718191a1b'), 17);
+    LSend.SetWriteProtection(LProt);
+    LData := nil;
+    SetLength(LData, 100);
+    // the first application record seals normally and advances the epoch to its rekey threshold
+    CheckTrue(LSend.Write(TTlsContentType.ApplicationData, LData, 0, 100) > 0,
+      'the first application record seals normally');
+    TakeAll(LSend); // drain it off the wire
+    CheckTrue(LSend.WriteNeedsKeyUpdate, 'the write epoch reached the rekey threshold');
+    // application data now seals nothing while at the threshold, so the engine can rekey first
+    CheckEquals(0, LSend.Write(TTlsContentType.ApplicationData, LData, 0, 100),
+      'application data pauses at the rekey threshold');
+    CheckEquals(0, System.Length(TakeAll(LSend)), 'nothing was sealed for the app data');
+    // a control record (handshake) still seals in full so the KeyUpdate itself can go out
+    CheckEquals(4, LSend.Write(TTlsContentType.Handshake, LData, 0, 4),
+      'a control record still seals at the threshold');
+    CheckTrue(System.Length(TakeAll(LSend)) > 0, 'the control record reached the wire');
+  finally
+    LSend.Free;
+  end;
+end;
+
 procedure TTestRecordLayer.TestChangeCipherSpecDropped;
 var
   LRecv: TRecordLayer;
@@ -410,9 +1122,68 @@ var
 begin
   LRecv := TRecordLayer.Create;
   try
-    // a well-formed legacy CCS (type 20, single 0x01) is silently discarded
+    // under TLS 1.3 a well-formed legacy CCS (type 20, single 0x01) is middlebox-compat
+    // filler: silently discarded
+    LRecv.SetNegotiatedVersion(TTlsVersion.Tls13);
     LRecv.ProcessInput(DecodeHex('140303000101'), 0, 6);
     CheckFalse(DrainOne(LRecv, LFrag), 'CCS is not delivered');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestChangeCipherSpecBeforeHelloRejected;
+var
+  LRecv: TRecordLayer;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    // before any peer hello fixes the version, a change_cipher_spec is out of its legal
+    // window (RFC 9846 E.4): unexpected_message, not silently dropped
+    CheckTrue(ExpectFatal(LRecv, DecodeHex('140303000101'),
+      TTlsAlertDescription.UnexpectedMessage),
+      'a change_cipher_spec before the peer hello is unexpected_message');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestTls12UnarmedChangeCipherSpecRejected;
+var
+  LRecv: TRecordLayer;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    // a TLS 1.2 change_cipher_spec with no read epoch armed (before ClientKeyExchange, or a
+    // stray extra one) is out of its legal window, not dropped (RFC 5246 7.1)
+    LRecv.SetNegotiatedVersion(TTlsVersion.Tls12);
+    CheckTrue(ExpectFatal(LRecv, DecodeHex('140303000101'),
+      TTlsAlertDescription.UnexpectedMessage),
+      'an unarmed TLS 1.2 change_cipher_spec is unexpected_message');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestTls12OversizePlaintextRecordIsRecordOverflow;
+var
+  LRecv: TRecordLayer;
+  LKey, LSalt, LPlain, LWire: TBytes;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    LKey := DecodeHex('000102030405060708090a0b0c0d0e0f');
+    LSalt := DecodeHex('cafebabe');
+    // a validly protected TLS 1.2 record whose plaintext is one byte over 2^14 passes the
+    // framing ceiling and must be refused at decrypt time (the sender's 2^14 limit, RFC 5246 6.2.1,
+    // checked on receipt)
+    LPlain := MakePayload(TRecordLimits.MaxPlaintext + 1, $5A);
+    LWire := MakeTls12(LKey, LSalt).Protect(TTlsContentType.ApplicationData, LPlain, 0,
+      System.Length(LPlain));
+    LRecv.SetNegotiatedVersion(TTlsVersion.Tls12);
+    LRecv.SetReadProtection(MakeTls12(LKey, LSalt));
+    CheckTrue(ExpectFatal(LRecv, LWire, TTlsAlertDescription.RecordOverflow),
+      'an oversize TLS 1.2 plaintext is record_overflow');
   finally
     LRecv.Free;
   end;
@@ -426,12 +1197,12 @@ var
 begin
   LRecv := TRecordLayer.Create;
   try
-    LRecv.MaxChangeCipherSpec := 2;
+    LRecv.SetNegotiatedVersion(TTlsVersion.Tls13);
     LCcs := DecodeHex('140303000101'); // one legal middlebox CCS
     LFlood := nil;
     for LI := 0 to 4 do
       LFlood := ConcatBytes(LFlood, LCcs);
-    // the first two are tolerated and dropped; the third trips the cap
+    // the default cap tolerates two; the third trips it
     CheckTrue(ExpectFatal(LRecv, LFlood, TTlsAlertDescription.UnexpectedMessage),
       'a change_cipher_spec flood is capped');
   finally
@@ -512,7 +1283,7 @@ begin
     LPayload := DecodeHex('48656c6c6f'); // "Hello"
     LSend.Write(TTlsContentType.ApplicationData, LPayload, 0, System.Length(LPayload));
     // the peer's CCS immediately precedes its first protected record
-    LWire := ConcatBytes(DecodeHex('140303000101'), LSend.TakeOutgoing);
+    LWire := ConcatBytes(DecodeHex('140303000101'), TakeAll(LSend));
     LRecv.ProcessInput(LWire, 0, System.Length(LWire));
     CheckTrue(DrainOne(LRecv, LFrag), 'the protected record after the CCS decrypts');
     CheckEqualBytes('it decrypts under the promoted epoch', LPayload, LFrag.Data);
@@ -622,6 +1393,132 @@ begin
   end;
 end;
 
+procedure TTestRecordLayer.TestBadHeaderBehindFramedRecordIsRaisedAfterIt;
+var
+  LRecv: TRecordLayer;
+  LFrag: TTlsRecordFragment;
+  LRaised: Boolean;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    // a good record then a header with an unknown type: the feed itself does not raise
+    LRecv.ProcessInput(DecodeHex('1603030004aabbccddff03030001'), 0, 14);
+    CheckTrue(DrainOne(LRecv, LFrag), 'the record framed ahead of the bad header is delivered');
+    CheckEqualBytes('its payload is intact', DecodeHex('aabbccdd'), LFrag.Data);
+    LRaised := False;
+    try
+      DrainOne(LRecv, LFrag);
+    except
+      on E: EFatalAlertTlsLibException do
+        LRaised := Ord(E.AlertDescription) = Ord(TTlsAlertDescription.UnexpectedMessage);
+    end;
+    CheckTrue(LRaised, 'the bad header is raised once the framed records are drained');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestBadHeaderWithNothingFramedFailsAtOnce;
+var
+  LRecv: TRecordLayer;
+  LRaised: Boolean;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    LRaised := False;
+    try
+      LRecv.ProcessInput(DecodeHex('ff03030001'), 0, 5);
+    except
+      on E: EFatalAlertTlsLibException do
+        LRaised := Ord(E.AlertDescription) = Ord(TTlsAlertDescription.UnexpectedMessage);
+    end;
+    CheckTrue(LRaised, 'the feed itself raises when no record was framed ahead of the header');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestOverflowHeaderBehindFramedRecordIsRaisedAfterIt;
+var
+  LRecv: TRecordLayer;
+  LFrag: TTlsRecordFragment;
+  LRaised: Boolean;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    // a good record then a header whose length exceeds the ceiling: deferred like an unknown type
+    LRecv.ProcessInput(DecodeHex('1603030004aabbccdd170303ffff'), 0, 14);
+    CheckTrue(DrainOne(LRecv, LFrag), 'the record framed ahead of the oversized header is delivered');
+    LRaised := False;
+    try
+      DrainOne(LRecv, LFrag);
+    except
+      on E: EFatalAlertTlsLibException do
+        LRaised := Ord(E.AlertDescription) = Ord(TTlsAlertDescription.RecordOverflow);
+    end;
+    CheckTrue(LRaised, 'the oversized header is raised as record_overflow once the framed records are drained');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestLayerFailedAfterDeferredBadHeaderRaised;
+var
+  LRecv: TRecordLayer;
+  LFrag: TTlsRecordFragment;
+  LRaised: Boolean;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    LRecv.ProcessInput(DecodeHex('1603030004aabbccddff03030001'), 0, 14);
+    DrainOne(LRecv, LFrag);
+    try
+      DrainOne(LRecv, LFrag);
+    except
+      on EFatalAlertTlsLibException do
+        ;
+    end;
+    LRaised := False;
+    try
+      DrainOne(LRecv, LFrag);
+    except
+      on E: EInvalidOperationTlsLibException do
+        LRaised := True;
+    end;
+    CheckTrue(LRaised, 'the layer refuses further reads after the deferred error was raised');
+    LRaised := False;
+    try
+      LRecv.ProcessInput(DecodeHex('1703030000'), 0, 5);
+    except
+      on E: EInvalidOperationTlsLibException do
+        LRaised := True;
+    end;
+    CheckTrue(LRaised, 'the layer refuses further input after the deferred error was raised');
+  finally
+    LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestDiscardInboundClearsDeferredBadHeader;
+var
+  LRecv: TRecordLayer;
+  LFrag: TTlsRecordFragment;
+begin
+  LRecv := TRecordLayer.Create;
+  try
+    LRecv.ProcessInput(DecodeHex('1603030004aabbccddff03030001'), 0, 14);
+    LRecv.DiscardInbound;
+    CheckFalse(DrainOne(LRecv, LFrag), 'discarding drops the framed record and the deferred error');
+    // the layer stays usable: a good record fed after the discard is delivered
+    LRecv.ProcessInput(DecodeHex('1603030004aabbccdd'), 0, 9);
+    CheckTrue(DrainOne(LRecv, LFrag), 'a record fed after the discard is processed normally');
+    CheckEqualBytes('its payload is intact', DecodeHex('aabbccdd'), LFrag.Data);
+    CheckFalse(DrainOne(LRecv, LFrag), 'no stale deferred error follows it');
+  finally
+    LRecv.Free;
+  end;
+end;
+
 procedure TTestRecordLayer.TestTerminalAfterFatal;
 var
   LRecv: TRecordLayer;
@@ -641,6 +1538,264 @@ begin
     CheckTrue(LRaised, 'the record layer is terminal after a fatal');
   finally
     LRecv.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestTakeOutgoingIntoBufferRetainsRemainder;
+var
+  LLayer, LExpectLayer: TRecordLayer;
+  LPayload, LExpected, LChunk, LGot: TBytes;
+  LN1, LN2: Int32;
+begin
+  LLayer := TRecordLayer.Create;
+  LExpectLayer := TRecordLayer.Create;
+  try
+    LPayload := DecodeHex('01020304050607'); // 7 content bytes -> a 12-byte plaintext record
+    // an identically framed second layer yields the full-take bytes the chunks must reproduce
+    LExpectLayer.Write(TTlsContentType.Handshake, LPayload, 0, System.Length(LPayload));
+    LExpected := TakeAll(LExpectLayer);
+
+    LLayer.Write(TTlsContentType.Handshake, LPayload, 0, System.Length(LPayload));
+    // take into a fixed 8-byte buffer twice: the first take fills it to capacity, the second
+    // drains the retained remainder
+    LChunk := nil;
+    SetLength(LChunk, 8);
+    LN1 := LLayer.TakeOutgoing(LChunk, 0);
+    CheckEquals(8, LN1, 'the first take fills the buffer to capacity');
+    LGot := System.Copy(LChunk, 0, LN1);
+    LN2 := LLayer.TakeOutgoing(LChunk, 0);
+    CheckEquals(System.Length(LExpected) - 8, LN2,
+      'the second take returns the retained remainder');
+    LGot := ConcatBytes(LGot, System.Copy(LChunk, 0, LN2));
+    CheckEqualBytes('the two chunks reproduce the full-take bytes', LExpected, LGot);
+    CheckEquals(0, LLayer.PendingOutgoing, 'nothing is left pending after both takes');
+  finally
+    LLayer.Free;
+    LExpectLayer.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestTakeOutgoingIntoBufferGuardsBadOffset;
+var
+  LLayer, LExpectLayer: TRecordLayer;
+  LPayload, LExpected, LDest: TBytes;
+begin
+  LLayer := TRecordLayer.Create;
+  LExpectLayer := TRecordLayer.Create;
+  try
+    LPayload := DecodeHex('01020304050607');
+    LExpectLayer.Write(TTlsContentType.Handshake, LPayload, 0, System.Length(LPayload));
+    LExpected := TakeAll(LExpectLayer);
+
+    LLayer.Write(TTlsContentType.Handshake, LPayload, 0, System.Length(LPayload));
+    LDest := nil;
+    SetLength(LDest, 16);
+    // a negative destination offset copies nothing
+    CheckEquals(0, LLayer.TakeOutgoing(LDest, -1), 'a negative offset takes nothing');
+    // a zero-capacity destination (offset at its end) likewise copies nothing
+    CheckEquals(0, LLayer.TakeOutgoing(LDest, System.Length(LDest)),
+      'a zero-capacity destination takes nothing');
+    // neither guarded take consumed anything: a normal take still returns the pending bytes whole
+    CheckEqualBytes('the guarded takes left the pending bytes intact', LExpected,
+      TakeAll(LLayer));
+  finally
+    LLayer.Free;
+    LExpectLayer.Free;
+  end;
+end;
+
+function TTestRecordLayer.TakeAll(const ALayer: TRecordLayer): TBytes;
+var
+  LChunk: TBytes;
+  LN: Int32;
+begin
+  Result := nil;
+  repeat
+    LChunk := nil;
+    SetLength(LChunk, 4096);
+    LN := ALayer.TakeOutgoing(LChunk, 0);
+    if LN > 0 then
+      Result := ConcatBytes(Result, System.Copy(LChunk, 0, LN));
+  until LN <= 0;
+end;
+
+class function TTestRecordLayer.MakePayload(ALen: Int32; ASeed: Byte): TBytes;
+var
+  I: Int32;
+begin
+  Result := nil;
+  SetLength(Result, ALen);
+  for I := 0 to ALen - 1 do
+    Result[I] := Byte(ASeed + I);
+end;
+
+procedure TTestRecordLayer.TestTakeOutgoingInterleavedAppendDrainPreservesOrder;
+var
+  LLayer, LTwin: TRecordLayer;
+  LA, LB, LExpected, LChunk, LOut: TBytes;
+  LGot: Int32;
+begin
+  LLayer := TRecordLayer.Create;
+  LTwin := TRecordLayer.Create;
+  try
+    LA := MakePayload(7, $10);
+    LB := MakePayload(20, $80);
+    // the twin frames the same two writes back-to-back; its whole-take is the byte-exact
+    // wire the interleaved append/drain below must reproduce in order
+    LTwin.Write(TTlsContentType.Handshake, LA, 0, System.Length(LA));
+    LTwin.Write(TTlsContentType.Handshake, LB, 0, System.Length(LB));
+    LExpected := TakeAll(LTwin);
+
+    LLayer.Write(TTlsContentType.Handshake, LA, 0, System.Length(LA));
+    // take part of A's record (leaves the head cursor mid-buffer), then append B behind it
+    LChunk := nil;
+    SetLength(LChunk, 8);
+    LGot := LLayer.TakeOutgoing(LChunk, 0);
+    LOut := System.Copy(LChunk, 0, LGot);
+    LLayer.Write(TTlsContentType.Handshake, LB, 0, System.Length(LB));
+    // drain the rest in 8-byte takes
+    repeat
+      LGot := LLayer.TakeOutgoing(LChunk, 0);
+      if LGot > 0 then
+        LOut := ConcatBytes(LOut, System.Copy(LChunk, 0, LGot));
+    until LGot = 0;
+    CheckEqualBytes('interleaved append/drain reproduces the contiguous wire', LExpected, LOut);
+    CheckEquals(0, LLayer.PendingOutgoing, 'nothing pending after a full drain');
+  finally
+    LLayer.Free;
+    LTwin.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestTakeOutgoingAppendAfterPartialDrainCompacts;
+var
+  LLayer, LTwin: TRecordLayer;
+  LRec, LExpected, LChunk, LOut: TBytes;
+  LGot, I: Int32;
+begin
+  LLayer := TRecordLayer.Create;
+  LTwin := TRecordLayer.Create;
+  try
+    // a full-size plaintext record per write; three of them exceed the initial capacity, so
+    // an append lands with the head cursor advanced -> the compaction-before-grow path
+    LRec := MakePayload(16384, $21);
+    for I := 0 to 2 do
+      LTwin.Write(TTlsContentType.ApplicationData, LRec, 0, System.Length(LRec));
+    LExpected := TakeAll(LTwin);
+
+    LLayer.Write(TTlsContentType.ApplicationData, LRec, 0, System.Length(LRec));
+    LChunk := nil;
+    SetLength(LChunk, 4096);
+    LGot := LLayer.TakeOutgoing(LChunk, 0); // partial drain -> head cursor > 0
+    LOut := System.Copy(LChunk, 0, LGot);
+    // two more full records: the first append compacts the drained prefix then grows
+    LLayer.Write(TTlsContentType.ApplicationData, LRec, 0, System.Length(LRec));
+    LLayer.Write(TTlsContentType.ApplicationData, LRec, 0, System.Length(LRec));
+    SetLength(LChunk, 16384);
+    repeat
+      LGot := LLayer.TakeOutgoing(LChunk, 0);
+      if LGot > 0 then
+        LOut := ConcatBytes(LOut, System.Copy(LChunk, 0, LGot));
+    until LGot = 0;
+    CheckEqualBytes('compaction-before-grow keeps the wire byte-exact', LExpected, LOut);
+    CheckEquals(0, LLayer.PendingOutgoing, 'nothing pending after a full drain');
+  finally
+    LLayer.Free;
+    LTwin.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestTakeOutgoingReleasesAndRegrowsAfterLargeWrite;
+var
+  LLayer, LTwin: TRecordLayer;
+  LBig, LSmall, LExpectedSmall, LChunk, LOut: TBytes;
+  LGot, I: Int32;
+begin
+  LLayer := TRecordLayer.Create;
+  LTwin := TRecordLayer.Create;
+  try
+    // six full records blow the buffer well past the retain cap; a full drain must release it
+    LBig := MakePayload(16384, $05);
+    for I := 0 to 5 do
+      LLayer.Write(TTlsContentType.ApplicationData, LBig, 0, System.Length(LBig));
+    LChunk := nil;
+    SetLength(LChunk, 16384);
+    repeat
+      LGot := LLayer.TakeOutgoing(LChunk, 0);
+    until LGot = 0;
+    CheckEquals(0, LLayer.PendingOutgoing, 'the large write fully drained');
+
+    // after the release, a fresh small write must regrow correctly and stay byte-exact
+    LSmall := MakePayload(9, $C0);
+    LTwin.Write(TTlsContentType.Handshake, LSmall, 0, System.Length(LSmall));
+    LExpectedSmall := TakeAll(LTwin);
+    LLayer.Write(TTlsContentType.Handshake, LSmall, 0, System.Length(LSmall));
+    LOut := TakeAll(LLayer);
+    CheckEqualBytes('the buffer regrows correctly after a release', LExpectedSmall, LOut);
+  finally
+    LLayer.Free;
+    LTwin.Free;
+  end;
+end;
+
+procedure TTestRecordLayer.TestOutgoingRandomInterleaveMatchesReferenceQueue;
+var
+  LLayer, LScratch: TRecordLayer;
+  LRef, LOut, LPayload, LChunk, LWritten: TBytes;
+  LOp, LLen, LCap, LGot, I: Int32;
+begin
+  LLayer := TRecordLayer.Create;
+  LScratch := TRecordLayer.Create;
+  try
+    RandSeed := 20240924;
+    LRef := nil;
+    LOut := nil;
+    for I := 0 to 299 do
+    begin
+      LOp := Random(3);
+      if LOp = 0 then
+      begin
+        // write a random-size record to the layer; the scratch layer yields its framed bytes
+        // so the reference wire grows by exactly what was queued
+        LLen := 1 + Random(40000);
+        LPayload := MakePayload(LLen, Byte(I));
+        LScratch.Write(TTlsContentType.ApplicationData, LPayload, 0, LLen);
+        LWritten := TakeAll(LScratch);
+        LRef := ConcatBytes(LRef, LWritten);
+        LLayer.Write(TTlsContentType.ApplicationData, LPayload, 0, LLen);
+      end
+      else if LOp = 1 then
+      begin
+        // partial take into a random-capacity buffer
+        LCap := 1 + Random(20000);
+        LChunk := nil;
+        SetLength(LChunk, LCap);
+        LGot := LLayer.TakeOutgoing(LChunk, 0);
+        if LGot > 0 then
+          LOut := ConcatBytes(LOut, System.Copy(LChunk, 0, LGot));
+      end
+      else
+      begin
+        // occasional whole-take
+        LWritten := TakeAll(LLayer);
+        if System.Length(LWritten) > 0 then
+          LOut := ConcatBytes(LOut, LWritten);
+      end;
+    end;
+    // drain whatever remains
+    LChunk := nil;
+    SetLength(LChunk, 16384);
+    repeat
+      LGot := LLayer.TakeOutgoing(LChunk, 0);
+      if LGot > 0 then
+        LOut := ConcatBytes(LOut, System.Copy(LChunk, 0, LGot));
+    until LGot = 0;
+    CheckEquals(System.Length(LRef), System.Length(LOut),
+      'every queued byte came back out');
+    CheckEqualBytes('random interleave preserves the exact outbound stream', LRef, LOut);
+  finally
+    LLayer.Free;
+    LScratch.Free;
   end;
 end;
 

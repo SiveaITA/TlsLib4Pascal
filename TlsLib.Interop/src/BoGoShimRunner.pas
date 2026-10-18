@@ -20,6 +20,7 @@ interface
 uses
   SysUtils,
   TlpICryptoProvider,
+  TlpIPkixProvider,
   TlpCryptoDomainTypes,
   TlpArrayUtilities,
   TlpISecretBuffer,
@@ -35,9 +36,18 @@ uses
   TlpEchConfig,
   TlpInMemoryEchKeyStore,
   TlpIEch,
+  TlpICertificateCompression,
+  TlpTlsLibExceptions,
+  TlpNegotiationTypes,
+  TlpCipherSuiteCatalog,
+  TlpCipherSuiteRegistry,
+  TlpTlsConnection,
+  TlpTlsConnectionInfo,
   TlpITlsEngine,
+  TlpHandshakeMessages,
   InteropSocket,
   InteropEngine,
+  TlsLibTestProviders,
   InteropCredentials,
   InteropPump,
   InteropUtils;
@@ -49,8 +59,22 @@ const
   ShimExitPass = 0;
   ShimExitFail = 1;
   ShimExitUnimplemented = 89;
+  // the runner fails 90 even for a must-fail test, where loose-errors would pass any failure
+  ShimExitMustFail = 90;
 
 type
+  /// <summary>The reference runner's three mock certificate-compression algorithms (RFC 8879):
+  /// 0xff01 strips the two-byte Certificate prefix 00 00 and declines input without it, 0xff02
+  /// prepends 01 02 03 04 (so it expands), and 0xff03 prepends one random byte. They install in
+  /// the runner's preference order 0xff02, 0xff01, 0xff03.</summary>
+  TBoGoCertCompression = class sealed(TObject)
+  public
+    /// <summary>The compressors for all three algorithms, or only AOnlyAlgorithm when non-zero
+    /// (empty when it names none of them).</summary>
+    class function Compressors(AOnlyAlgorithm: Int32): TArray<ICertificateCompressor>; static;
+    class function Decompressors(AOnlyAlgorithm: Int32): TArray<ICertificateDecompressor>; static;
+  end;
+
   /// <summary>A test clock with a fixed base that only advances by explicit steps, so a
   /// resumption PSK's obfuscated_ticket_age is exactly the runner's -resumption-delay (no
   /// real-time drift). The harness advances it before each resumption connection.</summary>
@@ -71,6 +95,86 @@ type
     IsRetry: Boolean;
   end;
 
+  /// <summary>Which connection a shim-side -expect-* flag binds to: every one, or the one a
+  /// -on-initial- / -on-resume- / -on-retry- prefix names. The retry after a rejected 0-RTT is
+  /// the resumption connection's final state in this shim, so Retry binds to the resumption.</summary>
+  TBoGoExpectScope = (Always, Initial, Resume, Retry);
+  TBoGoExpectScopes = set of TBoGoExpectScope;
+
+  /// <summary>The properties a shim-side -expect-* flag asserts. The first group is checked against
+  /// the finished handshake; the session group (NoSession onward) after the echo loop, because a
+  /// TLS 1.3 ticket arrives after the handshake.</summary>
+  TBoGoExpectKind = (Version, ExtendedMasterSecret, CurveId, ServerName, NoPeerCert,
+    AcceptEarlyData, RejectEarlyData, Cipher, Alpn, AdvertisedAlpn, PeerVerifyPref,
+    PeerSignatureAlgorithm, VerifyResult, PeerCertFile, SecureRenegotiation,
+    HelloRetryRequest, NoHelloRetryRequest, SelectedCredential, EarlyDataReason,
+    TicketAgeSkew, NoOfferEarlyData, EchNameOverride, NoEchNameOverride,
+    NoSession, TicketSupportsEarlyData, TicketRenewal, NotResumableAcrossNames,
+    SessionId, NoSessionId);
+
+  /// <summary>One shim-side assertion: Number holds a numeric value (version, group, suite), Text
+  /// the octets of a string value (server name, ALPN), Name the raw string (a file path, an ALPN
+  /// wire list).</summary>
+  TBoGoExpectation = record
+    Scope: TBoGoExpectScope;
+    Kind: TBoGoExpectKind;
+    Number: Int32;
+    Text: TBytes;
+    Name: string;
+  end;
+
+  /// <summary>What the shim's client session cache saw during the current connection.</summary>
+  IBoGoCacheView = interface(IInterface)
+    ['{77B144CE-1A5C-4211-B9C3-85016A28C06E}']
+    procedure BeginConnection;
+    /// <summary>The session the client took from the cache to offer, or nil.</summary>
+    function OfferedSession: IResumableSession;
+    /// <summary>A session stored this connection other than the offered one (a new ticket or
+    /// session id), or nil.</summary>
+    function NewSession: IResumableSession;
+  end;
+
+  /// <summary>What the shim's server session store saw during the current connection.</summary>
+  IBoGoStoreView = interface(IInterface)
+    ['{248AE7D0-D25E-4B80-8455-B32F926EDC71}']
+    procedure BeginConnection;
+    /// <summary>Whether a session was stored under an id this connection.</summary>
+    function Stored: Boolean;
+  end;
+
+  /// <summary>The ClientHello offer the shim's server credential resolver saw during the current
+  /// connection; the resolver runs on the certificate path only, so a resumed connection leaves it
+  /// unseen.</summary>
+  IBoGoHelloView = interface(IInterface)
+    ['{7E16ED1E-8DDA-4074-979D-E524921A78A4}']
+    procedure BeginConnection;
+    function Seen: Boolean;
+    function AlpnProtocols: TArray<TBytes>;
+    function SignatureSchemes: TArray<UInt16>;
+  end;
+
+  /// <summary>Everything the post-handshake assertions read about one connection.</summary>
+  TBoGoObserved = record
+    Info: TTlsConnectionInfo;
+    IsResume: Boolean;
+    /// <summary>The config-level verify_fail for this connection, whether or not the handshake
+    /// verified a peer.</summary>
+    VerifyFailConfigured: Boolean;
+    /// <summary>Whether the shim installed a WebPKI trust anchor for the peer chain.</summary>
+    WebPkiTrust: Boolean;
+    /// <summary>A client asked for early data that the shim could not configure (it offers only
+    /// TLS 1.2), so its early-data reason is not the test's.</summary>
+    EarlyDataRefused: Boolean;
+    OfferedSession: IResumableSession;
+    NewSession: IResumableSession;
+    HelloSeen: Boolean;
+    HelloAlpn: TArray<TBytes>;
+    HelloSchemes: TArray<UInt16>;
+    ServerSessionStored: Boolean;
+    /// <summary>The host of each verification this connection ran, in order.</summary>
+    VerifiedNames: TArray<string>;
+  end;
+
   /// <summary>The parsed per-test shim configuration BoGo hands over on argv.</summary>
   TBoGoConfig = record
     IsServer: Boolean;
@@ -82,34 +186,53 @@ type
     TrustCert: string;
     HostName: string;
     SuppressServerNameAck: Boolean;
+    /// <summary>-install-cert-compression-algs installs the runner's three test algorithms
+    /// (0xff02, 0xff01, 0xff03, in that preference order); -install-one-cert-compression-alg
+    /// installs only the one codepoint it names. Neither leaves the library defaults.</summary>
+    InstallCertCompressionAlgs: Boolean;
+    InstallOneCertCompressionAlg: Int32;
     EnableGrease: Boolean;
-    ExpectVersion: Int32;
+    /// <summary>The shim-side assertions checked against the finished handshake.</summary>
+    Expectations: TArray<TBoGoExpectation>;
+    /// <summary>-expect-session-miss: the resumption connection must not resume (without it a
+    /// resumption connection must).</summary>
+    ExpectSessionMiss: Boolean;
+    /// <summary>-cipher: the suites the connection is restricted to; empty keeps the defaults.</summary>
+    CipherSuites: TArray<UInt16>;
+    /// <summary>The credentials in argv order: an index into ExternalPsks for a PSK credential,
+    /// -1 for an X.509 one, so -expect-selected-credential reads as a position in this list.</summary>
+    CredentialOrder: TArray<Int32>;
+    /// <summary>The recorders the shim installs so the assertions can see the cache, store and
+    /// ClientHello; shared across the resume loop and reset per connection.</summary>
+    CacheView: IBoGoCacheView;
+    StoreView: IBoGoStoreView;
+    HelloView: IBoGoHelloView;
+    HelloObserver: IInteropClientHelloObserver;
     MinVersion: Int32;
     MaxVersion: Int32;
     Curves: TArray<UInt16>;
-    AdvertiseAlpn: TArray<string>;
-    SelectAlpn: string;
+    AdvertiseAlpn: TArray<TBytes>;
+    SelectAlpn: TBytes;
     RejectAlpn: Boolean;
     /// <summary>Per-connection ALPN, used by the 0-RTT ALPN tests where the initial and
     /// resumption handshakes negotiate different protocols: a server selects
     /// -on-initial/-on-resume-select-alpn, a client advertises -on-initial/-on-resume-advertise-alpn.
     /// The *Set flag distinguishes "select/advertise nothing" (empty) from "not overridden".</summary>
-    OnInitialSelectAlpn: string;
+    OnInitialSelectAlpn: TBytes;
     OnInitialSelectAlpnSet: Boolean;
-    OnResumeSelectAlpn: string;
+    OnResumeSelectAlpn: TBytes;
     OnResumeSelectAlpnSet: Boolean;
-    OnInitialAdvertiseAlpn: TArray<string>;
+    OnInitialAdvertiseAlpn: TArray<TBytes>;
     OnInitialAdvertiseAlpnSet: Boolean;
-    OnResumeAdvertiseAlpn: TArray<string>;
+    OnResumeAdvertiseAlpn: TArray<TBytes>;
     OnResumeAdvertiseAlpnSet: Boolean;
-    ExpectAlpn: string;
     ShimWritesFirst: Boolean;
     ShimShutsDown: Boolean;
     /// <summary>-check-close-notify: the shim's shutdown is bidirectional - after sending its
     /// close_notify it waits for the peer's, reading through any interleaved warning alerts /
-    /// empty records (RFC 8446 6.1).</summary>
+    /// empty records (RFC 9846 6.1).</summary>
     CheckCloseNotify: Boolean;
-    /// <summary>Exported keying material (RFC 5705 / RFC 8446 7.5): the shim exports this many
+    /// <summary>Exported keying material (RFC 5705 / RFC 9846 7.5): the shim exports this many
     /// bytes right after the handshake and writes them for the runner to compare. 0 = none.</summary>
     ExportLen: Int32;
     ExportLabel: string;
@@ -125,7 +248,7 @@ type
     VerifyPrefs: TArray<UInt16>;
     /// <summary>-use-client-ca-list: the DER DistinguishedName issuers a server names in its
     /// CertificateRequest certificate_authorities; the literal &lt;NULL&gt;/&lt;EMPTY&gt; name none
-    /// (RFC 5246 7.4.4 / RFC 8446 4.2.4).</summary>
+    /// (RFC 5246 7.4.4 / RFC 9846 4.3.4).</summary>
     UseClientCaList: TArray<TBytes>;
     /// <summary>-expect-client-ca-list: the DER DistinguishedName issuers the client must have
     /// seen in the server's CertificateRequest; asserted after the handshake when set.</summary>
@@ -148,21 +271,21 @@ type
     /// unchanged.</summary>
     AsyncVerify: Boolean;
     /// <summary>-on-resume-verify-fail: verification fails only on the resumption handshake. It
-    /// bites only under -reverify-on-resume, where the resuming client re-runs its verifier
-    /// against the stored chain; otherwise resumption reuses the original authentication and it is
-    /// inert.</summary>
+    /// bites only under -reverify-on-resume, where the resuming client checks the stored chain
+    /// before offering the session; otherwise resumption reuses the original authentication and it
+    /// is inert. A failed check drops the session, and the full handshake that follows fails too.</summary>
     OnResumeVerifyFail: Boolean;
-    /// <summary>-on-retry-verify-fail: verification fails on the retry - the resumption handshake's
-    /// continuation after a 0-RTT reject (or its full-handshake fallback when no ticket resumes).
-    /// In this shim's connection model that is the same resumed connection, and our re-verification
-    /// runs once the 0-RTT decision is known, so it bites there exactly like -on-resume-verify-fail.</summary>
+    /// <summary>-on-retry-verify-fail: verification fails on the retry, the resumption handshake's
+    /// continuation after an offered 0-RTT is rejected. The client verifies the stored chain
+    /// once, before offering the session, so only a full-handshake verification after a rejected
+    /// ticket reaches the retry; a rejected 0-RTT that keeps the PSK verifies nothing more.</summary>
     OnRetryVerifyFail: Boolean;
     /// <summary>-reverify-on-resume: the resuming client re-runs its certificate verifier against
-    /// the stored peer chain (RFC 8446 2.2 otherwise reuses the original authentication).</summary>
+    /// the stored peer chain (RFC 9846 2.2 otherwise reuses the original authentication).</summary>
     ReverifyOnResume: Boolean;
-    /// <summary>Send one unsolicited post-handshake KeyUpdate (RFC 8446 4.6.3).</summary>
+    /// <summary>Send one unsolicited post-handshake KeyUpdate (RFC 9846 4.7.3).</summary>
     KeyUpdate: Boolean;
-    /// <summary>Number of resumption connections after the initial one (RFC 8446 2.2);
+    /// <summary>Number of resumption connections after the initial one (RFC 9846 2.2);
     /// the shim makes ResumeCount+1 connections reusing one session cache/STEK.</summary>
     ResumeCount: Int32;
     /// <summary>-no-ticket: the server mints no session tickets (no STEK), so a 1.2 client
@@ -173,11 +296,11 @@ type
     /// offered ticket and falls back to a full handshake; the client stops offering the cached
     /// session, so a server that still echoes the session id is rejected (RFC 5246 7.4.1.3).</summary>
     OnResumeNoTicket: Boolean;
-    /// <summary>The client offers 0-RTT early data on a resumption (RFC 8446 2.3).</summary>
+    /// <summary>The client offers 0-RTT early data on a resumption (RFC 9846 2.3).</summary>
     EnableEarlyData: Boolean;
     /// <summary>-on-resume-enable-early-data: early data is enabled on the resumption connection
     /// only. The initial ticket is minted without 0-RTT authorization, so the server rejects the
-    /// client's early data on resume (the session did not allow it, RFC 8446 4.2.10).</summary>
+    /// client's early data on resume (the session did not allow it, RFC 9846 4.3.10).</summary>
     OnResumeEnableEarlyData: Boolean;
     /// <summary>On a resumption connection the shim writes first (its early data / initial
     /// message), rather than waiting to echo the peer.</summary>
@@ -185,12 +308,14 @@ type
     /// <summary>-on-resume-shim-initial-write + -on-resume-repeat-shim-initial-write: on the
     /// resumption the shim writes this payload repeated N times as its initial (early) write.
     /// Used by the large-early-data test where the total exceeds max_early_data, so the engine
-    /// sends the budget as 0-RTT and defers the remainder to 1-RTT (RFC 8446 4.2.10).</summary>
+    /// sends the budget as 0-RTT and defers the remainder to 1-RTT (RFC 9846 4.3.10).</summary>
     OnResumeInitialWrite: TBytes;
     OnResumeInitialWriteRepeat: Int32;
     /// <summary>The client-side cache and the server-side STEK, created once and shared
     /// across the resume loop so a later connection resumes an earlier one.</summary>
     SessionCache: ISessionCache;
+    SessionScope: TBytes;
+    ResumptionScope: TBytes;
     SessionTicketKeys: ISessionTicketKeyManager;
     SessionStore: ISessionStore;
     /// <summary>-resumption-delay: seconds the runner advances its (and the shim's) clock
@@ -208,6 +333,11 @@ type
     /// credential list (-new-psk-credential + -psk-importer-*). A client imports and offers
     /// them; a server imports and matches an offered pre_shared_key against them.</summary>
     ExternalPsks: TArray<TExternalPsk>;
+    /// <summary>The TLS 1.2 pre-shared key (RFC 4279 / RFC 5489) from -psk and -psk-identity,
+    /// both plain text. A client presents it when the server selects a PSK suite; a server
+    /// accepts it under that identity.</summary>
+    Tls12PskSecret: TBytes;
+    Tls12PskIdentity: TBytes;
     /// <summary>Set when -expect-ocsp-response was given; the client must have received
     /// exactly ExpectOcspResponse from the peer.</summary>
     HasExpectOcsp: Boolean;
@@ -242,7 +372,48 @@ type
     class function ShimInitialWrite: TBytes; static;
     class procedure LogArgv; static;
     class function HandleProbeFlags: Boolean; static;
-    class function ParseAlpnWire(const AWire: string): TArray<string>; static;
+    class function ParseAlpnWire(const AWire: string): TArray<TBytes>; static;
+    /// <summary>Whether AArg is a shim-side assertion flag (an -on-initial- / -on-resume- /
+    /// -on-retry- prefix picks its scope); AHasValue says it consumes a value.</summary>
+    class function TryExpectationFlag(const AArg: string; out AExpectation: TBoGoExpectation;
+      out AHasValue: Boolean): Boolean; static;
+    /// <summary>Whether the assertion binds to the (initial or resumption) connection.</summary>
+    class function ExpectationApplies(const AExpectation: TBoGoExpectation;
+      AIsResume: Boolean): Boolean; static;
+    class function EarlyDataReasonName(AReason: TEarlyDataReason): string; static;
+    class function SameBytesLists(const AA, AB: TArray<TBytes>): Boolean; static;
+    class function SameCodes(const AA, AB: TArray<UInt16>): Boolean; static;
+    /// <summary>The ALPN protocol the server is configured to select on this connection.</summary>
+    class function EffectiveSelectAlpn(const AConfig: TBoGoConfig;
+      AIsResume: Boolean): TBytes; static;
+    /// <summary>The position in the credential list of the credential the connection used, or -1.</summary>
+    class function SelectedCredentialIndex(const AConfig: TBoGoConfig;
+      const AInfo: TTlsConnectionInfo): Int32; static;
+    /// <summary>The verdict of one handshake-pass assertion (a shim exit code, with the mismatch
+    /// in AMessage); the session-pass kinds and the grouped ones are not decided here.</summary>
+    class function ExpectationVerdict(const AConfig: TBoGoConfig;
+      const AExpectation: TBoGoExpectation; const AObserved: TBoGoObserved;
+      const APkix: IPkixProvider; out AMessage: string): Int32; static;
+    /// <summary>Runs the assertions whose scope is in AScopes against AObserved (APreReject: the
+    /// view of a rejected 0-RTT offer), plus the runner's always-on ALPN equality.</summary>
+    class function RunExpectations(const AConfig: TBoGoConfig; const AObserved: TBoGoObserved;
+      const APkix: IPkixProvider; AScopes: TBoGoExpectScopes; APreReject: Boolean;
+      out AMessage: string): Int32; static;
+    /// <summary>Checks the ECH name-override assertions against the verified hosts (RFC 9849 6.1.7).</summary>
+    class function CheckEchNameExpectations(const AConfig: TBoGoConfig;
+      const AObserved: TBoGoObserved; out AMessage: string): Int32; static;
+    /// <summary>Checks the session-reuse invariant and every assertion bound to this connection
+    /// against the finished handshake; a shim exit code.</summary>
+    class function CheckHandshakeExpectations(const AConfig: TBoGoConfig;
+      const AObserved: TBoGoObserved; const APkix: IPkixProvider): Int32; static;
+    /// <summary>Checks, once the exchange is over, which sessions the connection cached and
+    /// whether they support early data; a shim exit code.</summary>
+    class function CheckSessionExpectations(const AConfig: TBoGoConfig;
+      var AObserved: TBoGoObserved): Int32; static;
+    /// <summary>Whether this is the connection that follows a rejected 0-RTT offer, the only one
+    /// the -on-retry- flags belong to.</summary>
+    class function InRetryState(const AConfig: TBoGoConfig;
+      const AObserved: TBoGoObserved): Boolean; static;
     class function TryParseArgs(out AConfig: TBoGoConfig;
       out AReason: string): Boolean; static;
     class procedure AnnounceShimId(const ASocket: TInteropSocket;
@@ -250,17 +421,18 @@ type
     class function VersionRange(const AConfig: TBoGoConfig): TArray<UInt16>; static;
     /// <summary>Builds an ECH server key store from the parsed -ech-server-config triples,
     /// or nil when the test served no config.</summary>
-    class function BuildEchKeyStore(const AProvider: ICryptoProvider;
+    class function BuildEchKeyStore(const ACryptoProvider: ICryptoProvider;
       const AConfigs: TArray<TBoGoEchServerConfig>): IEchServerKeyStore; static;
     /// <summary>Whether the runner expects ECH accepted on this connection: the base
     /// -expect-ech-accept unless a per-connection -on-initial / -on-resume override applies.</summary>
     class function EchAcceptExpected(const AConfig: TBoGoConfig;
       AIsResume: Boolean): Boolean; static;
-    class function BuildOptions(const AProvider: ICryptoProvider;
-      const AConfig: TBoGoConfig; AIsResume: Boolean): TInteropEngineOptions; static;
-    class function RunExchange(const AProvider: ICryptoProvider;
-      const ASocket: TInteropSocket; const AConfig: TBoGoConfig;
-      AIsResume: Boolean): Int32; static;
+    class function BuildOptions(const ACryptoProvider: ICryptoProvider;
+      const APkix: IPkixProvider; const AConfig: TBoGoConfig;
+      AIsResume: Boolean): TInteropEngineOptions; static;
+    class function RunExchange(const ACryptoProvider: ICryptoProvider;
+      const APkix: IPkixProvider; const ASocket: TInteropSocket;
+      const AConfig: TBoGoConfig; AIsResume: Boolean): Int32; static;
     class function FinishShutdown(const AEngine: ITlsEngine;
       const ASocket: TInteropSocket; ACheckCloseNotify: Boolean): Int32; static;
   public
@@ -276,8 +448,32 @@ const
   XorMask = $FF;
   // the server's 0-RTT budget when early data is enabled (BoGo's test messages are small)
   EarlyDataBudget = UInt32(16384);
+  ShrinkingAlgorithm = UInt16($FF01);
+  ExpandingAlgorithm = UInt16($FF02);
+  RandomAlgorithm = UInt16($FF03);
+  // decided by CheckEchNameExpectations, which also runs when the handshake fails
+  EchNameKinds = [TBoGoExpectKind.EchNameOverride, TBoGoExpectKind.NoEchNameOverride];
 
 type
+  TBoGoTestCompressor = class sealed(TInterfacedObject, ICertificateCompressor)
+  strict private
+    FAlgorithm: UInt16;
+  public
+    constructor Create(AAlgorithm: UInt16);
+    function Algorithm: UInt16;
+    function TryCompress(const AData: TBytes; out ACompressed: TBytes): Boolean;
+  end;
+
+  TBoGoTestDecompressor = class sealed(TInterfacedObject, ICertificateDecompressor)
+  strict private
+    FAlgorithm: UInt16;
+  public
+    constructor Create(AAlgorithm: UInt16);
+    function Algorithm: UInt16;
+    function TryDecompress(const ACompressed: TBytes; AMaxLength: Int32;
+      out ADecompressed: TBytes): Boolean;
+  end;
+
   /// <summary>Captures a TLS 1.3 server's keying-material export in half-RTT (the first non-nil
   /// value while the handshake is still running, i.e. after the server Finished, before the
   /// client's). The captured value is written post-handshake; a nil capture on a TLS 1.3 server
@@ -297,6 +493,65 @@ type
     procedure Observe(const AEngine: ITlsEngine);
     property Captured: TBytes read FCaptured;
     property HasCaptured: Boolean read FHasCaptured;
+  end;
+
+  /// <summary>The client session cache the shim installs: it forwards to an in-memory cache and
+  /// records the session taken to be offered and any other session stored during the current
+  /// connection, so the assertions can tell a new ticket or session id from a re-stored one.</summary>
+  TBoGoCacheRecorder = class sealed(TInterfacedObject, ISessionCache,IBoGoCacheView)
+  strict private
+    FInner: ISessionCache;
+    FOffered: IResumableSession;
+    FNew: IResumableSession;
+    class function SessionKey(const ASession: IResumableSession): TBytes; static;
+  public
+    constructor Create(const AInner: ISessionCache);
+    procedure Store(const AServerIdentity, AServerName: string;
+      const ASession: IResumableSession);
+    procedure Remove(const AServerIdentity, AServerName: string;
+      const ASession: IResumableSession);
+    function Take(const AServerIdentity, AServerName: string; ANowMillis: UInt64;
+      out ASession: IResumableSession): Boolean;
+    procedure SetKxHint(const AServerIdentity, AServerName: string; AGroup: UInt16);
+    function KxHint(const AServerIdentity, AServerName: string): UInt16;
+    procedure Clear;
+    function Count: Int32;
+    procedure BeginConnection;
+    function OfferedSession: IResumableSession;
+    function NewSession: IResumableSession;
+  end;
+
+  /// <summary>The server session store the shim installs: it forwards to an in-memory store and
+  /// records whether a session was stored under a session id during the current connection.</summary>
+  TBoGoStoreRecorder = class sealed(TInterfacedObject, ISessionStore,IBoGoStoreView)
+  strict private
+    FInner: ISessionStore;
+    FStored: Boolean;
+  public
+    constructor Create(const AInner: ISessionStore);
+    function Put(const ASession: IResumableSession): TBytes;
+    procedure PutWithId(const AId: TBytes; const ASession: IResumableSession);
+    function Peek(const AId: TBytes; out ASession: IResumableSession): Boolean;
+    function Take(const AId: TBytes; out ASession: IResumableSession): Boolean;
+    procedure Remove(const AId: TBytes);
+    procedure Clear;
+    function Count: Int32;
+    procedure BeginConnection;
+    function Stored: Boolean;
+  end;
+
+  /// <summary>Records the latest ClientHello the server's credential was resolved for.</summary>
+  TBoGoHelloRecorder = class sealed(TInterfacedObject, IInteropClientHelloObserver,IBoGoHelloView)
+  strict private
+    FSeen: Boolean;
+    FAlpn: TArray<TBytes>;
+    FSchemes: TArray<UInt16>;
+  public
+    procedure Observe(const AHello: TTlsClientHelloInfo);
+    procedure BeginConnection;
+    function Seen: Boolean;
+    function AlpnProtocols: TArray<TBytes>;
+    function SignatureSchemes: TArray<UInt16>;
   end;
 
 { TExportProbe }
@@ -319,7 +574,10 @@ begin
   if FHasCaptured then
     Exit;
   try
-    LBytes := AEngine.ExportKeyingMaterial(FLabel, FContext, FUseContext, FLength);
+    if FUseContext then
+      LBytes := AEngine.ExportKeyingMaterial(FLabel, FContext, FLength)
+    else
+      LBytes := AEngine.ExportKeyingMaterial(FLabel, FLength);
   except
     // a rejected label (the TLS 1.3 empty-label policy difference) - stay uncaptured; the
     // outcome is decided post-handshake, matching the non-probe path
@@ -330,6 +588,296 @@ begin
     FCaptured := LBytes;
     FHasCaptured := True;
   end;
+end;
+
+{ TBoGoCacheRecorder }
+
+constructor TBoGoCacheRecorder.Create(const AInner: ISessionCache);
+begin
+  inherited Create;
+  FInner := AInner;
+end;
+
+class function TBoGoCacheRecorder.SessionKey(const ASession: IResumableSession): TBytes;
+var
+  L13: ITls13ResumableSession;
+  L12: ITls12ResumableSession;
+begin
+  Result := nil;
+  if Supports(ASession, ITls13ResumableSession, L13) then
+    Result := L13.TicketIdentity
+  else if Supports(ASession, ITls12ResumableSession, L12) then
+  begin
+    // a ticket resumption echoes a throwaway session id, so the ticket names the session first
+    Result := L12.SessionTicket;
+    if System.Length(Result) = 0 then
+      Result := L12.SessionId;
+  end;
+end;
+
+procedure TBoGoCacheRecorder.Store(const AServerIdentity, AServerName: string;
+  const ASession: IResumableSession);
+begin
+  // a re-stored resumed session carries the offered ticket or session id: not a new session
+  if (FOffered = nil) or
+    (not TInteropUtils.BytesEqual(SessionKey(FOffered), SessionKey(ASession))) then
+    FNew := ASession;
+  FInner.Store(AServerIdentity, AServerName, ASession);
+end;
+
+procedure TBoGoCacheRecorder.Remove(const AServerIdentity, AServerName: string;
+  const ASession: IResumableSession);
+begin
+  // a session a fatal alert dropped is no longer a new session
+  if FNew = ASession then
+    FNew := nil;
+  FInner.Remove(AServerIdentity, AServerName, ASession);
+end;
+
+function TBoGoCacheRecorder.Take(const AServerIdentity, AServerName: string;
+  ANowMillis: UInt64; out ASession: IResumableSession): Boolean;
+begin
+  Result := FInner.Take(AServerIdentity, AServerName, ANowMillis, ASession);
+  if Result then
+    FOffered := ASession;
+end;
+
+procedure TBoGoCacheRecorder.SetKxHint(const AServerIdentity, AServerName: string;
+  AGroup: UInt16);
+begin
+  FInner.SetKxHint(AServerIdentity, AServerName, AGroup);
+end;
+
+function TBoGoCacheRecorder.KxHint(const AServerIdentity, AServerName: string): UInt16;
+begin
+  Result := FInner.KxHint(AServerIdentity, AServerName);
+end;
+
+procedure TBoGoCacheRecorder.Clear;
+begin
+  FInner.Clear;
+end;
+
+function TBoGoCacheRecorder.Count: Int32;
+begin
+  Result := FInner.Count;
+end;
+
+procedure TBoGoCacheRecorder.BeginConnection;
+begin
+  FOffered := nil;
+  FNew := nil;
+end;
+
+function TBoGoCacheRecorder.OfferedSession: IResumableSession;
+begin
+  Result := FOffered;
+end;
+
+function TBoGoCacheRecorder.NewSession: IResumableSession;
+begin
+  Result := FNew;
+end;
+
+{ TBoGoStoreRecorder }
+
+constructor TBoGoStoreRecorder.Create(const AInner: ISessionStore);
+begin
+  inherited Create;
+  FInner := AInner;
+end;
+
+function TBoGoStoreRecorder.Put(const ASession: IResumableSession): TBytes;
+begin
+  // a handle put here is the ticket a stateful strategy hands out, not a session id
+  Result := FInner.Put(ASession);
+end;
+
+procedure TBoGoStoreRecorder.PutWithId(const AId: TBytes; const ASession: IResumableSession);
+begin
+  FStored := True;
+  FInner.PutWithId(AId, ASession);
+end;
+
+function TBoGoStoreRecorder.Peek(const AId: TBytes; out ASession: IResumableSession): Boolean;
+begin
+  Result := FInner.Peek(AId, ASession);
+end;
+
+function TBoGoStoreRecorder.Take(const AId: TBytes; out ASession: IResumableSession): Boolean;
+begin
+  Result := FInner.Take(AId, ASession);
+end;
+
+procedure TBoGoStoreRecorder.Remove(const AId: TBytes);
+begin
+  FInner.Remove(AId);
+end;
+
+procedure TBoGoStoreRecorder.Clear;
+begin
+  FInner.Clear;
+end;
+
+function TBoGoStoreRecorder.Count: Int32;
+begin
+  Result := FInner.Count;
+end;
+
+procedure TBoGoStoreRecorder.BeginConnection;
+begin
+  FStored := False;
+end;
+
+function TBoGoStoreRecorder.Stored: Boolean;
+begin
+  Result := FStored;
+end;
+
+{ TBoGoHelloRecorder }
+
+procedure TBoGoHelloRecorder.Observe(const AHello: TTlsClientHelloInfo);
+begin
+  FSeen := True;
+  FAlpn := AHello.AlpnProtocols;
+  FSchemes := AHello.SignatureSchemes;
+end;
+
+procedure TBoGoHelloRecorder.BeginConnection;
+begin
+  FSeen := False;
+  FAlpn := nil;
+  FSchemes := nil;
+end;
+
+function TBoGoHelloRecorder.Seen: Boolean;
+begin
+  Result := FSeen;
+end;
+
+function TBoGoHelloRecorder.AlpnProtocols: TArray<TBytes>;
+begin
+  Result := FAlpn;
+end;
+
+function TBoGoHelloRecorder.SignatureSchemes: TArray<UInt16>;
+begin
+  Result := FSchemes;
+end;
+
+{ TBoGoTestCompressor }
+
+constructor TBoGoTestCompressor.Create(AAlgorithm: UInt16);
+begin
+  inherited Create;
+  FAlgorithm := AAlgorithm;
+end;
+
+function TBoGoTestCompressor.Algorithm: UInt16;
+begin
+  Result := FAlgorithm;
+end;
+
+function TBoGoTestCompressor.TryCompress(const AData: TBytes;
+  out ACompressed: TBytes): Boolean;
+begin
+  ACompressed := nil;
+  Result := True;
+  case FAlgorithm of
+    ShrinkingAlgorithm:
+      begin
+        // only a Certificate message (which starts 00 00, the empty request context) shrinks
+        if (System.Length(AData) < 2) or (AData[0] <> 0) or (AData[1] <> 0) then
+          Exit(False);
+        ACompressed := System.Copy(AData, 2, System.Length(AData) - 2);
+      end;
+    ExpandingAlgorithm:
+      ACompressed := TInteropUtils.Concat(TBytes.Create(1, 2, 3, 4), AData);
+    RandomAlgorithm:
+      ACompressed := TInteropUtils.Concat(TBytes.Create(Byte(Random(256))), AData);
+  else
+    Result := False;
+  end;
+  // a result of nothing would break the compressor contract; the shrinking case of a bare
+  // 00 00 body is the only way to get there, and it is declined instead
+  if Result and (System.Length(ACompressed) = 0) then
+  begin
+    ACompressed := nil;
+    Result := False;
+  end;
+end;
+
+{ TBoGoTestDecompressor }
+
+constructor TBoGoTestDecompressor.Create(AAlgorithm: UInt16);
+begin
+  inherited Create;
+  FAlgorithm := AAlgorithm;
+end;
+
+function TBoGoTestDecompressor.Algorithm: UInt16;
+begin
+  Result := FAlgorithm;
+end;
+
+function TBoGoTestDecompressor.TryDecompress(const ACompressed: TBytes;
+  AMaxLength: Int32; out ADecompressed: TBytes): Boolean;
+begin
+  // AMaxLength is the declared uncompressed length, which each algorithm checks against its input
+  ADecompressed := nil;
+  Result := False;
+  case FAlgorithm of
+    ShrinkingAlgorithm:
+      if AMaxLength = 2 + System.Length(ACompressed) then
+      begin
+        ADecompressed := TInteropUtils.Concat(TBytes.Create(0, 0), ACompressed);
+        Result := True;
+      end;
+    ExpandingAlgorithm:
+      if (System.Length(ACompressed) >= 4) and (ACompressed[0] = 1) and (ACompressed[1] = 2) and
+        (ACompressed[2] = 3) and (ACompressed[3] = 4) and
+        (AMaxLength = System.Length(ACompressed) - 4) then
+      begin
+        ADecompressed := System.Copy(ACompressed, 4, System.Length(ACompressed) - 4);
+        Result := True;
+      end;
+    RandomAlgorithm:
+      if AMaxLength + 1 = System.Length(ACompressed) then
+      begin
+        ADecompressed := System.Copy(ACompressed, 1, System.Length(ACompressed) - 1);
+        Result := True;
+      end;
+  end;
+end;
+
+{ TBoGoCertCompression }
+
+class function TBoGoCertCompression.Compressors(
+  AOnlyAlgorithm: Int32): TArray<ICertificateCompressor>;
+var
+  LAll: TArray<UInt16>;
+  LAlg: UInt16;
+begin
+  Result := nil;
+  LAll := TArray<UInt16>.Create(ExpandingAlgorithm, ShrinkingAlgorithm, RandomAlgorithm);
+  for LAlg in LAll do
+    if (AOnlyAlgorithm = 0) or (AOnlyAlgorithm = LAlg) then
+      TArrayUtilities.Append<ICertificateCompressor>(Result,
+        TBoGoTestCompressor.Create(LAlg) as ICertificateCompressor);
+end;
+
+class function TBoGoCertCompression.Decompressors(
+  AOnlyAlgorithm: Int32): TArray<ICertificateDecompressor>;
+var
+  LAll: TArray<UInt16>;
+  LAlg: UInt16;
+begin
+  Result := nil;
+  LAll := TArray<UInt16>.Create(ExpandingAlgorithm, ShrinkingAlgorithm, RandomAlgorithm);
+  for LAlg in LAll do
+    if (AOnlyAlgorithm = 0) or (AOnlyAlgorithm = LAlg) then
+      TArrayUtilities.Append<ICertificateDecompressor>(Result,
+        TBoGoTestDecompressor.Create(LAlg) as ICertificateDecompressor);
 end;
 
 { TInteropAdjustableClock }
@@ -401,7 +949,7 @@ begin
     end;
 end;
 
-class function TBoGoShimRunner.ParseAlpnWire(const AWire: string): TArray<string>;
+class function TBoGoShimRunner.ParseAlpnWire(const AWire: string): TArray<TBytes>;
 var
   LPos, LLen, LI: Int32;
 begin
@@ -411,7 +959,7 @@ begin
   // round-trip, so a single-protocol value like <03>"foo" arrives as bare "foo". When
   // the leading byte cannot be a valid length prefix, treat the whole value as one name.
   if (System.Length(AWire) > 0) and (Ord(AWire[1]) >= System.Length(AWire)) then
-    Exit(TArray<string>.Create(AWire));
+    Exit(TArray<TBytes>.Create(TInteropUtils.OctetsOf(AWire)));
   LPos := 1;
   while LPos <= System.Length(AWire) do
   begin
@@ -421,8 +969,611 @@ begin
       Break;
     LI := System.Length(Result);
     SetLength(Result, LI + 1);
-    Result[LI] := System.Copy(AWire, LPos, LLen);
+    Result[LI] := TInteropUtils.OctetsOf(System.Copy(AWire, LPos, LLen));
     Inc(LPos, LLen);
+  end;
+end;
+
+class function TBoGoShimRunner.TryExpectationFlag(const AArg: string;
+  out AExpectation: TBoGoExpectation; out AHasValue: Boolean): Boolean;
+var
+  LBase: string;
+begin
+  AExpectation := Default(TBoGoExpectation);
+  AExpectation.Scope := TBoGoExpectScope.Always;
+  LBase := AArg;
+  if System.Copy(AArg, 1, 12) = '-on-initial-' then
+  begin
+    AExpectation.Scope := TBoGoExpectScope.Initial;
+    LBase := '-' + System.Copy(AArg, 13, System.Length(AArg));
+  end
+  else if System.Copy(AArg, 1, 11) = '-on-resume-' then
+  begin
+    AExpectation.Scope := TBoGoExpectScope.Resume;
+    LBase := '-' + System.Copy(AArg, 12, System.Length(AArg));
+  end
+  else if System.Copy(AArg, 1, 10) = '-on-retry-' then
+  begin
+    AExpectation.Scope := TBoGoExpectScope.Retry;
+    LBase := '-' + System.Copy(AArg, 11, System.Length(AArg));
+  end;
+  Result := True;
+  AHasValue := True;
+  if LBase = '-expect-version' then
+    AExpectation.Kind := TBoGoExpectKind.Version
+  else if LBase = '-expect-curve-id' then
+    AExpectation.Kind := TBoGoExpectKind.CurveId
+  else if LBase = '-expect-server-name' then
+    AExpectation.Kind := TBoGoExpectKind.ServerName
+  else if LBase = '-expect-cipher' then
+    AExpectation.Kind := TBoGoExpectKind.Cipher
+  else if LBase = '-expect-alpn' then
+    AExpectation.Kind := TBoGoExpectKind.Alpn
+  else if LBase = '-expect-advertised-alpn' then
+    AExpectation.Kind := TBoGoExpectKind.AdvertisedAlpn
+  else if LBase = '-expect-peer-verify-pref' then
+    AExpectation.Kind := TBoGoExpectKind.PeerVerifyPref
+  else if LBase = '-expect-peer-signature-algorithm' then
+    AExpectation.Kind := TBoGoExpectKind.PeerSignatureAlgorithm
+  else if LBase = '-expect-peer-cert-file' then
+    AExpectation.Kind := TBoGoExpectKind.PeerCertFile
+  else if LBase = '-expect-selected-credential' then
+    AExpectation.Kind := TBoGoExpectKind.SelectedCredential
+  else if LBase = '-expect-early-data-reason' then
+    AExpectation.Kind := TBoGoExpectKind.EarlyDataReason
+  else if LBase = '-expect-ticket-age-skew' then
+    AExpectation.Kind := TBoGoExpectKind.TicketAgeSkew
+  else if LBase = '-expect-ech-name-override' then
+    AExpectation.Kind := TBoGoExpectKind.EchNameOverride
+  else
+  begin
+    AHasValue := False;
+    if LBase = '-expect-no-offer-early-data' then
+      AExpectation.Kind := TBoGoExpectKind.NoOfferEarlyData
+    else if LBase = '-expect-no-ech-name-override' then
+      AExpectation.Kind := TBoGoExpectKind.NoEchNameOverride
+    else if LBase = '-expect-extended-master-secret' then
+      AExpectation.Kind := TBoGoExpectKind.ExtendedMasterSecret
+    else if LBase = '-expect-no-peer-cert' then
+      AExpectation.Kind := TBoGoExpectKind.NoPeerCert
+    else if LBase = '-expect-accept-early-data' then
+      AExpectation.Kind := TBoGoExpectKind.AcceptEarlyData
+    else if LBase = '-expect-reject-early-data' then
+      AExpectation.Kind := TBoGoExpectKind.RejectEarlyData
+    else if LBase = '-expect-verify-result' then
+      AExpectation.Kind := TBoGoExpectKind.VerifyResult
+    else if LBase = '-expect-secure-renegotiation' then
+      AExpectation.Kind := TBoGoExpectKind.SecureRenegotiation
+    else if LBase = '-expect-hrr' then
+      AExpectation.Kind := TBoGoExpectKind.HelloRetryRequest
+    else if LBase = '-expect-no-hrr' then
+      AExpectation.Kind := TBoGoExpectKind.NoHelloRetryRequest
+    else if LBase = '-expect-no-session' then
+      AExpectation.Kind := TBoGoExpectKind.NoSession
+    else if LBase = '-expect-ticket-supports-early-data' then
+      AExpectation.Kind := TBoGoExpectKind.TicketSupportsEarlyData
+    else if LBase = '-expect-ticket-renewal' then
+      AExpectation.Kind := TBoGoExpectKind.TicketRenewal
+    else if LBase = '-expect-not-resumable-across-names' then
+      AExpectation.Kind := TBoGoExpectKind.NotResumableAcrossNames
+    else if LBase = '-expect-session-id' then
+      AExpectation.Kind := TBoGoExpectKind.SessionId
+    else if LBase = '-expect-no-session-id' then
+      AExpectation.Kind := TBoGoExpectKind.NoSessionId
+    else
+      Result := False;
+  end;
+end;
+
+class function TBoGoShimRunner.ExpectationApplies(const AExpectation: TBoGoExpectation;
+  AIsResume: Boolean): Boolean;
+begin
+  case AExpectation.Scope of
+    TBoGoExpectScope.Initial:
+      Result := not AIsResume;
+    TBoGoExpectScope.Resume, TBoGoExpectScope.Retry:
+      Result := AIsResume;
+  else
+    Result := True;
+  end;
+end;
+
+class function TBoGoShimRunner.EarlyDataReasonName(AReason: TEarlyDataReason): string;
+begin
+  case AReason of
+    TEarlyDataReason.Disabled:
+      Result := 'disabled';
+    TEarlyDataReason.Accepted:
+      Result := 'accept';
+    TEarlyDataReason.ProtocolVersion:
+      Result := 'protocol_version';
+    TEarlyDataReason.PeerDeclined:
+      Result := 'peer_declined';
+    TEarlyDataReason.NoSessionOffered:
+      Result := 'no_session_offered';
+    TEarlyDataReason.SessionNotResumed:
+      Result := 'session_not_resumed';
+    TEarlyDataReason.UnsupportedForSession:
+      Result := 'unsupported_for_session';
+    TEarlyDataReason.HelloRetryRequest:
+      Result := 'hello_retry_request';
+    TEarlyDataReason.AlpnMismatch:
+      Result := 'alpn_mismatch';
+    TEarlyDataReason.TicketAgeSkew:
+      Result := 'ticket_age_skew';
+  else
+    // the anti-replay decline has no runner-side reason
+    Result := 'unknown';
+  end;
+end;
+
+class function TBoGoShimRunner.SameBytesLists(const AA, AB: TArray<TBytes>): Boolean;
+var
+  LI: Int32;
+begin
+  Result := System.Length(AA) = System.Length(AB);
+  if Result then
+    for LI := 0 to System.High(AA) do
+      if not TInteropUtils.BytesEqual(AA[LI], AB[LI]) then
+        Exit(False);
+end;
+
+class function TBoGoShimRunner.SameCodes(const AA, AB: TArray<UInt16>): Boolean;
+var
+  LI: Int32;
+begin
+  Result := System.Length(AA) = System.Length(AB);
+  if Result then
+    for LI := 0 to System.High(AA) do
+      if AA[LI] <> AB[LI] then
+        Exit(False);
+end;
+
+class function TBoGoShimRunner.EffectiveSelectAlpn(const AConfig: TBoGoConfig;
+  AIsResume: Boolean): TBytes;
+begin
+  // a per-connection override wins over the fixed -select-alpn; an empty override selects nothing
+  if AIsResume and AConfig.OnResumeSelectAlpnSet then
+    Result := AConfig.OnResumeSelectAlpn
+  else if (not AIsResume) and AConfig.OnInitialSelectAlpnSet then
+    Result := AConfig.OnInitialSelectAlpn
+  else
+    Result := AConfig.SelectAlpn;
+end;
+
+class function TBoGoShimRunner.SelectedCredentialIndex(const AConfig: TBoGoConfig;
+  const AInfo: TTlsConnectionInfo): Int32;
+var
+  LPos, LPsk: Int32;
+begin
+  Result := -1;
+  // the PSK whose configured identity authenticated the connection, else the X.509 credential
+  if System.Length(AInfo.PskIdentity) > 0 then
+    for LPos := 0 to System.High(AConfig.CredentialOrder) do
+    begin
+      LPsk := AConfig.CredentialOrder[LPos];
+      if (LPsk >= 0) and TInteropUtils.BytesEqual(AConfig.ExternalPsks[LPsk].Identity,
+        AInfo.PskIdentity) then
+        Exit(LPos);
+    end;
+  for LPos := 0 to System.High(AConfig.CredentialOrder) do
+    if AConfig.CredentialOrder[LPos] < 0 then
+      Exit(LPos);
+end;
+
+class function TBoGoShimRunner.ExpectationVerdict(const AConfig: TBoGoConfig;
+  const AExpectation: TBoGoExpectation; const AObserved: TBoGoObserved;
+  const APkix: IPkixProvider; out AMessage: string): Int32;
+var
+  LX509Count, LPos: Int32;
+  LChain: TArray<TBytes>;
+begin
+  AMessage := '';
+  Result := ShimExitFail;
+  case AExpectation.Kind of
+    TBoGoExpectKind.Version:
+      if AObserved.Info.NegotiatedVersion.WireValue <> AExpectation.Number then
+        AMessage := Format('want version %.4x, got %.4x',
+          [AExpectation.Number, AObserved.Info.NegotiatedVersion.WireValue]);
+    TBoGoExpectKind.ExtendedMasterSecret:
+      if not AObserved.Info.ExtendedMasterSecret then
+        AMessage := 'no extended master secret for a connection expecting one';
+    TBoGoExpectKind.CurveId:
+      if AObserved.Info.NamedGroup <> AExpectation.Number then
+        AMessage := Format('curve_id was %.4x, wanted %.4x',
+          [AObserved.Info.NamedGroup, AExpectation.Number]);
+    TBoGoExpectKind.ServerName:
+      if not TInteropUtils.BytesEqual(TInteropUtils.OctetsOf(AObserved.Info.ServerName),
+        AExpectation.Text) then
+        AMessage := 'servername did not match the expected one';
+    TBoGoExpectKind.NoPeerCert:
+      if System.Length(AObserved.Info.PeerCertificates) > 0 then
+        AMessage := 'received an unexpected peer certificate';
+    TBoGoExpectKind.AcceptEarlyData:
+      if not AObserved.Info.EarlyDataAccepted then
+        AMessage := 'early data was not accepted, but the test expected it';
+    TBoGoExpectKind.RejectEarlyData:
+      if AObserved.Info.EarlyDataAccepted then
+        AMessage := 'early data was accepted, but the test expected a reject';
+    TBoGoExpectKind.Cipher:
+      if AObserved.Info.CipherSuite <> AExpectation.Number then
+        AMessage := Format('cipher id was %.4x, wanted %.4x',
+          [AObserved.Info.CipherSuite, AExpectation.Number]);
+    TBoGoExpectKind.AdvertisedAlpn:
+      // the resolver runs on the certificate path only, so a resumption or PSK leaves the offer unseen
+      if not AObserved.HelloSeen then
+      begin
+        if not (AObserved.Info.Resumed or (System.Length(AObserved.Info.PskIdentity) > 0)) then
+          AMessage := 'no ClientHello was observed on a certificate connection';
+      end
+      else if not SameBytesLists(AObserved.HelloAlpn, ParseAlpnWire(AExpectation.Name)) then
+        AMessage := 'the ClientHello advertised ALPN list did not match the expected one';
+    TBoGoExpectKind.PeerSignatureAlgorithm:
+      if AObserved.Info.PeerSignatureScheme <> AExpectation.Number then
+        AMessage := Format('peer signature algorithm was %.4x, wanted %.4x',
+          [AObserved.Info.PeerSignatureScheme, AExpectation.Number]);
+    TBoGoExpectKind.VerifyResult:
+      // TlsLib has no soft-fail: a completed handshake means verification passed or did not apply
+      if AObserved.VerifyFailConfigured then
+        AMessage := 'the peer verified although the test expects a failed verification result'
+      else if AObserved.WebPkiTrust and (System.Length(AObserved.Info.PeerCertificates) > 0) and
+        (not AObserved.IsResume) and (System.Length(AObserved.Info.ValidatedPath) = 0) then
+        AMessage := 'a presented chain was accepted without a validated path';
+    TBoGoExpectKind.PeerCertFile:
+    begin
+      LChain := APkix.Certificates.LoadChain(
+        TEncoding.ASCII.GetBytes(TInteropUtils.ReadAllText(AExpectation.Name)));
+      if not SameBytesLists(AObserved.Info.PeerCertificates, LChain) then
+        AMessage := 'the peer certificate chain did not match the expected file';
+    end;
+    TBoGoExpectKind.SecureRenegotiation:
+      // TLS 1.3 reports it by definition; the RFC 5746 state of a TLS 1.2 connection is not surfaced
+      if AObserved.Info.NegotiatedVersion.WireValue <> WireVersionTls13 then
+      begin
+        AMessage := 'unimplemented: the secure renegotiation state of a TLS 1.2 connection';
+        Result := ShimExitUnimplemented;
+      end;
+    TBoGoExpectKind.EarlyDataReason:
+      if AObserved.EarlyDataRefused then
+      begin
+        AMessage := 'unimplemented: the builder refuses 0-RTT on a client that offers only TLS 1.2';
+        Result := ShimExitUnimplemented;
+      end
+      else if EarlyDataReasonName(AObserved.Info.EarlyDataReason) <> AExpectation.Name then
+        AMessage := Format('early data reason was "%s", expected "%s"',
+          [EarlyDataReasonName(AObserved.Info.EarlyDataReason), AExpectation.Name]);
+    TBoGoExpectKind.TicketAgeSkew:
+      // the runner reads the skew of a resumption only, and 0 means no expectation
+      if AObserved.IsResume and (AExpectation.Number <> 0) and
+        (AObserved.Info.TicketAgeSkew <> AExpectation.Number) then
+        AMessage := Format('ticket age skew was %d, wanted %d',
+          [AObserved.Info.TicketAgeSkew, AExpectation.Number]);
+    TBoGoExpectKind.NoOfferEarlyData:
+      // a client withholds 0-RTT for exactly these reasons; any other means it offered it
+      if not (AObserved.Info.EarlyDataReason in [TEarlyDataReason.Disabled,
+        TEarlyDataReason.ProtocolVersion, TEarlyDataReason.NoSessionOffered,
+        TEarlyDataReason.UnsupportedForSession, TEarlyDataReason.AlpnMismatch]) then
+        AMessage := 'the client offered early data, but the test expected it not to';
+    TBoGoExpectKind.HelloRetryRequest:
+      if not AObserved.Info.HelloRetryRequest then
+        AMessage := 'got no HelloRetryRequest, but wanted one';
+    TBoGoExpectKind.NoHelloRetryRequest:
+      if AObserved.Info.HelloRetryRequest then
+        AMessage := 'got a HelloRetryRequest, but wanted none';
+    TBoGoExpectKind.SelectedCredential:
+    begin
+      // one X.509 credential is all the shim loads, so which of several was chosen is not observable
+      LX509Count := 0;
+      for LPos := 0 to System.High(AConfig.CredentialOrder) do
+        if AConfig.CredentialOrder[LPos] < 0 then
+          Inc(LX509Count);
+      if LX509Count > 1 then
+      begin
+        AMessage := 'unimplemented: selection among several X.509 credentials';
+        Result := ShimExitUnimplemented;
+      end
+      else if SelectedCredentialIndex(AConfig, AObserved.Info) <> AExpectation.Number then
+        AMessage := Format('credential %d was used, wanted %d',
+          [SelectedCredentialIndex(AConfig, AObserved.Info), AExpectation.Number]);
+    end;
+  end;
+  if AMessage = '' then
+    Result := ShimExitPass;
+end;
+
+class function TBoGoShimRunner.RunExpectations(const AConfig: TBoGoConfig;
+  const AObserved: TBoGoObserved; const APkix: IPkixProvider;
+  AScopes: TBoGoExpectScopes; APreReject: Boolean; out AMessage: string): Int32;
+const
+  PreRejectKinds = [TBoGoExpectKind.Version, TBoGoExpectKind.ServerName,
+    TBoGoExpectKind.NoPeerCert, TBoGoExpectKind.Cipher, TBoGoExpectKind.Alpn,
+    TBoGoExpectKind.PeerCertFile];
+  SessionKinds = [TBoGoExpectKind.NoSession, TBoGoExpectKind.TicketSupportsEarlyData,
+    TBoGoExpectKind.TicketRenewal, TBoGoExpectKind.NotResumableAcrossNames,
+    TBoGoExpectKind.SessionId, TBoGoExpectKind.NoSessionId];
+var
+  LI: Int32;
+  LExpected, LGot: TBytes;
+  LPrefs, LSeen: TArray<UInt16>;
+  LHavePrefs: Boolean;
+begin
+  AMessage := '';
+  // the negotiated ALPN must equal -select-alpn on a server and the last -expect-alpn on a client
+  LGot := AObserved.Info.AlpnProtocol;
+  if AConfig.IsServer then
+    LExpected := EffectiveSelectAlpn(AConfig, AObserved.IsResume)
+  else
+  begin
+    LExpected := nil;
+    for LI := 0 to System.High(AConfig.Expectations) do
+      if (AConfig.Expectations[LI].Kind = TBoGoExpectKind.Alpn) and
+        (AConfig.Expectations[LI].Scope in AScopes) and
+        ExpectationApplies(AConfig.Expectations[LI], AObserved.IsResume) then
+        LExpected := AConfig.Expectations[LI].Text;
+  end;
+  if not TInteropUtils.BytesEqual(LGot, LExpected) then
+  begin
+    AMessage := Format('negotiated alpn proto mismatch (got %d bytes, wanted %d, resume=%s)',
+      [System.Length(LGot), System.Length(LExpected), BoolToStr(AObserved.IsResume, True)]);
+    Exit(ShimExitFail);
+  end;
+  LPrefs := nil;
+  LHavePrefs := False;
+  for LI := 0 to System.High(AConfig.Expectations) do
+  begin
+    if (not (AConfig.Expectations[LI].Scope in AScopes)) or
+      (not ExpectationApplies(AConfig.Expectations[LI], AObserved.IsResume)) or
+      (AConfig.Expectations[LI].Kind in SessionKinds + EchNameKinds + [TBoGoExpectKind.Alpn]) then
+      Continue;
+    if AConfig.Expectations[LI].Kind = TBoGoExpectKind.PeerVerifyPref then
+    begin
+      TArrayUtilities.Append<UInt16>(LPrefs, UInt16(AConfig.Expectations[LI].Number));
+      LHavePrefs := True;
+      Continue;
+    end;
+    // the early-data outcome and reason are read only once the handshake is confirmed
+    if APreReject and (AConfig.Expectations[LI].Kind in [TBoGoExpectKind.AcceptEarlyData,
+      TBoGoExpectKind.RejectEarlyData, TBoGoExpectKind.EarlyDataReason]) then
+      Continue;
+    if APreReject and (not (AConfig.Expectations[LI].Kind in PreRejectKinds)) then
+    begin
+      AMessage := 'unimplemented: this property of a rejected 0-RTT offer is not observed';
+      Exit(ShimExitUnimplemented);
+    end;
+    Result := ExpectationVerdict(AConfig, AConfig.Expectations[LI], AObserved, APkix, AMessage);
+    if Result <> ShimExitPass then
+      Exit;
+  end;
+  if LHavePrefs then
+  begin
+    // the peer's signature_algorithms: the ClientHello's on a server, the CertificateRequest's on a client
+    if AConfig.IsServer then
+      LSeen := AObserved.HelloSchemes
+    else
+      LSeen := AObserved.Info.RequestedSignatureSchemes;
+    // the resolver runs on the certificate path only, so a resumption or PSK leaves the hello unseen
+    if AConfig.IsServer and (not AObserved.HelloSeen) and
+      (not (AObserved.Info.Resumed or (System.Length(AObserved.Info.PskIdentity) > 0))) then
+    begin
+      AMessage := 'no ClientHello was observed on a certificate connection';
+      Exit(ShimExitFail);
+    end;
+    if (AObserved.HelloSeen or (not AConfig.IsServer)) and (not SameCodes(LSeen, LPrefs)) then
+    begin
+      AMessage := 'the peer verify preferences did not match the expected ones';
+      Exit(ShimExitFail);
+    end;
+  end;
+  Result := ShimExitPass;
+end;
+
+class function TBoGoShimRunner.CheckEchNameExpectations(const AConfig: TBoGoConfig;
+  const AObserved: TBoGoObserved; out AMessage: string): Int32;
+var
+  LI, LJ, LFirst, LLast: Int32;
+  LRetry, LUnobservable: Boolean;
+  LExpected: string;
+begin
+  AMessage := '';
+  LUnobservable := False;
+  LRetry := InRetryState(AConfig, AObserved);
+  for LI := 0 to System.High(AConfig.Expectations) do
+  begin
+    if (not (AConfig.Expectations[LI].Kind in EchNameKinds)) or
+      (not ExpectationApplies(AConfig.Expectations[LI], AObserved.IsResume)) then
+      Continue;
+    // the pre-offer check is the first verification (-on-resume-), the retry the last (-on-retry-)
+    LFirst := 0;
+    LLast := System.High(AObserved.VerifiedNames);
+    if LRetry then
+    begin
+      if AConfig.Expectations[LI].Scope = TBoGoExpectScope.Resume then
+      begin
+        // a single verification is the retry's, so the resume-scope name was not observed
+        if System.Length(AObserved.VerifiedNames) < 2 then
+        begin
+          LUnobservable := True;
+          Continue;
+        end;
+        LLast := 0;
+      end
+      else if AConfig.Expectations[LI].Scope = TBoGoExpectScope.Retry then
+        LFirst := LLast;
+    end
+    else if AConfig.Expectations[LI].Scope = TBoGoExpectScope.Retry then
+      Continue;
+    if System.Length(AObserved.VerifiedNames) = 0 then
+    begin
+      AMessage := 'no peer certificate verification ran, so the name override was not observed';
+      Exit(ShimExitMustFail);
+    end;
+    // no override verifies the host the connection was configured with, an override its own name
+    if AConfig.Expectations[LI].Kind = TBoGoExpectKind.EchNameOverride then
+      LExpected := AConfig.Expectations[LI].Name
+    else
+      LExpected := AConfig.HostName;
+    for LJ := LFirst to LLast do
+      if AObserved.VerifiedNames[LJ] <> LExpected then
+      begin
+        AMessage := Format('the peer was verified against "%s", wanted "%s"',
+          [AObserved.VerifiedNames[LJ], LExpected]);
+        Exit(ShimExitMustFail);
+      end;
+  end;
+  // decided last so an observable mismatch is never hidden behind the unobservable half
+  if LUnobservable then
+  begin
+    AMessage := 'unimplemented: the offered session''s verification was not observed';
+    Exit(ShimExitUnimplemented);
+  end;
+  Result := ShimExitPass;
+end;
+
+class function TBoGoShimRunner.CheckHandshakeExpectations(const AConfig: TBoGoConfig;
+  const AObserved: TBoGoObserved; const APkix: IPkixProvider): Int32;
+var
+  LPre: TBoGoObserved;
+  LMessage: string;
+begin
+  // a resumption connection must resume unless a miss is expected, an initial one never does
+  if AObserved.Info.Resumed <> (AObserved.IsResume and (not AConfig.ExpectSessionMiss)) then
+  begin
+    if AObserved.Info.Resumed then
+      Writeln(ErrOutput, 'session was unexpectedly reused')
+    else
+      Writeln(ErrOutput, 'session was unexpectedly not reused');
+    Exit(ShimExitFail);
+  end;
+  // a PSK connection holds no peer certificate; a client or a client-auth server holds one
+  if (System.Length(AConfig.Tls12PskSecret) > 0) or
+    (System.Length(AObserved.Info.PskIdentity) > 0) then
+  begin
+    if System.Length(AObserved.Info.PeerCertificates) > 0 then
+    begin
+      Writeln(ErrOutput, 'received an unexpected peer certificate');
+      Exit(ShimExitFail);
+    end;
+  end
+  else if ((not AConfig.IsServer) or AConfig.RequireClientCert) and
+    (System.Length(AObserved.Info.PeerCertificates) = 0) then
+  begin
+    Writeln(ErrOutput, 'received no peer certificate but expected one');
+    Exit(ShimExitFail);
+  end;
+  // a rejected 0-RTT is checked twice: -on-resume flags on the offered session, -on-retry on the retry
+  if not InRetryState(AConfig, AObserved) then
+    // -on-retry- flags belong to the connection that follows a rejected 0-RTT, never to this one
+    Result := RunExpectations(AConfig, AObserved, APkix,
+      [TBoGoExpectScope.Always, TBoGoExpectScope.Initial, TBoGoExpectScope.Resume], False,
+      LMessage)
+  else if AObserved.OfferedSession = nil then
+  begin
+    LMessage := 'unimplemented: a rejected 0-RTT without an offered session';
+    Result := ShimExitUnimplemented;
+  end
+  else
+  begin
+    LPre := AObserved;
+    LPre.Info.CipherSuite := AObserved.OfferedSession.CipherSuite;
+    LPre.Info.AlpnProtocol := AObserved.OfferedSession.Alpn;
+    LPre.Info.NegotiatedVersion := AObserved.OfferedSession.Version;
+    LPre.Info.PeerCertificates := AObserved.OfferedSession.PeerCertificates;
+    LPre.Info.ServerName := AObserved.OfferedSession.ServerName;
+    Result := RunExpectations(AConfig, LPre, APkix,
+      [TBoGoExpectScope.Always, TBoGoExpectScope.Resume], True, LMessage);
+    if Result = ShimExitPass then
+      Result := RunExpectations(AConfig, AObserved, APkix,
+        [TBoGoExpectScope.Always, TBoGoExpectScope.Retry], False, LMessage);
+  end;
+  if Result <> ShimExitPass then
+    Writeln(ErrOutput, LMessage);
+end;
+
+class function TBoGoShimRunner.InRetryState(const AConfig: TBoGoConfig;
+  const AObserved: TBoGoObserved): Boolean;
+var
+  LI: Int32;
+begin
+  Result := False;
+  if AObserved.IsResume and (not AConfig.IsServer) then
+    for LI := 0 to System.High(AConfig.Expectations) do
+      if (AConfig.Expectations[LI].Kind = TBoGoExpectKind.RejectEarlyData) and
+        (AConfig.Expectations[LI].Scope in [TBoGoExpectScope.Always, TBoGoExpectScope.Resume]) then
+        Result := True;
+end;
+
+class function TBoGoShimRunner.CheckSessionExpectations(const AConfig: TBoGoConfig;
+  var AObserved: TBoGoObserved): Int32;
+var
+  LI: Int32;
+  LScopes: TBoGoExpectScopes;
+  LNoSession, LRenewal, LSupportsEarly, LExpectNew, LGotNew, LCapable: Boolean;
+  L13: ITls13ResumableSession;
+begin
+  // the recorders are read now: a TLS 1.3 ticket arrives after the handshake
+  if AConfig.CacheView <> nil then
+    AObserved.NewSession := AConfig.CacheView.NewSession;
+  if AConfig.StoreView <> nil then
+    AObserved.ServerSessionStored := AConfig.StoreView.Stored;
+  LNoSession := False;
+  LRenewal := False;
+  LSupportsEarly := False;
+  if InRetryState(AConfig, AObserved) then
+    LScopes := [TBoGoExpectScope.Always, TBoGoExpectScope.Retry]
+  else
+    LScopes := [TBoGoExpectScope.Always, TBoGoExpectScope.Initial, TBoGoExpectScope.Resume];
+  for LI := 0 to System.High(AConfig.Expectations) do
+  begin
+    if (not (AConfig.Expectations[LI].Scope in LScopes)) or
+      (not ExpectationApplies(AConfig.Expectations[LI], AObserved.IsResume)) then
+      Continue;
+    case AConfig.Expectations[LI].Kind of
+      TBoGoExpectKind.NoSession:
+        LNoSession := True;
+      TBoGoExpectKind.TicketRenewal:
+        LRenewal := True;
+      TBoGoExpectKind.TicketSupportsEarlyData:
+        LSupportsEarly := True;
+      TBoGoExpectKind.SessionId, TBoGoExpectKind.NoSessionId:
+        // only an initial connection stores a session under an id that the test can name
+        if (not AObserved.IsResume) and AConfig.IsServer and
+          ((AConfig.Expectations[LI].Kind = TBoGoExpectKind.SessionId) <>
+          AObserved.ServerSessionStored) then
+        begin
+          Writeln(ErrOutput, 'the server session id caching did not match the expectation (stored=',
+            AObserved.ServerSessionStored, ', version=',
+            IntToHex(AObserved.Info.NegotiatedVersion.WireValue, 4), ')');
+          Exit(ShimExitFail);
+        end;
+    end;
+  end;
+  Result := ShimExitPass;
+  if AConfig.IsServer then
+    Exit;
+  // a client caches a session on a TLS 1.2 full handshake or renewal and on TLS 1.3 unless shut down first
+  LGotNew := AObserved.NewSession <> nil;
+  if AObserved.Info.NegotiatedVersion.WireValue = WireVersionTls13 then
+    LExpectNew := (not LNoSession) and (not AConfig.ShimShutsDown)
+  else
+    LExpectNew := (not LNoSession) and ((not AObserved.Info.Resumed) or LRenewal);
+  if LExpectNew <> LGotNew then
+  begin
+    if LGotNew then
+      Writeln(ErrOutput, 'new session was cached, but we expected the opposite')
+    else
+      Writeln(ErrOutput, 'new session was not cached, but we expected the opposite');
+    Exit(ShimExitFail);
+  end;
+  // a ticket is never resumable across names, so -expect-not-resumable-across-names holds by construction
+  if LExpectNew and (AObserved.Info.NegotiatedVersion.WireValue = WireVersionTls13) then
+  begin
+    LCapable := Supports(AObserved.NewSession, ITls13ResumableSession, L13) and
+      (L13.MaxEarlyData > 0);
+    if LCapable <> LSupportsEarly then
+    begin
+      Writeln(ErrOutput, 'the new session''s early-data support did not match the expectation');
+      Exit(ShimExitFail);
+    end;
   end;
 end;
 
@@ -430,7 +1581,9 @@ class function TBoGoShimRunner.TryParseArgs(out AConfig: TBoGoConfig;
   out AReason: string): Boolean;
 var
   LI: Int32;
-  LArg: string;
+  LArg, LValue: string;
+  LExpectation: TBoGoExpectation;
+  LHasValue: Boolean;
 
   function NextValue(const AName: string): string;
   begin
@@ -538,50 +1691,43 @@ begin
   AConfig := Default(TBoGoConfig);
   AConfig.MinVersion := -1;
   AConfig.MaxVersion := -1;
-  AConfig.ExpectVersion := -1;
   AReason := '';
   LI := 1;
   while LI <= TInteropArgs.Count do
   begin
     LArg := TInteropArgs.Get(LI);
-    // valueless flags BoGo passes that our default behaviour or the successful exchange
-    // already satisfies - assertions it checks on its own side, tolerances, and no-op
-    // capability hooks: accept and rely on our behaviour (no shim action, no value consumed)
-    if IsInList(LArg, ['-implicit-handshake', '-expect-hrr', '-expect-no-hrr',
-      '-server-preference', '-permute-extensions', '-enable-signed-cert-timestamps',
-      '-expect-not-resumable-across-names', '-install-cert-compression-algs',
-      '-expect-no-peer-cert', '-on-resume-expect-no-session', '-decline-alpn',
-      '-on-resume-expect-reject-early-data',
-      '-use-custom-verify-callback', '-expect-verify-result',
-      '-expect-ticket-supports-early-data', '-expect-accept-early-data',
-      '-on-resume-expect-accept-early-data', '-expect-early-data-info',
+    // valueless tolerances and capability hooks that change nothing this shim does
+    if IsInList(LArg, ['-implicit-handshake', '-server-preference', '-permute-extensions',
+      '-enable-signed-cert-timestamps', '-decline-alpn', '-use-custom-verify-callback',
       '-no-tls1', '-no-tls11', '-no-legacy-server-connect',
       '-use-old-client-cert-callback', '-use-early-callback', '-no-op-extra-handshake',
-      '-expect-session-miss', '-expect-session-id', '-expect-no-session-id',
-      '-expect-extended-master-secret', '-expect-ticket-renewal',
-      '-expect-resumable-across-names', '-on-retry-expect-no-session', '-expect-no-session',
       '-allow-hint-mismatch', '-on-resume-allow-hint-mismatch', '-install-ddos-callback',
-      '-expect-secure-renegotiation', '-expect-no-offer-early-data',
-      '-on-resume-expect-no-offer-early-data', '-expect-reject-early-data']) then
+      // this shim never renegotiates: it answers a renegotiation request with a warning
+      // no_renegotiation and continues. The runner drops that warning, so its expectation for
+      // both flags (ignore-and-continue, or forbid-after-handshake) is satisfied regardless
+      '-renegotiate-ignore', '-forbid-renegotiation-after-handshake']) then
     begin
       // accepted no-op
     end
-    // one-value flags BoGo asserts on ITS side (a cert file, the negotiated cipher/curve, a
-    // peer signature preference, an early-data reason - including the per-connection -on-initial
-    // / -on-resume / -on-retry variants across the three logical 0-RTT connections): consume and
-    // discard the value; our default negotiation or the encrypted exchange proves the outcome
-    else if IsInList(LArg, ['-expect-selected-credential', '-signed-cert-timestamps',
-      '-expect-curve-id', '-expect-peer-signature-algorithm', '-server-supported-groups-hint',
-      '-on-initial-expect-curve-id', '-on-resume-expect-curve-id', '-expect-msg-callback',
-      '-expect-ticket-age-skew', '-cipher', '-advertise-npn',
-      '-on-resume-expect-early-data-reason', '-expect-early-data-reason',
-      '-expect-advertised-alpn', '-expect-server-name', '-expect-peer-verify-pref',
-      '-expect-peer-cert-file', '-expect-cipher-aes', '-on-retry-expect-early-data-reason',
-      '-on-initial-expect-early-data-reason', '-on-initial-expect-peer-cert-file',
-      '-on-resume-expect-peer-cert-file', '-on-retry-expect-peer-cert-file',
-      '-on-initial-expect-cipher', '-on-resume-expect-cipher', '-on-retry-expect-cipher',
-      '-on-initial-expect-alpn', '-on-resume-expect-alpn', '-on-retry-expect-alpn']) then
+    // one-value configuration inputs this shim has no use for: consume the value
+    else if IsInList(LArg, ['-signed-cert-timestamps', '-server-supported-groups-hint',
+      '-advertise-npn']) then
       NextValue(LArg)
+    else if LArg = '-expect-session-miss' then
+      AConfig.ExpectSessionMiss := True
+    else if LArg = '-cipher' then
+    begin
+      // an expression or a suite this library lacks is a request the shim cannot fulfill
+      try
+        AConfig.CipherSuites := THostCipherList.Parse(NextValue(LArg), LArg);
+      except
+        on E: ETlsStreamError do
+        begin
+          AReason := 'unimplemented -cipher: ' + E.Message;
+          Exit(False);
+        end;
+      end;
+    end
     else if LArg = '-server' then
       AConfig.IsServer := True
     else if LArg = '-ipv6' then
@@ -598,14 +1744,23 @@ begin
     begin
       // begins an X.509 credential in the shim credential list; the following
       // -cert-file / -key-file populate our single certificate credential
+      TArrayUtilities.Append<Int32>(AConfig.CredentialOrder, -1);
     end
     else if LArg = '-new-psk-credential' then
     begin
       // begins an out-of-band external PSK credential (RFC 9258); the -psk-importer-*
       // flags that follow fill it. Default the KDF hash to SHA-256 until stated.
+      TArrayUtilities.Append<Int32>(AConfig.CredentialOrder, System.Length(AConfig.ExternalPsks));
       SetLength(AConfig.ExternalPsks, System.Length(AConfig.ExternalPsks) + 1);
       AConfig.ExternalPsks[High(AConfig.ExternalPsks)] := Default(TExternalPsk);
       AConfig.ExternalPsks[High(AConfig.ExternalPsks)].Hash := THashAlgorithm.SHA_256;
+    end
+    else if (System.Copy(LArg, 1, 13) = '-psk-importer') and
+      (System.Length(AConfig.ExternalPsks) = 0) then
+    begin
+      // the importer flags fill the credential -new-psk-credential began; none began yet
+      AReason := 'unimplemented: ' + LArg + ' before -new-psk-credential';
+      Exit(False);
     end
     else if LArg = '-psk-importer-key' then
       AConfig.ExternalPsks[High(AConfig.ExternalPsks)].Secret :=
@@ -620,6 +1775,10 @@ begin
       AConfig.ExternalPsks[High(AConfig.ExternalPsks)].Hash := THashAlgorithm.SHA_256
     else if LArg = '-psk-importer-sha384' then
       AConfig.ExternalPsks[High(AConfig.ExternalPsks)].Hash := THashAlgorithm.SHA_384
+    else if LArg = '-psk' then
+      AConfig.Tls12PskSecret := BytesOf(NextValue(LArg))
+    else if LArg = '-psk-identity' then
+      AConfig.Tls12PskIdentity := BytesOf(NextValue(LArg))
     else if LArg = '-trust-cert' then
       AConfig.TrustCert := NextValue(LArg)
     else if LArg = '-enable-ocsp-stapling' then
@@ -665,22 +1824,20 @@ begin
       AConfig.MinVersion := StrToInt(NextValue(LArg))
     else if LArg = '-max-version' then
       AConfig.MaxVersion := StrToInt(NextValue(LArg))
-    else if LArg = '-expect-version' then
-      AConfig.ExpectVersion := StrToInt(NextValue(LArg))
     else if LArg = '-curves' then
       AddCurve(UInt16(StrToInt(NextValue(LArg))))
     else if LArg = '-advertise-alpn' then
       AConfig.AdvertiseAlpn := ParseAlpnWire(NextValue(LArg))
     else if LArg = '-select-alpn' then
-      AConfig.SelectAlpn := NextValue(LArg)
+      AConfig.SelectAlpn := TInteropUtils.OctetsOf(NextValue(LArg))
     else if LArg = '-on-initial-select-alpn' then
     begin
-      AConfig.OnInitialSelectAlpn := NextValue(LArg);
+      AConfig.OnInitialSelectAlpn := TInteropUtils.OctetsOf(NextValue(LArg));
       AConfig.OnInitialSelectAlpnSet := True;
     end
     else if LArg = '-on-resume-select-alpn' then
     begin
-      AConfig.OnResumeSelectAlpn := NextValue(LArg);
+      AConfig.OnResumeSelectAlpn := TInteropUtils.OctetsOf(NextValue(LArg));
       AConfig.OnResumeSelectAlpnSet := True;
     end
     else if LArg = '-on-initial-advertise-alpn' then
@@ -696,8 +1853,6 @@ begin
     else if LArg = '-reject-alpn' then
       // the server rejects any client ALPN offer with no_application_protocol (RFC 7301)
       AConfig.RejectAlpn := True
-    else if LArg = '-expect-alpn' then
-      AConfig.ExpectAlpn := NextValue(LArg)
     else if LArg = '-shim-writes-first' then
     begin
       AConfig.ShimWritesFirst := True;
@@ -770,12 +1925,16 @@ begin
     else if LArg = '-no-tls13' then
       // exclude TLS 1.3 from this connection: lower the version ceiling to 1.2
       AConfig.MaxVersion := WireVersionTls12
+    else if LArg = '-install-cert-compression-algs' then
+      AConfig.InstallCertCompressionAlgs := True
+    else if LArg = '-install-one-cert-compression-alg' then
+      AConfig.InstallOneCertCompressionAlg := StrToInt(NextValue(LArg))
     else if LArg = '-no-server-name-ack' then
-      // the server must not echo the empty server_name acknowledgement (RFC 6066 3)
+      // suppress the RFC 6066 3 acknowledgement, as the runner asks
       AConfig.SuppressServerNameAck := True
     else if LArg = '-check-close-notify' then
       // a shim-initiated shutdown must be bidirectional: send our close_notify and wait for
-      // the peer's before closing the transport (RFC 8446 6.1)
+      // the peer's before closing the transport (RFC 9846 6.1)
       AConfig.CheckCloseNotify := True
     else if LArg = '-resumption-delay' then
       // seconds the runner advances its clock between connections; the shim advances its own
@@ -817,15 +1976,31 @@ begin
       SetLastEchServerKey(TInteropUtils.DecodeBase64(NextValue(LArg)))
     else if LArg = '-ech-is-retry-config' then
       SetLastEchServerRetry(NextValue(LArg) = '1')
-    // name-override assertions describe the client's public_name handling on a reject; our
-    // reject aborts with ech_required (never a plaintext fallback), so consume and ignore them
-    else if IsInList(LArg, ['-expect-ech-name-override',
-      '-on-retry-expect-ech-name-override']) then
-      NextValue(LArg)
-    else if IsInList(LArg, ['-expect-no-ech-name-override',
-      '-on-resume-expect-no-ech-name-override']) then
+    else if LArg = '-expect-total-renegotiations' then
     begin
-      // no value; the public_name override is not separately asserted
+      // this shim never renegotiates, so only an expectation of zero renegotiations is
+      // satisfiable; any other count is a request it cannot fulfill (exit 89)
+      if NextValue(LArg) <> '0' then
+      begin
+        AReason := 'unsupported -expect-total-renegotiations (renegotiation not performed)';
+        Exit(False);
+      end;
+    end
+    else if TryExpectationFlag(LArg, LExpectation, LHasValue) then
+    begin
+      if LHasValue then
+      begin
+        LValue := NextValue(LArg);
+        if LExpectation.Kind in [TBoGoExpectKind.ServerName, TBoGoExpectKind.Alpn] then
+          LExpectation.Text := TInteropUtils.OctetsOf(LValue)
+        else if LExpectation.Kind in [TBoGoExpectKind.AdvertisedAlpn,
+          TBoGoExpectKind.PeerCertFile, TBoGoExpectKind.EarlyDataReason,
+          TBoGoExpectKind.EchNameOverride] then
+          LExpectation.Name := LValue
+        else
+          LExpectation.Number := StrToInt(LValue);
+      end;
+      TArrayUtilities.Append<TBoGoExpectation>(AConfig.Expectations, LExpectation);
     end
     else
     begin
@@ -858,6 +2033,19 @@ end;
 class function TBoGoShimRunner.VersionRange(
   const AConfig: TBoGoConfig): TArray<UInt16>;
 
+  // a -cipher list names suites of the versions it keeps; naming no TLS 1.2 suite drops TLS 1.2
+  function NamesTls12Suite: Boolean;
+  var
+    LK: Int32;
+    LSuite: TTlsCipherSuite;
+  begin
+    Result := System.Length(AConfig.CipherSuites) = 0;
+    for LK := 0 to System.High(AConfig.CipherSuites) do
+      if TCipherSuiteCatalog.TryGet(AConfig.CipherSuites[LK], LSuite) and
+        (LSuite.Protocol = TSuiteProtocol.Tls12) then
+        Result := True;
+  end;
+
   procedure Consider(AVersion: UInt16);
   var
     LMin, LMax, LN: Int32;
@@ -866,6 +2054,8 @@ class function TBoGoShimRunner.VersionRange(
     if AConfig.MinVersion < 0 then LMin := WireVersionTls12 else LMin := AConfig.MinVersion;
     if AConfig.MaxVersion < 0 then LMax := WireVersionTls13 else LMax := AConfig.MaxVersion;
     if (AVersion < LMin) or (AVersion > LMax) then
+      Exit;
+    if (AVersion = WireVersionTls12) and (not NamesTls12Suite) then
       Exit;
     LN := System.Length(Result);
     SetLength(Result, LN + 1);
@@ -879,7 +2069,7 @@ begin
   Consider(WireVersionTls12);
 end;
 
-class function TBoGoShimRunner.BuildEchKeyStore(const AProvider: ICryptoProvider;
+class function TBoGoShimRunner.BuildEchKeyStore(const ACryptoProvider: ICryptoProvider;
   const AConfigs: TArray<TBoGoEchServerConfig>): IEchServerKeyStore;
 var
   LEntries: TArray<TEchKeyEntry>;
@@ -895,7 +2085,7 @@ begin
     // (not PKCS#8), imported into a prepared recipient key
     LReader := TWireReader.Create(AConfigs[LI].Config);
     LEntries[LI].Config := TEchConfig.Parse(LReader);
-    LEntries[LI].RecipientKey := AProvider.Hpke.ImportRecipientKey(
+    LEntries[LI].RecipientKey := ACryptoProvider.Hpke.ImportRecipientKey(
       LEntries[LI].Config.KemId, TSecretBuffer.From(AConfigs[LI].Key) as ISecretBuffer);
     LEntries[LI].IsRetry := AConfigs[LI].IsRetry;
   end;
@@ -913,10 +2103,13 @@ begin
     Result := AConfig.ExpectEchAccept;
 end;
 
-class function TBoGoShimRunner.BuildOptions(const AProvider: ICryptoProvider;
-  const AConfig: TBoGoConfig; AIsResume: Boolean): TInteropEngineOptions;
+class function TBoGoShimRunner.BuildOptions(const ACryptoProvider: ICryptoProvider;
+  const APkix: IPkixProvider; const AConfig: TBoGoConfig;
+  AIsResume: Boolean): TInteropEngineOptions;
 var
   LDropTicketState: Boolean;
+  LSuiteCode: UInt16;
+  LSuite: TTlsCipherSuite;
 begin
   Result := Default(TInteropEngineOptions);
   // -on-resume-no-ticket disables tickets on the resumption connection only: the server keeps
@@ -929,10 +2122,41 @@ begin
   // the client's verify preferences restrict the offered signature_algorithms (empty = default)
   Result.VerifySchemes := AConfig.VerifyPrefs;
   Result.SupportedVersions := VersionRange(AConfig);
+  // -cipher selects TLS 1.2 suites only; the preset's TLS 1.3 suites stay on offer, in its order
+  Result.CipherSuites := AConfig.CipherSuites;
+  if System.Length(AConfig.CipherSuites) > 0 then
+  begin
+    Result.CipherSuites := nil;
+    for LSuite in TCipherSuiteRegistry.CreateDualVersion(ACryptoProvider).Items do
+      if LSuite.Protocol = TSuiteProtocol.Tls13 then
+        TArrayUtilities.Append<UInt16>(Result.CipherSuites, LSuite.Common.Code);
+    for LSuiteCode in AConfig.CipherSuites do
+      if not (TCipherSuiteCatalog.TryGet(LSuiteCode, LSuite) and
+        (LSuite.Protocol = TSuiteProtocol.Tls13)) then
+        TArrayUtilities.Append<UInt16>(Result.CipherSuites, LSuiteCode);
+  end;
   // -async drives the deferred-verdict seam (resolved in the pump); inert without a peer cert
   Result.AsyncVerify := AConfig.AsyncVerify;
   // out-of-band external PSKs (RFC 9258) apply to either role
   Result.ExternalPsks := AConfig.ExternalPsks;
+  // the TLS 1.2 pre-shared key (-psk); a missing identity is the empty string BoGo's server sends
+  if System.Length(AConfig.Tls12PskSecret) > 0 then
+  begin
+    SetLength(Result.Tls12Psks, 1);
+    Result.Tls12Psks[0].Identity := AConfig.Tls12PskIdentity;
+    Result.Tls12Psks[0].Secret := TSecretBuffer.From(AConfig.Tls12PskSecret);
+    // the runner's client requires the server's hint to equal the configured identity
+    Result.Tls12PskIdentityHint := AConfig.Tls12PskIdentity;
+  end;
+  // the runner's test compression algorithms replace the defaults on both roles
+  if AConfig.InstallCertCompressionAlgs or (AConfig.InstallOneCertCompressionAlg <> 0) then
+  begin
+    Result.OverrideCertCompression := True;
+    Result.CertificateCompressors := TBoGoCertCompression.Compressors(
+      AConfig.InstallOneCertCompressionAlg);
+    Result.CertificateDecompressors := TBoGoCertCompression.Decompressors(
+      AConfig.InstallOneCertCompressionAlg);
+  end;
   if AConfig.IsServer then
   begin
     Result.Role := TInteropRole.Server;
@@ -941,9 +2165,9 @@ begin
     begin
       Result.HasCredential := True;
       Result.Credential := TInteropCredentials.ServerCredentialFromPem(
-        AProvider, AConfig.CertFile, AConfig.KeyFile);
+        ACryptoProvider, APkix, AConfig.CertFile, AConfig.KeyFile);
       // honor BoGo -signing-prefs: pin the CertificateVerify scheme to the requested
-      // ones (like rustls' FixedSignatureSchemeSigningKey); empty is a no-op
+      // ones; empty is a no-op
       Result.Credential.PrivateKey := Result.Credential.PrivateKey.WithPreferredSchemes(
         TInteropCredentials.SchemesFromCodes(AConfig.SigningPrefs));
     end;
@@ -955,28 +2179,22 @@ begin
     else if AConfig.VerifyPeer then
       Result.ClientAuth := TClientAuthMode.Requested;
     if (Result.ClientAuth <> TClientAuthMode.None) and (AConfig.TrustCert <> '') then
-      Result.Trust := TInteropCredentials.TrustFromPem(AProvider, AConfig.TrustCert);
+      Result.Trust := TInteropCredentials.TrustFromPem(APkix, AConfig.TrustCert);
     // -require-any-client-certificate requests a client cert with no CA to validate it
     // against: accept any presented chain (an accept-any whole-verifier in the engine)
     Result.AcceptAnyPeerCert := (Result.ClientAuth <> TClientAuthMode.None) and
       (Result.Trust = nil);
     // per-connection ALPN selection overrides the fixed -select-alpn on the matching
     // connection; an empty override means "select no protocol" (0-RTT ALPN tests)
-    if AIsResume and AConfig.OnResumeSelectAlpnSet then
-    begin
-      if AConfig.OnResumeSelectAlpn <> '' then
-        Result.AlpnProtocols := TArray<string>.Create(AConfig.OnResumeSelectAlpn);
-    end
-    else if (not AIsResume) and AConfig.OnInitialSelectAlpnSet then
-    begin
-      if AConfig.OnInitialSelectAlpn <> '' then
-        Result.AlpnProtocols := TArray<string>.Create(AConfig.OnInitialSelectAlpn);
-    end
-    else if AConfig.SelectAlpn <> '' then
-      Result.AlpnProtocols := TArray<string>.Create(AConfig.SelectAlpn);
+    if System.Length(EffectiveSelectAlpn(AConfig, AIsResume)) > 0 then
+      Result.AlpnProtocols := TArray<TBytes>.Create(EffectiveSelectAlpn(AConfig, AIsResume));
+    Result.ClientHelloObserver := AConfig.HelloObserver;
     Result.AlpnReject := AConfig.RejectAlpn;
     Result.ClientCertificateAuthorities := AConfig.UseClientCaList;
     Result.SuppressServerNameAck := AConfig.SuppressServerNameAck;
+    // the reference runner expects a server to resume a session neither side set up with
+    // extended_master_secret (RFC 7627 5.3's legacy path); the library default declines it
+    Result.NonEmsResumption := TNonEmsResumption.Resume;
     // resumption: the shared STEK issues and re-opens tickets; a positive early-data
     // budget lets the server accept the client's 0-RTT. -on-resume-no-ticket drops both on the
     // resumption connection so the server cannot accept the offered session and does a full
@@ -985,6 +2203,7 @@ begin
     begin
       Result.SessionTicketKeys := AConfig.SessionTicketKeys;
       Result.SessionStore := AConfig.SessionStore;
+      Result.ResumptionScope := AConfig.ResumptionScope;
     end;
     // a 0-RTT budget on the initial connection (always) or on the resumption only
     // (-on-resume-enable-early-data): the latter mints the initial ticket without early-data
@@ -996,7 +2215,7 @@ begin
       Result.MaxEarlyData := EarlyDataBudget;
     // the ECH key store is the same across the resume loop; a client whose config id we do
     // not hold is shared-mode rejected (retry_configs from the is_retry entries)
-    Result.EchKeyStore := BuildEchKeyStore(AProvider, AConfig.EchServerConfigs);
+    Result.EchKeyStore := BuildEchKeyStore(ACryptoProvider, AConfig.EchServerConfigs);
   end
   else
   begin
@@ -1021,9 +2240,17 @@ begin
     // (PSK-required). A leaf that is not a well-formed certificate is still rejected at parse
     // (GarbageCertificate-Client) before any trust decision.
     if (AConfig.TrustCert <> '') and AConfig.VerifyPeer then
-      Result.Trust := TInteropCredentials.TrustFromPem(AProvider, AConfig.TrustCert)
-    else if (System.Length(AConfig.ExternalPsks) = 0) or AConfig.VerifyPeer then
-      Result.AcceptAnyPeerCert := True;
+      Result.Trust := TInteropCredentials.TrustFromPem(APkix, AConfig.TrustCert)
+    else if ((System.Length(AConfig.ExternalPsks) = 0) and (System.Length(AConfig.Tls12PskSecret) = 0)) or
+      AConfig.VerifyPeer then
+      Result.AcceptAnyPeerCert := True
+    else if System.Length(AConfig.Tls12PskSecret) = 0 then
+      // a PSK-only client with no certificate trust offers only the versions it holds a key for:
+      // an external PSK is TLS 1.3-only (RFC 9258), and a 1.2 server would drop such a client onto
+      // a certificate path it has no trust to verify, so that shape is refused at build
+      Result.SupportedVersions := TArray<UInt16>.Create(WireVersionTls13)
+    else if System.Length(AConfig.ExternalPsks) = 0 then
+      Result.SupportedVersions := TArray<UInt16>.Create(WireVersionTls12);
     // per-connection ALPN advertisement overrides the fixed -advertise-alpn on the matching
     // connection (the client 0-RTT ALPN-preference-change test offers different protocols)
     if AIsResume and AConfig.OnResumeAdvertiseAlpnSet then
@@ -1037,7 +2264,7 @@ begin
     begin
       Result.HasCredential := True;
       Result.Credential := TInteropCredentials.ServerCredentialFromPem(
-        AProvider, AConfig.CertFile, AConfig.KeyFile);
+        ACryptoProvider, APkix, AConfig.CertFile, AConfig.KeyFile);
       // honor BoGo -signing-prefs for the client credential too (empty is a no-op)
       Result.Credential.PrivateKey := Result.Credential.PrivateKey.WithPreferredSchemes(
         TInteropCredentials.SchemesFromCodes(AConfig.SigningPrefs));
@@ -1046,13 +2273,17 @@ begin
     // separate opt-in the client uses when a cached ticket authorizes it. -on-resume-no-ticket
     // withholds the cache on the resumption connection so the client offers no cached session
     if not LDropTicketState then
+    begin
       Result.SessionCache := AConfig.SessionCache;
+      Result.SessionScope := AConfig.SessionScope;
+    end;
     // early data is a TLS 1.3 feature: a client capped below 1.3 offers none
     Result.OfferEarlyData := AConfig.EnableEarlyData and
       ((AConfig.MaxVersion < 0) or (AConfig.MaxVersion >= WireVersionTls13));
     // a client with external PSKs requires one unless the test also accepts a certificate
     // (-verify-peer); then a certificate-only ServerHello is fatal (PSK-required)
     Result.ExternalPskRequired := not AConfig.VerifyPeer;
+    Result.Tls12PskRequired := not AConfig.VerifyPeer;
     // the client requests a staple when the test enables stapling or asserts a staple
     Result.RequestOcsp := AConfig.EnableOcspStapling or AConfig.HasExpectOcsp;
     // Encrypted Client Hello: offer the config list (a resumption may override it), and GREASE
@@ -1074,7 +2305,7 @@ var
 
   function AppDataDuringShutdown: Int32;
   begin
-    // a peer that has our close_notify must not send application data (RFC 8446 6.1)
+    // a peer that has our close_notify must not send application data (RFC 9846 6.1)
     Writeln(ErrOutput, 'application data received during shutdown');
     Result := ShimExitFail;
   end;
@@ -1119,9 +2350,9 @@ begin
   Result := ShimExitPass;
 end;
 
-class function TBoGoShimRunner.RunExchange(const AProvider: ICryptoProvider;
-  const ASocket: TInteropSocket; const AConfig: TBoGoConfig;
-  AIsResume: Boolean): Int32;
+class function TBoGoShimRunner.RunExchange(const ACryptoProvider: ICryptoProvider;
+  const APkix: IPkixProvider; const ASocket: TInteropSocket;
+  const AConfig: TBoGoConfig; AIsResume: Boolean): Int32;
 var
   LEngine: ITlsEngine;
   LOptions: TInteropEngineOptions;
@@ -1135,25 +2366,51 @@ var
   LExportProbe: TExportProbe;
   LProbe: IHandshakeProbe;
   LSeenCas: TArray<TBytes>;
-  LCaIdx, LRep, LRepeat, LAccepted: Int32;
+  LInfo: TTlsConnectionInfo;
+  LCaIdx, LRep, LRepeat, LAccepted, LCheck: Int32;
+  LObserved: TBoGoObserved;
+  LNameRecorder: TInteropVerifyNameRecorder;
+  LRecorderOwner: IInterface;
+  LMessage: string;
+  LVerifyGate, LRetryVerifyFail, LNeedRecorder: Boolean;
 begin
-  LOptions := BuildOptions(AProvider, AConfig, AIsResume);
-  LOptions.ReverifyOnResume := AConfig.ReverifyOnResume;
+  // each recorder reports the current connection only, though the cache and store span the loop
+  if AConfig.CacheView <> nil then
+    AConfig.CacheView.BeginConnection;
+  if AConfig.StoreView <> nil then
+    AConfig.StoreView.BeginConnection;
+  if AConfig.HelloView <> nil then
+    AConfig.HelloView.BeginConnection;
+  LOptions := BuildOptions(ACryptoProvider, APkix, AConfig, AIsResume);
+  // the initial connection has no session to check
+  LOptions.ReverifyOnResume := AConfig.ReverifyOnResume and AIsResume;
   // -verify-fail is fatal only under -verify-peer / -require-any-client-certificate (a hard
-  // verify); without them BoringSSL soft-fails and completes, and so do we (the valid cert
-  // verifies and no reject is injected). -on-resume-verify-fail and -on-retry-verify-fail bite on
-  // the resumed connection: the former on its re-verification (under -reverify-on-resume), the
-  // latter on the retry after a 0-RTT reject or on the full-handshake fallback when no ticket
-  // resumes - both land on the same resumed connection in this shim's model.
-  LOptions.VerifyFail := (AConfig.VerifyFail or
-    ((AConfig.OnResumeVerifyFail or AConfig.OnRetryVerifyFail) and AIsResume)) and
-    (AConfig.VerifyPeer or AConfig.RequireClientCert or
-    (AConfig.ReverifyOnResume and AIsResume));
-  // reverify-on-resume runs the verifier synchronously on the resumed connection (there is no
-  // async park there), so an async verify-fail on that connection is a synchronous reject
+  // verify); without them the runner expects a soft-fail completion (no reject is injected)
+  LVerifyGate := AConfig.VerifyPeer or AConfig.RequireClientCert or
+    (AConfig.ReverifyOnResume and AIsResume);
+  LObserved := Default(TBoGoObserved);
+  LObserved.IsResume := AIsResume;
+  // without -reverify-on-resume the retry flag fails the one verification, in a 0-RTT reject test
+  LOptions.VerifyFail := (AConfig.VerifyFail or (AIsResume and (AConfig.OnResumeVerifyFail or
+    (AConfig.OnRetryVerifyFail and (not AConfig.ReverifyOnResume) and
+    InRetryState(AConfig, LObserved))))) and LVerifyGate;
+  LRetryVerifyFail := AConfig.OnRetryVerifyFail and AIsResume and AConfig.ReverifyOnResume;
+  // the offer-time check is synchronous, and Build refuses early data beside an async verdict
   if AIsResume and AConfig.ReverifyOnResume then
     LOptions.AsyncVerify := False;
-  LEngine := TInteropEngine.Build(AProvider, LOptions);
+  LNeedRecorder := LRetryVerifyFail;
+  for LI := 0 to System.High(AConfig.Expectations) do
+    if AConfig.Expectations[LI].Kind in EchNameKinds then
+      LNeedRecorder := True;
+  LNameRecorder := nil;
+  if LNeedRecorder then
+  begin
+    LNameRecorder := TInteropVerifyNameRecorder.Create(LOptions.VerifyFail, LRetryVerifyFail,
+      InRetryState(AConfig, LObserved));
+    LRecorderOwner := LNameRecorder;
+    LOptions.VerifyNameRecorder := LNameRecorder;
+  end;
+  LEngine := TInteropEngine.Build(ACryptoProvider, LOptions);
   // this connection writes first when -shim-writes-first, or on a resumption under
   // -on-resume-shim-writes-first; a client that also offered 0-RTT sends that first write
   // as early data before the handshake completes
@@ -1193,7 +2450,7 @@ begin
   LServerHalfRtt := AConfig.IsServer and AIsResume and
     (AConfig.EnableEarlyData or AConfig.OnResumeEnableEarlyData);
   // resolve the effective export parameters (on-resume overrides when supplied) up front so a
-  // server can capture its keying-material export in half-RTT (RFC 8446 7.5) during the pump
+  // server can capture its keying-material export in half-RTT (RFC 9846 7.5) during the pump
   LExportLen := AConfig.ExportLen;
   LExportLabel := AConfig.ExportLabel;
   LExportContext := AConfig.ExportContext;
@@ -1219,52 +2476,72 @@ begin
   // verify-fail (in which case the parked handshake is rejected, fail-closed)
   LResult := TInteropPump.DriveHandshake(LEngine, ASocket, not LOptions.VerifyFail,
     LServerHalfRtt, LProbe);
+  if LNameRecorder <> nil then
+    LObserved.VerifiedNames := LNameRecorder.Names;
+  // an ECH reject fails by design after verifying the public_name, so decide the names first
+  LCheck := CheckEchNameExpectations(AConfig, LObserved, LMessage);
+  if LCheck <> ShimExitPass then
+  begin
+    Writeln(ErrOutput, LMessage);
+    Exit(LCheck);
+  end;
   if LResult.Status <> TInteropStatus.Ok then
   begin
     Writeln(ErrOutput, 'handshake failed: ', LResult.Detail);
     Exit(ShimExitFail);
   end;
+  // a retry failure that never ran must not read as a pass
+  if LRetryVerifyFail and (not LNameRecorder.RetryRejected) then
+  begin
+    Writeln(ErrOutput, 'the retry verification the test fails never ran: the offered session ' +
+      'is verified once, before it is offered');
+    Exit(ShimExitMustFail);
+  end;
+
+  LInfo := LEngine.ConnectionInfo;
 
   // Encrypted Client Hello acceptance (RFC 9849): when the runner expects ECH to be accepted
   // on this connection, the negotiation must have run on the inner ClientHello. A per-connection
   // -on-initial / -on-resume override wins over the base -expect-ech-accept.
   if EchAcceptExpected(AConfig, AIsResume) and
-    (LEngine.EchStatus <> TEchStatus.Accepted) then
+    (LInfo.EchStatus <> TEchStatus.Accepted) then
   begin
     Writeln(ErrOutput, 'ECH was expected to be accepted but was not');
     Exit(ShimExitFail);
   end;
 
-  // the negotiated version is enforced by the peer (BoGo pins its own side) and proven
-  // by the successful encrypted echo below, so -expect-version needs no separate check
-  // here beyond confirming it is a version this shim can offer at all
-  if (AConfig.ExpectVersion >= 0) and (AConfig.ExpectVersion <> WireVersionTls13) and
-    (AConfig.ExpectVersion <> WireVersionTls12) then
+  LObserved.Info := LInfo;
+  LObserved.VerifyFailConfigured := AConfig.VerifyFail or
+    ((AConfig.OnResumeVerifyFail or AConfig.OnRetryVerifyFail) and AIsResume);
+  LObserved.WebPkiTrust := LOptions.Trust <> nil;
+  LObserved.EarlyDataRefused := (not AConfig.IsServer) and AConfig.EnableEarlyData and
+    (not LOptions.OfferEarlyData);
+  if AConfig.CacheView <> nil then
+    LObserved.OfferedSession := AConfig.CacheView.OfferedSession;
+  if AConfig.HelloView <> nil then
   begin
-    Writeln(ErrOutput, 'the test expects a version this shim does not offer');
-    Exit(ShimExitFail);
+    LObserved.HelloSeen := AConfig.HelloView.Seen;
+    LObserved.HelloAlpn := AConfig.HelloView.AlpnProtocols;
+    LObserved.HelloSchemes := AConfig.HelloView.SignatureSchemes;
   end;
-  if (AConfig.ExpectAlpn <> '') and
-    (LEngine.NegotiatedAlpnProtocol <> AConfig.ExpectAlpn) then
-  begin
-    Writeln(ErrOutput, 'negotiated ALPN did not match the expected protocol');
-    Exit(ShimExitFail);
-  end;
+  LCheck := CheckHandshakeExpectations(AConfig, LObserved, APkix);
+  if LCheck <> ShimExitPass then
+    Exit(LCheck);
   // the client must have received exactly the stapled OCSP response the runner expects.
   // The staple rides the Certificate message, which a full TLS 1.3 resumption omits (there
   // is no re-authentication), so it is only asserted on the full handshake - our client
   // does not cache and re-surface a prior staple across resumption.
   if AConfig.HasExpectOcsp and (not AIsResume) and
-    (not TInteropUtils.BytesEqual(LEngine.PeerOcspStaple, AConfig.ExpectOcspResponse)) then
+    (not TInteropUtils.BytesEqual(LInfo.PeerOcspStaple, AConfig.ExpectOcspResponse)) then
   begin
     Writeln(ErrOutput, 'the stapled OCSP response did not match the expected one');
     Exit(ShimExitFail);
   end;
   // the client must have seen exactly the certificate_authorities the server named in its
-  // CertificateRequest (RFC 8446 4.2.4 / RFC 5246 7.4.4), in the same order
+  // CertificateRequest (RFC 9846 4.3.4 / RFC 5246 7.4.4), in the same order
   if AConfig.ExpectClientCaListSet then
   begin
-    LSeenCas := LEngine.RequestedCertificateAuthorities;
+    LSeenCas := LInfo.RequestedCertificateAuthorities;
     if System.Length(LSeenCas) <> System.Length(AConfig.ExpectClientCaList) then
     begin
       Writeln(ErrOutput, 'the requested certificate_authorities count did not match');
@@ -1280,13 +2557,13 @@ begin
   end;
 
   // exported keying material is written first thing after the handshake so the runner reads it
-  // before the echo protocol (RFC 5705 / RFC 8446 7.5). A TLS 1.3 server writes the value it
+  // before the echo protocol (RFC 5705 / RFC 9846 7.5). A TLS 1.3 server writes the value it
   // captured in half-RTT (the runner reads it post-handshake, but capturing it in half-RTT is what
   // validates the capability); a nil capture there means the half-RTT export was unavailable and
   // fails loudly rather than falling back. A client, or a TLS 1.2 server, exports post-handshake.
   if LExportLen > 0 then
   begin
-    if LHalfRttExport and (LEngine.NegotiatedVersion.WireValue = WireVersionTls13) then
+    if LHalfRttExport and (LInfo.NegotiatedVersion.WireValue = WireVersionTls13) then
     begin
       if not LExportProbe.HasCaptured then
       begin
@@ -1295,17 +2572,19 @@ begin
       end;
       LExported := LExportProbe.Captured;
     end
-    else
+    else if AConfig.UseExportContext then
       LExported := LEngine.ExportKeyingMaterial(LExportLabel, LExportContext,
-        AConfig.UseExportContext, LExportLen);
+        LExportLen)
+    else
+      LExported := LEngine.ExportKeyingMaterial(LExportLabel, LExportLen);
     TInteropPump.WriteAppData(LEngine, ASocket, LExported);
   end;
 
-  // an unsolicited KeyUpdate is sent right after the handshake (RFC 8446 4.6.3); inbound
+  // an unsolicited KeyUpdate is sent right after the handshake (RFC 9846 4.7.3); inbound
   // KeyUpdates the peer sends are absorbed by the engine during the echo loop below
   if AConfig.KeyUpdate then
   begin
-    LEngine.RequestKeyUpdate(False);
+    LEngine.RequestKeyUpdate(TKeyUpdateRequest.UpdateNotRequested);
     TInteropPump.Flush(LEngine, ASocket);
   end;
 
@@ -1324,7 +2603,12 @@ begin
   // -shim-shuts-down: the shim closes the connection right after the handshake instead of
   // echoing. Entering the echo loop would block on a read the runner never satisfies.
   if AConfig.ShimShutsDown then
+  begin
+    LCheck := CheckSessionExpectations(AConfig, LObserved);
+    if LCheck <> ShimExitPass then
+      Exit(LCheck);
     Exit(FinishShutdown(LEngine, ASocket, AConfig.CheckCloseNotify));
+  end;
 
   // the runner's echo protocol: read a message, flip every byte, write it back
   repeat
@@ -1343,6 +2627,9 @@ begin
     end;
   until LResult.Status <> TInteropStatus.Ok;
 
+  LCheck := CheckSessionExpectations(AConfig, LObserved);
+  if LCheck <> ShimExitPass then
+    Exit(LCheck);
   if LResult.Status = TInteropStatus.PeerClosed then
     TInteropPump.Close(LEngine, ASocket);
   Result := ShimExitPass;
@@ -1352,19 +2639,36 @@ class function TBoGoShimRunner.Run: Int32;
 var
   LConfig: TBoGoConfig;
   LReason: string;
-  LProvider: ICryptoProvider;
+  LCrypto: ICryptoProvider;
+  LPkix: IPkixProvider;
   LSocket: TInteropSocket;
   LConn: Int32;
   LAddress: string;
   LClock: TInteropAdjustableClock;
+  LStoreRecorder: TBoGoStoreRecorder;
+  LCacheRecorder: TBoGoCacheRecorder;
+  LHelloRecorder: TBoGoHelloRecorder;
+  LObservesHello: Boolean;
+  LI: Int32;
 begin
-  LogArgv;
-  if HandleProbeFlags then
-    Exit(ShimExitPass);
-  if not TryParseArgs(LConfig, LReason) then
-  begin
-    Writeln(ErrOutput, LReason);
-    Exit(ShimExitUnimplemented);
+  try
+    LogArgv;
+    if HandleProbeFlags then
+      Exit(ShimExitPass);
+    if not TryParseArgs(LConfig, LReason) then
+    begin
+      Writeln(ErrOutput, LReason);
+      Exit(ShimExitUnimplemented);
+    end;
+  except
+    // an argument the shim cannot read faithfully (a wide character, a missing or malformed value)
+    on E: Exception do
+    begin
+      if not ((E is EInteropData) or (E is EConvertError)) then
+        raise;
+      Writeln(ErrOutput, 'unimplemented: ', E.Message);
+      Exit(ShimExitUnimplemented);
+    end;
   end;
   // the shim offers TLS 1.3 and hardened 1.2. An empty range that still permits a version
   // at or above our 1.2 floor means every supported version was explicitly disabled (e.g.
@@ -1382,14 +2686,26 @@ begin
     Exit(ShimExitUnimplemented);
   end;
 
-  LProvider := TInteropEngine.DefaultProvider;
-  // one session cache (client) / STEK (server) shared across every connection, so a
+  LCrypto := TTlsLibTestProviders.Crypto;
+  LPkix := TTlsLibTestProviders.Pkix;
   // the client always keeps a session cache so it offers psk_key_exchange_modes and accepts
   // (and validates) the NewSessionTickets the server issues, even on a non-resume connection;
   // a resumption reuses the same cache across the ResumeCount+1 connections. The server only
   // needs ticket keys when a resumption is expected.
   if LConfig.IsServer then
   begin
+    // the observing resolver replaces the stock credential path, so only ClientHello tests install it
+    LObservesHello := False;
+    for LI := 0 to System.High(LConfig.Expectations) do
+      if LConfig.Expectations[LI].Kind in [TBoGoExpectKind.AdvertisedAlpn,
+        TBoGoExpectKind.PeerVerifyPref] then
+        LObservesHello := True;
+    if LObservesHello then
+    begin
+      LHelloRecorder := TBoGoHelloRecorder.Create;
+      LConfig.HelloView := LHelloRecorder;
+      LConfig.HelloObserver := LHelloRecorder;
+    end;
     if LConfig.ResumeCount > 0 then
     begin
       // ticket (stateless) resumption keys AND a stateful session-id store (RFC 5246 7.3),
@@ -1397,14 +2713,24 @@ begin
       // resumes via the session id, which the server can only honor from a persistent store.
       // -no-ticket suppresses the STEK so no ticket is minted, leaving only the session-id path
       if not LConfig.NoTicket then
-        LConfig.SessionTicketKeys := TStekTicketKeyManager.Create(LProvider.Primitives.GetRandom)
+        LConfig.SessionTicketKeys := TStekTicketKeyManager.Create(LCrypto.Primitives.GetRandom)
           as ISessionTicketKeyManager;
-      LConfig.SessionStore := TInMemorySessionStore.Create(LProvider.Primitives.GetRandom)
-        as ISessionStore;
+      LStoreRecorder := TBoGoStoreRecorder.Create(
+        TInMemorySessionStore.Create(LCrypto.Primitives.GetRandom) as ISessionStore);
+      LConfig.SessionStore := LStoreRecorder;
+      LConfig.StoreView := LStoreRecorder;
+      // one scope for the resume loop: a client-auth server partitions its tickets by it
+      LConfig.ResumptionScope := LCrypto.Primitives.GetRandom.GenerateBytes(16);
     end;
   end
   else
-    LConfig.SessionCache := TInMemorySessionCache.Create as ISessionCache;
+  begin
+    LCacheRecorder := TBoGoCacheRecorder.Create(TInMemorySessionCache.Create as ISessionCache);
+    LConfig.SessionCache := LCacheRecorder;
+    LConfig.CacheView := LCacheRecorder;
+    // one scope for the resume loop so each rebuilt client config resumes the last
+    LConfig.SessionScope := LCrypto.Primitives.GetRandom.GenerateBytes(16);
+  end;
   // -resumption-delay drives a test clock the shim advances between connections (so a
   // resumption PSK's obfuscated_ticket_age and lifetime expiry are exact); without it every
   // engine keeps the real system clock. LClock is a raw view of the interface LConfig.Clock owns.
@@ -1431,7 +2757,7 @@ begin
       LSocket := TInteropSocket.Connect(LAddress, LConfig.Port);
       try
         AnnounceShimId(LSocket, LConfig.ShimId);
-        Result := RunExchange(LProvider, LSocket, LConfig, LConn > 0);
+        Result := RunExchange(LCrypto, LPkix, LSocket, LConfig, LConn > 0);
       finally
         LSocket.Free;
       end;

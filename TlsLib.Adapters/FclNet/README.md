@@ -4,7 +4,8 @@ Drops TlsLib4Pascal's managed TLS engine into **Free Pascal's own networking** t
 fcl-net's `TSSLSocketHandler` "swap-your-SSL" seam — so a stock `TFPHTTPClient` HTTPS
 request (or any `TInetSocket`) speaks our managed TLS instead of OpenSSL.
 
-**Free Pascal only.** This adapter ships no Delphi package or examples.
+**Free Pascal only.** This adapter ships no Delphi package or examples. Its package requires the
+`TlsLib.Net` package, whose socket layer it waits and sends through.
 
 ## How to swap it in
 
@@ -47,7 +48,7 @@ begin
   H.UseSystemTrust := True;             // (or pin a CA: H.CertificateData.CertCA.FileName := ...)
   AHandler := H;                        // verification is on by default; nothing else to set
 end;
-client.OnGetSocketHandler := GetHandler;
+client.OnGetSocketHandler := GetHandler;   // @GetHandler under FPC {$mode objfpc}
 ```
 
 A handler you return fully configured covers every trust and credential case below.
@@ -71,8 +72,8 @@ n := sock.Read(buf[0], Length(buf));
 sock.Free;                                              // flushes close_notify, closes the socket
 ```
 
-The host passed to `TInetSocket.Create` is both the SNI name and the name the certificate is
-verified against.
+The host passed to `TInetSocket.Create` is both the SNI name (unless `SendHostAsSNI := False`) and the
+name the certificate is verified against.
 
 ## Configuring trust
 
@@ -83,17 +84,29 @@ trust the familiar way. Only what fcl-net lacks is added as extension properties
 
 | Source                                                | Maps to                                            |
 |-------------------------------------------------------|----------------------------------------------------|
-| `CertificateData.CertCA` / `.TrustedCertificate`      | `WithTrustAnchors` — pinned anchors (unioned)      |
+| `CertificateData.CertCA` / `.TrustedCertificate`      | `TServerVerification.WebPki` anchor blobs (unioned) |
 | `CertificateData.Certificate` + `.PrivateKey` + `KeyPassword` | `WithCredential` — own cert (server, or mTLS client) |
-| `UseSystemTrust: Boolean`                             | OS system-trust store (crypt32 / SecTrust / Unix)  |
-| `CustomTrustStore: ITrustAnchorStore`                 | `WithTrustStore` (unions with the above)           |
-| `CustomServerCertificateVerifier` / `CustomClientCertificateVerifier` | `WithCertificateVerifier` — **replaces** the pipeline (role-typed) |
+| `CertificateData.PFX` + `KeyPassword`                  | `WithCredential` from a PKCS#12; its CA bag is sent as chain, never trusted. PFX beside `Certificate` or `PrivateKey` **fails loudly**, as does `CertCA` with both `Value` and `FileName` set |
+| `UseSystemTrust: Boolean`                             | OS system-trust store (crypt32 / SecTrust / Android / Unix); unions with `CertCA` / `CustomTrustStore` as "my CA plus the OS roots" ([rule](../../docs/system-trust.md#host-roots-beside-the-os-roots)); on Android, the `CertCA` / `CustomTrustStore` roots do not apply to hosts a network-security-config `<domain-config>` names |
+| `CustomTrustStore: ITrustAnchorStore`                 | `WebPki` store (unions with the above)             |
+| `ClientAuth: TClientAuthMode` (**server**)            | `WithPeerAuth(None / Requested / Required)`; default `None` never requests a client certificate. Any other mode needs a private client-CA (`CertCA` / `TrustedCertificate` / `CustomTrustStore`). `UseSystemTrust` is a server-cert source, never a client-CA |
+| `CustomServerCertificateVerifier` / `CustomClientCertificateVerifier` | `Custom` verification — **replaces** the pipeline (role-typed) |
 | `CheckHostName: Boolean` (default True)               | on by default; off via `WithDangerousDisableServerNameCheck` |
-| `AlpnProtocols: TArray<string>`                       | `WithAlpnProtocols`                                |
-| `VerifyPeerCert` (fcl-net native, default **True** here) | verify on/off; **False** → `dangerous` `WithDangerousInsecureSkipVerify` |
-| `VerifyCallback` / `VerdictResolver` + `VerdictDeadlineMs` | augment-only hook / out-of-band verdict (live OCSP/CRL) |
+| `SendHostAsSNI` (fcl-net native, default True)        | `WithServerNameIndication(Send / Omit)`; False sends no SNI but the certificate is still verified against the host |
+| `AlpnProtocols: TArray<string>`                       | `WithAlpnProtocols` (ASCII names, converted with `TAlpnProtocols.FromText`) |
+| `VerifyPeerCert` (fcl-net native, default **True** here) | verify on/off; **False** → `dangerous` `DangerousSkip` |
+| `SSLType` (fcl-net native)                            | `stAny` offers TLS 1.3 and 1.2; `stTLSv1_2` offers 1.2 alone; any other value fails the handshake |
+| `VerifyCallback` | augment-only hook, runs last (presented chain + validated path + host → Boolean) |
+| `VerdictResolver` + `VerdictDeadlineMs` | client-role out-of-band verdict (server's chain), e.g. live OCSP/CRL |
+| `ServerVerdictResolver` + `ServerVerdictDeadlineMs` | server-role out-of-band verdict (mTLS client's chain); beside a supplied `ClientConfig` / `ServerConfig` that config must itself defer the verdict, else the connection is refused; beside a server config that requests no client certificate the resolver is refused outright |
+| `HandshakeTimeoutMs` | bounds the handshake read (ms); `0` = `Socket.IOTimeout` when set, else the 30 s default |
+| `Socket.IOTimeout` (fcl-net native) | bounds application reads; an expiry is retryable (`Recv` returns -1 with `LastErrorDesc` set, the connection stays usable), never a truncation |
 | `OnVerifyCertificate` (fcl-net native)                | augment-only reject after our pipeline             |
+| `SessionResumption: Boolean`                          | `WithResumption` (0-RTT is never enabled)          |
+| `Crypto` / `Pkix`                                     | the providers the slot-driven build uses (nil = the shared defaults) |
+| `ClientConfig` / `ServerConfig`                       | a fully built config that replaces the slot-driven build |
 
+**Read timeouts**: the adapter waits before each receive, so `HandshakeTimeoutMs` and read timeouts hold on every supported CPU. Do not set `Socket.IOTimeout`; the wait replaces it.
 **Certificate chain**: `CertificateData.Certificate` is the chain the server *presents* — put your leaf
 **followed by any intermediates** (a concatenated PEM, or a multi-cert byte slot) so clients build a
 complete chain. `CertCA` / `TrustedCertificate` are **trust sources** (used to verify the *peer*), never
@@ -105,8 +118,12 @@ clients to fetch the missing CA.
 this adapter's constructor defaults it to **`True`**. Trust is therefore **fail-closed**: a client
 that names **no** trust source (`CertCA`/`TrustedCertificate`, `UseSystemTrust`, `CustomTrustStore`,
 a custom verifier) **refuses to connect** — system trust is never implicit. Anchor sources UNION; a
-a custom verifier is exclusive. A server requires `CertificateData.Certificate`/`.PrivateKey`; it
-requests + verifies client certificates only when a client-trust source is named (mTLS is opt-in).
+custom verifier is exclusive. A server requires `CertificateData.Certificate`/`.PrivateKey`; it
+requests + verifies client certificates only when `ClientAuth` is set (mTLS is an explicit opt-in; a
+named client-CA alone never triggers it). Set `ClientAuth` per server-side handler in the
+`OnCreateClientSocketHandler` hook, never process-wide. `UseSystemTrust` is a server-certificate
+source (a client verifying a server) and is **not** a valid client-CA: a mode whose only source is it
+fails the build — name a private `CertCA` (or a `CustomTrustStore`) for the client-CA.
 
 Setting `VerifyPeerCert := False` is the loud, deliberate bypass (no PKIX/host/pinning checks) —
 for tests and pinned dev peers, never production.
@@ -123,11 +140,24 @@ system-trust model see [docs/system-trust.md](../../docs/system-trust.md).
 
 ## Notes
 
-- The transport reads/writes the raw socket handle via the `Sockets` unit's `fpRecv`/`fpSend`,
-  bypassing the SSL-aware handler methods (which carry decrypted application data).
+- The transport reads/writes the raw socket handle through TlsLib.Net's `TNetOs`
+  (`ReceiveBytes` / `SendBytes`; WinSock `recv`/`send` on Windows), bypassing the SSL-aware handler
+  methods (which carry decrypted application data).
+- `TlsLibFclNetTrustDefaults` also seeds `Crypto`, `Pkix` and `SessionResumption` into every new
+  handler. A handler given a `ClientConfig` / `ServerConfig` while `Crypto` or `Pkix` is non-nil or
+  `SessionResumption` is False raises a conflict, as a config carries its own providers and
+  resumption setting.
+- `KeyPassword` on the handler wins; when it is empty the host's `CertificateData.KeyPassword` is used.
+- A handler with no host (not created through a `TInetSocket`) fails closed under `CheckHostName`.
 - `BytesAvailable` reports our buffered plaintext count (the `SSL_pending` analogue).
-- `TSocketStream` owns and frees the handler it was given; the adapter frees its inner
-  `TTlsStream` in `Destroy`.
+- `TSocketStream` owns and frees the handler it was given; the adapter frees its `TTlsConnection`
+  (and with it the TLS stream) in `Destroy`.
+- After the handshake the handler reports `NegotiatedVersion`, `NegotiatedCipherSuite`,
+  `NegotiatedGroup`, `PeerServerName`, `EchStatus`, `Resumed` and `NegotiatedAlpn` (text; empty when
+  none was agreed).
+- Built configs are cached process-wide. After rotating a certificate or key, call
+  `FlushTlsLibFclNetConfigCache` (with no TLS traffic in flight) so the next handshake rebuilds and
+  the retired key is released.
 
 ## Proven
 
@@ -150,4 +180,20 @@ not a test gate**: it needs outbound HTTPS and exits 0 (PASS) / 2 (SKIP, offline
 each handler a fully-built config through `ServerConfig` / `ClientConfig` — an ordered, bound
 cipher-suite preference pinned to TLS 1.2, so the negotiated 1.2 (the preset would pick 1.3) proves
 the injected config replaced the built-in build. This is the escape hatch to the whole builder API
-(cipher order, groups, resumption, ALPN, …).
+(cipher order, groups, resumption, ALPN, …). A built config supplied alongside cert/trust options
+(or a pinned `SSLType`, a verify callback, `SendHostAsSNI := False` on a client, or a crypto/PKIX
+provider) is refused, not silently dropped; so are resumption turned off, a non-default
+`ClientAuth`, verification or the host-name check switched off, and a cipher list.
+`CustomClientCertificateVerifier` also counts as a client-CA source for `ClientAuth`.
+
+`Examples/` further holds `FclNetEchLoopback`, `FclNetResumptionScope` and `FclNetWedgeDemo`
+(Lazarus `.lpi`).
+
+`CertificateData.CipherList` names the suites to use: exact IANA or OpenSSL suite names, separated
+by `:`, `,`, `;`, spaces or tabs, matched without regard to case and de-duplicated, in preference
+order. It narrows and reorders TlsLib's own hardened set and
+never widens it. A list that names no TLS 1.3 suite leaves TLS 1.3 on with its default suites (an
+OpenSSL cipher list never governed 1.3); a list that names TLS 1.3 suites narrows 1.3 too, and a
+list naming only TLS 1.3 suites turns TLS 1.2 off. Cipher-string expressions such as `HIGH` or
+`!aNULL`, and suites TlsLib does not implement, are refused rather than skipped; empty or `DEFAULT`
+keeps the preset, and a list beside a supplied `ClientConfig` / `ServerConfig` is refused.

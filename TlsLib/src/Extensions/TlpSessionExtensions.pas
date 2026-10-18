@@ -27,7 +27,7 @@ uses
 
 type
   /// <summary>
-  /// psk_key_exchange_modes (RFC 8446 4.2.9): the PSK exchange modes the client
+  /// psk_key_exchange_modes (RFC 9846 4.3.9): the PSK exchange modes the client
   /// offers (psk_ke = 0, psk_dhe_ke = 1). Present only in the ClientHello.
   /// </summary>
   TPskKeyExchangeModesExtension = class sealed(TInterfacedObject, ITlsExtension)
@@ -39,7 +39,7 @@ type
   end;
 
   /// <summary>
-  /// early_data (RFC 8446 4.2.10): an empty flag in the ClientHello (offering
+  /// early_data (RFC 9846 4.3.10): an empty flag in the ClientHello (offering
   /// 0-RTT) and in EncryptedExtensions (accepting it), and a max_early_data_size
   /// (uint32) in a NewSessionTicket.
   /// </summary>
@@ -66,7 +66,7 @@ type
   end;
 
   /// <summary>
-  /// pre_shared_key (RFC 8446 4.2.11): the ClientHello OfferedPsks (identities +
+  /// pre_shared_key (RFC 9846 4.3.11): the ClientHello OfferedPsks (identities +
   /// obfuscated ages + binders) and the ServerHello selected_identity. It MUST be
   /// the last ClientHello extension - the binders are computed over the transcript
   /// up to their own bytes, so the caller writes a placeholder here and back-patches
@@ -88,8 +88,7 @@ uses
 resourcestring
   SEmptyPskModes = 'psk_key_exchange_modes carries no modes';
   SBadEarlyData = 'early_data must be empty in this context';
-  SEmptyPskIdentities = 'pre_shared_key carries no identities';
-  SEmptyPskBinders = 'pre_shared_key carries no binders';
+  SBadSessionTicketEcho = 'a server session_ticket acknowledgement must carry an empty body (RFC 5077 3.2)';
 
 { TPskKeyExchangeModesExtension }
 
@@ -230,6 +229,11 @@ end;
 procedure TSessionTicketExtension.Consume(const AContext: TExtensionContext;
   const AExtensionData: TBytes);
 begin
+  // a server's ServerHello echo announces a forthcoming NewSessionTicket and is empty; a non-empty
+  // body there is a decode error (RFC 5077 3.2). The ClientHello carries the ticket itself.
+  if (AContext.MessageContext = TTlsExtensionContextKind.ServerHello) and
+    (System.Length(AExtensionData) <> 0) then
+    raise EDecodeErrorTlsLibException.CreateRes(@SBadSessionTicketEcho);
   AContext.SessionTicketOffered := True;
   AContext.SessionTicket := System.Copy(AExtensionData, 0,
     System.Length(AExtensionData));
@@ -320,8 +324,6 @@ begin
     AContext.OfferedPskAges[LIdCount] := LIdentities.ReadUInt32;
     Inc(LIdCount);
   end;
-  if LIdCount = 0 then
-    raise EDecodeErrorTlsLibException.CreateRes(@SEmptyPskIdentities);
   LBinders := LReader.OpenVector(2);
   LReader.ExpectEnd;
   AContext.OfferedPskBinders := nil;
@@ -333,8 +335,6 @@ begin
     AContext.OfferedPskBinders[LBinderCount] := LEntry.ReadBytes(LEntry.Remaining);
     Inc(LBinderCount);
   end;
-  if LBinderCount = 0 then
-    raise EDecodeErrorTlsLibException.CreateRes(@SEmptyPskBinders);
 end;
 
 end.

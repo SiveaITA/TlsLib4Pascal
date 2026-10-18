@@ -31,9 +31,11 @@ uses
   TlpSecretBuffer,
   TlpICryptoProvider,
   TlpCryptoDomainTypes,
+  TlpTlsVersion,
   TlpIRecordProtection,
   TlpRecordProtection,
   TlpHkdfLabel,
+  TlpTlsLibExceptions,
   TlpIKeySchedule,
   TlpTls13KeySchedule,
   TlpITranscriptHash,
@@ -54,7 +56,6 @@ type
     function ToBytes(const ASecret: ISecretBuffer): TBytes;
   protected
     procedure SetUp; override;
-    procedure TearDown; override;
   published
     procedure TestSecretTreeRfc8448;
     procedure TestTrafficKeysRfc8448;
@@ -63,12 +64,28 @@ type
     procedure TestDerivedKeysDecryptRfc8448Record;
     procedure TestKeyUpdateAdvancesTheKey;
     procedure TestExporterIsDeterministic;
+    procedure TestExporterRejectsBadArgs;
+    procedure TestExporterEmptyLabelMatchesIndependentDerivation;
+    procedure TestEarlyExporterDeterministicAndDistinct;
+    procedure TestEarlyExporterRaisesBeforeEarlyEpoch;
+    procedure TestForgetEarlyExporterWithdrawsIt;
     procedure TestBinderKeyResumptionVsExternalDiffer;
     procedure TestBinderRoundTripConstantTime;
     procedure TestPskDheKeAgreesOnBothSides;
     procedure TestPskDheKeDiffersFromPskKe;
     procedure TestPartialTranscriptForBinder;
     procedure TestExternalPskImporterIdentityAndBinder;
+    procedure TestExternalPskImporterImportAllOrder;
+    procedure TestImportRejectsEmptyIdentity;
+    procedure TestImportRejectsUnregisteredKdfHash;
+    procedure TestImportDerivesFromAProvisionedSha512;
+    procedure TestDeriveRejectsWrongLengthTranscript;
+    procedure TestForgetKeepsApplicationEpochAndExporter;
+    procedure TestForgetReleasesHandshakeStages;
+    procedure TestForgetBeforeApplicationEpochRaises;
+    procedure TestResumptionPskSurvivesForget;
+    procedure TestForgetResumptionMasterMakesResumptionPskRaise;
+    procedure TestLateStageInputRaises;
   end;
 
 implementation
@@ -78,13 +95,7 @@ implementation
 procedure TTestTls13KeySchedule.SetUp;
 begin
   inherited SetUp;
-  FVec := LoadVectorFields('Rfc8448/Tls13KeySchedule.txt');
-end;
-
-procedure TTestTls13KeySchedule.TearDown;
-begin
-  FVec.Free;
-  inherited TearDown;
+  FVec := Own<TStringList>(LoadVectorFields('Rfc8448/Tls13KeySchedule.txt'));
 end;
 
 function TTestTls13KeySchedule.Bytes(const AName: string): TBytes;
@@ -100,14 +111,14 @@ end;
 function TTestTls13KeySchedule.NewSchedule: TTls13KeySchedule;
 begin
   // the RFC 8448 sample suite is TLS_AES_128_GCM_SHA256
-  Result := TTls13KeySchedule.Create(Provider, THashAlgorithm.SHA_256, 16);
+  Result := TTls13KeySchedule.Create(Crypto, THashAlgorithm.SHA_256, 16);
   Result.SetSharedSecret(TSecretBuffer.From(Bytes('shared_secret')));
 end;
 
 function TTestTls13KeySchedule.NewResumptionSchedule(const APsk: ISecretBuffer;
   const ASharedSecret: TBytes): ITls13KeySchedule;
 begin
-  Result := TTls13KeySchedule.Create(Provider, THashAlgorithm.SHA_256, 16);
+  Result := TTls13KeySchedule.Create(Crypto, THashAlgorithm.SHA_256, 16);
   Result.SetPsk(APsk);
   if System.Length(ASharedSecret) > 0 then
     Result.SetSharedSecret(TSecretBuffer.From(ASharedSecret));
@@ -123,20 +134,20 @@ var
 begin
   // recompute the RFC 8448 secret tree through the public HKDF seam and pin every
   // node against the published bytes - no reaching into the schedule's internals
-  LHkdf := Provider.Primitives.CreateHkdf(THashAlgorithm.SHA_256);
+  LHkdf := Crypto.Primitives.CreateHkdf(THashAlgorithm.SHA_256);
   LZeros := TSecretBuffer.Allocate(32);
-  LEmptyHash := Provider.Primitives.CreateHash(THashAlgorithm.SHA_256).DoFinal;
+  LEmptyHash := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256).DoFinal;
 
   LEarly := LHkdf.Extract(nil, LZeros); // 0-PSK: salt and IKM are HashLen zeros
   CheckEqualBytes('early secret', Bytes('early_secret'), ToBytes(LEarly));
 
   LDerived := THkdfLabel.DeriveSecret(LHkdf, LEarly, 'derived', LEmptyHash);
-  LHandshake := LHkdf.Extract(ToBytes(LDerived),
+  LHandshake := LHkdf.Extract(LDerived,
     TSecretBuffer.From(Bytes('shared_secret')));
   CheckEqualBytes('handshake secret', Bytes('handshake_secret'), ToBytes(LHandshake));
 
   LDerived := THkdfLabel.DeriveSecret(LHkdf, LHandshake, 'derived', LEmptyHash);
-  LMaster := LHkdf.Extract(ToBytes(LDerived), LZeros);
+  LMaster := LHkdf.Extract(LDerived, LZeros);
   CheckEqualBytes('master secret', Bytes('master_secret'), ToBytes(LMaster));
 
   CheckEqualBytes('c hs traffic', Bytes('c_hs_traffic'), ToBytes(
@@ -147,13 +158,14 @@ begin
     THkdfLabel.DeriveSecret(LHkdf, LMaster, 'c ap traffic', Bytes('hash_ch_sf'))));
   CheckEqualBytes('s ap traffic', Bytes('s_ap_traffic'), ToBytes(
     THkdfLabel.DeriveSecret(LHkdf, LMaster, 's ap traffic', Bytes('hash_ch_sf'))));
-  CheckEqualBytes('exporter master', Bytes('exp_master'), ToBytes(
+  CheckEqualBytes('exporter secret', Bytes('exp_master'), ToBytes(
     THkdfLabel.DeriveSecret(LHkdf, LMaster, 'exp master', Bytes('hash_ch_sf'))));
 
-  // the resumption master secret is the schedule's own public output
+  // the resumption secret is the schedule's own public output
   LResumption := NewSchedule;
-  CheckEqualBytes('resumption master', Bytes('res_master'),
-    ToBytes(LResumption.ResumptionMasterSecret(Bytes('hash_ch_cf'))));
+  LResumption.DeriveResumptionMasterSecret(Bytes('hash_ch_cf'));
+  CheckEqualBytes('resumption secret', Bytes('res_master'),
+    ToBytes(LResumption.ResumptionMasterSecret));
 end;
 
 procedure TTestTls13KeySchedule.TestTrafficKeysRfc8448;
@@ -227,7 +239,7 @@ begin
   // the schedule-derived client handshake keys must decrypt the RFC 8448 record
   LKeys := LSched.TrafficKeys(TTlsEpoch.Handshake, TTlsDirection.ClientWrite);
   LProt := TTls13RecordProtection.Create(LKeys.Key, LKeys.Iv,
-    Provider.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM));
+    Crypto.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM));
   LRec := LoadVectorFields('Rfc8448/Tls13RecordFinished.txt');
   try
     LRecord := DecodeHex(LRec.Values['record']);
@@ -262,10 +274,129 @@ var
 begin
   LSched := NewSchedule;
   LSched.DeriveEpochSecrets(TTlsEpoch.Application, Bytes('hash_ch_sf'));
-  LFirst := LSched.ExportKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), True, 32);
-  LSecond := LSched.ExportKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), True, 32);
+  LFirst := LSched.ExportKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), 32);
+  LSecond := LSched.ExportKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), 32);
   CheckEquals(32, System.Length(LFirst), 'requested length honored');
   CheckEqualBytes('exporter is deterministic', LFirst, LSecond);
+end;
+
+procedure TTestTls13KeySchedule.TestExporterEmptyLabelMatchesIndependentDerivation;
+var
+  LSched: ITls13KeySchedule;
+  LHkdf: IHkdf;
+  LZeros, LDerived, LMaster, LExporterMaster, LLabelSecret: ISecretBuffer;
+  LEmptyHash, LContext, LContextHash, LExpected: TBytes;
+  LHash: IHash;
+begin
+  LSched := NewSchedule;
+  LSched.DeriveEpochSecrets(TTlsEpoch.Application, Bytes('hash_ch_sf'));
+  // recompute RFC 9846 7.5 through the HKDF seam: an empty label is "tls13 " alone
+  LHkdf := Crypto.Primitives.CreateHkdf(THashAlgorithm.SHA_256);
+  LZeros := TSecretBuffer.Allocate(32);
+  LEmptyHash := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256).DoFinal;
+  LDerived := THkdfLabel.DeriveSecret(LHkdf, LHkdf.Extract(nil, LZeros), 'derived', LEmptyHash);
+  LDerived := THkdfLabel.DeriveSecret(LHkdf,
+    LHkdf.Extract(LDerived, TSecretBuffer.From(Bytes('shared_secret'))), 'derived', LEmptyHash);
+  LMaster := LHkdf.Extract(LDerived, LZeros);
+  LExporterMaster := THkdfLabel.DeriveSecret(LHkdf, LMaster, 'exp master', Bytes('hash_ch_sf'));
+  // literal HkdfLabel: length 32, the bare "tls13 " label, context H("")
+  LLabelSecret := LHkdf.Expand(LExporterMaster, DecodeHex('0020' + '06' + '746c73313320' + '20' +
+    'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'), 32);
+  LContext := DecodeHex('00010203');
+  LHash := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256);
+  LHash.Update(LContext, 0, System.Length(LContext));
+  LContextHash := LHash.DoFinal;
+  LExpected := THkdfLabel.HkdfExpandLabel(LHkdf, LLabelSecret, 'exporter', LContextHash, 32).ToBytes;
+  CheckEqualBytes('an empty-label export equals the RFC 9846 7.5 derivation', LExpected,
+    LSched.ExportKeyingMaterial('', LContext, 32));
+end;
+
+procedure TTestTls13KeySchedule.TestEarlyExporterDeterministicAndDistinct;
+var
+  LSched: ITls13KeySchedule;
+  LEarly, LEarly2, LMain: TBytes;
+begin
+  LSched := NewSchedule;
+  CheckFalse(LSched.CanExportEarly, 'no early exporter before the early epoch is derived');
+  LSched.DeriveEpochSecrets(TTlsEpoch.EarlyData,
+    DecodeHex('000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f'));
+  CheckTrue(LSched.CanExportEarly, 'early exporter available after the early epoch');
+  LEarly := LSched.ExportEarlyKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), 32);
+  LEarly2 := LSched.ExportEarlyKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), 32);
+  CheckEquals(32, System.Length(LEarly), 'requested length honored');
+  CheckEqualBytes('early exporter is deterministic', LEarly, LEarly2);
+  // the early_exporter_secret is a different secret, so the value differs from the
+  // application exporter for the same label and context
+  LSched.DeriveEpochSecrets(TTlsEpoch.Application, Bytes('hash_ch_sf'));
+  LMain := LSched.ExportKeyingMaterial('EXPORTER-test', DecodeHex('00010203'), 32);
+  CheckFalse(AreEqual(LEarly, LMain),
+    'the early exporter differs from the application exporter');
+end;
+
+procedure TTestTls13KeySchedule.TestForgetEarlyExporterWithdrawsIt;
+var
+  LSched: ITls13KeySchedule;
+  LRaised: Boolean;
+begin
+  LSched := NewSchedule;
+  LSched.DeriveEpochSecrets(TTlsEpoch.EarlyData,
+    DecodeHex('000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f'));
+  CheckTrue(LSched.CanExportEarly, 'the early exporter is derived');
+  LSched.ForgetEarlyExporter;
+  CheckFalse(LSched.CanExportEarly, 'a forgotten early exporter is gone');
+  LRaised := False;
+  try
+    LSched.ExportEarlyKeyingMaterial('EXPORTER-test', DecodeHex('00'), 32);
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'exporting after the early exporter was forgotten raises');
+end;
+
+procedure TTestTls13KeySchedule.TestEarlyExporterRaisesBeforeEarlyEpoch;
+var
+  LSched: ITls13KeySchedule;
+  LRaised: Boolean;
+begin
+  // a schedule that never took the early epoch (a 1-RTT handshake) cannot early-export
+  LSched := NewSchedule;
+  CheckFalse(LSched.CanExportEarly, 'a 1-RTT schedule cannot early-export');
+  LRaised := False;
+  try
+    LSched.ExportEarlyKeyingMaterial('EXPORTER-test', DecodeHex('00'), 32);
+  except
+    on EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'early-exporting before the early epoch raises');
+end;
+
+procedure TTestTls13KeySchedule.TestExporterRejectsBadArgs;
+var
+  LSched: ITls13KeySchedule;
+
+  function Raises(const ALabel: string; ALength: Int32): Boolean;
+  begin
+    Result := False;
+    try
+      LSched.ExportKeyingMaterial(ALabel, ALength);
+    except
+      on EArgumentTlsLibException do
+        Result := True;
+    end;
+  end;
+
+begin
+  LSched := NewSchedule;
+  LSched.DeriveEpochSecrets(TTlsEpoch.Application, Bytes('hash_ch_sf'));
+  CheckTrue(Raises('EXPORTER-test', 0), 'a zero length is rejected');
+  CheckTrue(Raises('EXPORTER-test', -1), 'a negative length is rejected');
+  CheckTrue(Raises(#$00E9 + 'label', 32), 'a non-ASCII label is rejected');
+  CheckFalse(Raises('', 32), 'an empty label is accepted for TLS 1.3');
+  // RFC 5705 4: an exporter label must not reuse a TLS PRF label
+  CheckTrue(Raises('master secret', 32), 'a reserved PRF label is rejected');
+  CheckTrue(Raises('client finished', 32), 'a reserved finished label is rejected');
 end;
 
 procedure TTestTls13KeySchedule.TestBinderKeyResumptionVsExternalDiffer;
@@ -293,7 +424,7 @@ var
 begin
   LPsk := TSecretBuffer.From(DecodeHex('AABBCCDDEEFF00112233445566778899'));
   LSched := NewResumptionSchedule(LPsk, nil);
-  LTruncatedHash := Provider.Primitives.CreateHash(THashAlgorithm.SHA_256).DoFinal;
+  LTruncatedHash := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256).DoFinal;
   LBinder := LSched.ComputeBinder(TPskBinderKind.Resumption, LTruncatedHash);
   CheckTrue(LSched.VerifyBinder(TPskBinderKind.Resumption, LTruncatedHash, LBinder),
     'a genuine binder verifies');
@@ -309,12 +440,12 @@ var
   LPsk: ISecretBuffer;
   LShared, LHash, LTrunc: TBytes;
 begin
-  // the client and server, given the same resumption PSK and the same fresh (EC)DHE
+  // the client and server, given the same resumption PSK and the same fresh asymmetric
   // shared secret, derive identical binder, traffic keys and Finished verify_data
   LPsk := TSecretBuffer.From(DecodeHex('1122334455667788990011223344556677889900AABBCCDD'));
   LShared := DecodeHex('9FA1E9C3B6D2074F5E8A0C1D2B3A4958677685948382718065544332211009FF');
   LHash := Bytes('hash_ch_sh');
-  LTrunc := Provider.Primitives.CreateHash(THashAlgorithm.SHA_256).DoFinal;
+  LTrunc := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256).DoFinal;
 
   LClient := NewResumptionSchedule(LPsk, LShared);
   LServer := NewResumptionSchedule(LPsk, LShared);
@@ -342,7 +473,7 @@ var
   LPsk: ISecretBuffer;
   LShared, LHash: TBytes;
 begin
-  // folding a fresh (EC)DHE secret in (psk_dhe_ke) must change the handshake keys
+  // folding a fresh asymmetric shared secret in (psk_dhe_ke) must change the handshake keys
   // versus PSK-only (psk_ke) - proving the shared secret is actually composed
   LPsk := TSecretBuffer.From(DecodeHex('00112233445566778899AABBCCDDEEFF'));
   LShared := DecodeHex('DEADBEEFCAFEBABE0011223344556677889900AABBCCDDEEFF0102030405060708');
@@ -363,12 +494,12 @@ var
   LPrefix, LViaTranscript, LManual: TBytes;
 begin
   // HashPrefixExcludingBinders(prefix) == Hash(running transcript || prefix)
-  LTranscript := TTranscriptHash.Create(Provider.Primitives.CreateHash(THashAlgorithm.SHA_256));
+  LTranscript := TTranscriptHash.Create(Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256));
   LTranscript.Update(DecodeHex('AABBCCDD')); // some prior transcript bytes
   LPrefix := DecodeHex('0100000504030201'); // a partial ClientHello prefix
   LViaTranscript := LTranscript.HashPrefixExcludingBinders(LPrefix);
   // recompute manually: the same prior bytes then the prefix
-  LManual := Provider.Primitives.CreateHash(THashAlgorithm.SHA_256).DoFinal; // placeholder
+  LManual := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256).DoFinal; // placeholder
   LTranscript.Update(LPrefix);
   LManual := LTranscript.CurrentHash;
   CheckEqualBytes('the partial-transcript hash matches feeding the prefix',
@@ -393,8 +524,8 @@ begin
   LSpec.Secret := TSecretBuffer.From(DecodeHex('00112233445566778899AABBCCDDEEFF'));
   LSpec.Context := nil;
   LSpec.Hash := THashAlgorithm.SHA_256;
-  LImp256 := TExternalPskImporter.Import(Provider, LSpec, $0304, THashAlgorithm.SHA_256);
-  LImp384 := TExternalPskImporter.Import(Provider, LSpec, $0304, THashAlgorithm.SHA_384);
+  LImp256 := TExternalPskImporter.Import(Crypto, LSpec, $0304, THashAlgorithm.SHA_256);
+  LImp384 := TExternalPskImporter.Import(Crypto, LSpec, $0304, THashAlgorithm.SHA_384);
   // importing the same secret for a different target hash yields a distinct wire identity
   // (its target_kdf differs) and a distinct bound hash
   CheckFalse(AreEqual(LImp256.Identity, LImp384.Identity),
@@ -402,19 +533,292 @@ begin
   CheckEquals(Ord(THashAlgorithm.SHA_256), Ord(LImp256.Hash), 'SHA-256 import bound hash');
   CheckEquals(Ord(THashAlgorithm.SHA_384), Ord(LImp384.Hash), 'SHA-384 import bound hash');
 
-  // the "imp binder" (RFC 9258 6) over the imported key round-trips between the two sides,
+  // the "imp binder" (RFC 9258 5.2) over the imported key round-trips between the two sides,
   // and is distinct from a resumption ("res binder") over the same key
-  LClient := TTls13KeySchedule.Create(Provider, LImp256.Hash, 16);
+  LClient := TTls13KeySchedule.Create(Crypto, LImp256.Hash, 16);
   LClient.SetPsk(LImp256.Key);
-  LServer := TTls13KeySchedule.Create(Provider, LImp256.Hash, 16);
+  LServer := TTls13KeySchedule.Create(Crypto, LImp256.Hash, 16);
   LServer.SetPsk(LImp256.Key);
-  LTrunc := Provider.Primitives.CreateHash(THashAlgorithm.SHA_256).DoFinal;
+  LTrunc := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256).DoFinal;
   LImpBinder := LClient.ComputeBinder(TPskBinderKind.Imported, LTrunc);
   CheckTrue(LServer.VerifyBinder(TPskBinderKind.Imported, LTrunc, LImpBinder),
     'the imported-PSK binder round-trips between client and server');
   CheckFalse(AreEqual(LImpBinder,
     LClient.ComputeBinder(TPskBinderKind.Resumption, LTrunc)),
     'the imported and resumption binders differ for the same key');
+end;
+
+procedure TTestTls13KeySchedule.TestExternalPskImporterImportAllOrder;
+var
+  LSpecA, LSpecB: TExternalPsk;
+  LAll: TArray<IPreSharedKey>;
+begin
+  LSpecA.Identity := TBytes.Create($61); // "a"
+  LSpecA.Secret := TSecretBuffer.From(DecodeHex('00112233445566778899AABBCCDDEEFF'));
+  LSpecA.Context := nil;
+  LSpecA.Hash := THashAlgorithm.SHA_256;
+  LSpecB.Identity := TBytes.Create($62); // "b"
+  LSpecB.Secret := TSecretBuffer.From(DecodeHex('FFEEDDCCBBAA99887766554433221100'));
+  LSpecB.Context := nil;
+  LSpecB.Hash := THashAlgorithm.SHA_256;
+
+  // no specs imports nothing
+  CheckEquals(0, System.Length(TExternalPskImporter.ImportAll(Crypto, nil,
+    TlsWireVersionTls13)), 'ImportAll over no specs yields no offers');
+
+  // each spec is imported once per supported hash (SHA-256 then SHA-384), specs in order,
+  // so ImportAll's four entries match the individual Import calls one-for-one
+  LAll := TExternalPskImporter.ImportAll(Crypto,
+    TArray<TExternalPsk>.Create(LSpecA, LSpecB), TlsWireVersionTls13);
+  CheckEquals(4, System.Length(LAll), 'two specs times two hashes is four offers');
+  CheckEqualBytes('offer 0 is spec A under SHA-256',
+    TExternalPskImporter.Import(Crypto, LSpecA, TlsWireVersionTls13,
+    THashAlgorithm.SHA_256).Identity, LAll[0].Identity);
+  CheckEquals(Ord(THashAlgorithm.SHA_384), Ord(LAll[1].Hash),
+    'offer 1 is spec A under SHA-384');
+  CheckEqualBytes('offer 2 is spec B under SHA-256',
+    TExternalPskImporter.Import(Crypto, LSpecB, TlsWireVersionTls13,
+    THashAlgorithm.SHA_256).Identity, LAll[2].Identity);
+  CheckEquals(Ord(THashAlgorithm.SHA_384), Ord(LAll[3].Hash),
+    'offer 3 is spec B under SHA-384');
+end;
+
+procedure TTestTls13KeySchedule.TestImportRejectsEmptyIdentity;
+var
+  LSpec: TExternalPsk;
+  LRaised: Boolean;
+begin
+  // RFC 9258 5.1: external_identity is opaque<1..2^16-1>, so an empty identity is invalid
+  LSpec.Identity := nil;
+  LSpec.Secret := TSecretBuffer.From(DecodeHex('00112233445566778899AABBCCDDEEFF'));
+  LSpec.Context := nil;
+  LSpec.Hash := THashAlgorithm.SHA_256;
+  LRaised := False;
+  try
+    TExternalPskImporter.Import(Crypto, LSpec, $0304, THashAlgorithm.SHA_256);
+  except
+    on EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'an empty external identity is rejected');
+end;
+
+procedure TTestTls13KeySchedule.TestImportRejectsUnregisteredKdfHash;
+var
+  LSpec: TExternalPsk;
+  LRaised: Boolean;
+begin
+  // RFC 9258 10 registers only HKDF-SHA256 and HKDF-SHA384; a SHA-512 target has no KDF id
+  LSpec.Identity := TBytes.Create($61, $62);
+  LSpec.Secret := TSecretBuffer.From(DecodeHex('00112233445566778899AABBCCDDEEFF'));
+  LSpec.Context := nil;
+  LSpec.Hash := THashAlgorithm.SHA_256;
+  LRaised := False;
+  try
+    TExternalPskImporter.Import(Crypto, LSpec, $0304, THashAlgorithm.SHA_512);
+  except
+    on EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a target hash with no registered KDF id is rejected');
+end;
+
+procedure TTestTls13KeySchedule.TestImportDerivesFromAProvisionedSha512;
+var
+  LSpec: TExternalPsk;
+  LPsk: IPreSharedKey;
+begin
+  // RFC 9258 3: the provisioned hash is the EPSK's own; only the target KDF fixes the output size
+  LSpec.Identity := TBytes.Create($61, $62);
+  LSpec.Secret := TSecretBuffer.From(DecodeHex('00112233445566778899AABBCCDDEEFF'));
+  LSpec.Context := nil;
+  LSpec.Hash := THashAlgorithm.SHA_512;
+  LPsk := TExternalPskImporter.Import(Crypto, LSpec, $0304, THashAlgorithm.SHA_384);
+  CheckEquals(48, LPsk.Key.Len, 'the imported key has the target KDF output length');
+  CheckTrue(LPsk.Hash = THashAlgorithm.SHA_384, 'bound to the target hash');
+end;
+
+procedure TTestTls13KeySchedule.TestDeriveRejectsWrongLengthTranscript;
+var
+  LSched: ITls13KeySchedule;
+  LRaised: Boolean;
+begin
+  // Derive-Secret takes its output length from the transcript hash, so a wrong-length one would
+  // mint a wrong-length secret; the schedule rejects it (the hash is SHA-256 = 32 bytes)
+  LSched := NewSchedule;
+  LRaised := False;
+  try
+    LSched.DeriveEpochSecrets(TTlsEpoch.Handshake, DecodeHex('00112233'));
+  except
+    on EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a transcript hash of the wrong length is rejected');
+end;
+
+procedure TTestTls13KeySchedule.TestForgetKeepsApplicationEpochAndExporter;
+var
+  LSched: ITls13KeySchedule;
+  LApKeyBefore, LExportBefore, LApKeyAfter, LExportAfter: TBytes;
+begin
+  // after releasing the handshake secrets, the live connection's application traffic keys,
+  // exporter, and KeyUpdate must all keep working
+  LSched := NewSchedule;
+  LSched.DeriveEpochSecrets(TTlsEpoch.Handshake, Bytes('hash_ch_sh'));
+  LSched.DeriveEpochSecrets(TTlsEpoch.Application, Bytes('hash_ch_sf'));
+  LApKeyBefore := ToBytes(LSched.TrafficKeys(TTlsEpoch.Application,
+    TTlsDirection.ClientWrite).Key);
+  LExportBefore := LSched.ExportKeyingMaterial('EXPORTER-x', Bytes('ctx'), 32);
+
+  LSched.DeriveResumptionMasterSecret(Bytes('hash_ch_cf'));
+  LSched.ForgetHandshakeSecrets;
+
+  LApKeyAfter := ToBytes(LSched.TrafficKeys(TTlsEpoch.Application,
+    TTlsDirection.ClientWrite).Key);
+  LExportAfter := LSched.ExportKeyingMaterial('EXPORTER-x', Bytes('ctx'), 32);
+  CheckEqualBytes('application key unchanged after forget', LApKeyBefore, LApKeyAfter);
+  CheckEqualBytes('exporter unchanged after forget', LExportBefore, LExportAfter);
+  CheckTrue(LSched.CanExport, 'exporter secret retained after forget');
+  LSched.AdvanceKeyUpdate(TTlsDirection.ClientWrite);
+  CheckFalse(AreEqual(LApKeyAfter, ToBytes(LSched.TrafficKeys(TTlsEpoch.Application,
+    TTlsDirection.ClientWrite).Key)), 'KeyUpdate still advances the application key after forget');
+end;
+
+procedure TTestTls13KeySchedule.TestForgetReleasesHandshakeStages;
+var
+  LSched: ITls13KeySchedule;
+  LRaisedTraffic, LRaisedFinished, LRaisedSetPsk, LRaisedDerive: Boolean;
+begin
+  LSched := NewSchedule;
+  LSched.DeriveEpochSecrets(TTlsEpoch.Handshake, Bytes('hash_ch_sh'));
+  LSched.DeriveEpochSecrets(TTlsEpoch.Application, Bytes('hash_ch_sf'));
+  LSched.DeriveResumptionMasterSecret(Bytes('hash_ch_cf'));
+  LSched.ForgetHandshakeSecrets;
+
+  // the handshake-stage reads now fail, and no derivation silently rebuilds a zero tree
+  LRaisedTraffic := False;
+  try
+    LSched.TrafficKeys(TTlsEpoch.Handshake, TTlsDirection.ClientWrite);
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaisedTraffic := True;
+  end;
+  CheckTrue(LRaisedTraffic, 'handshake traffic keys released');
+
+  LRaisedFinished := False;
+  try
+    LSched.FinishedKey(TTlsDirection.ServerWrite);
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaisedFinished := True;
+  end;
+  CheckTrue(LRaisedFinished, 'finished key released');
+
+  LRaisedSetPsk := False;
+  try
+    LSched.SetPsk(TSecretBuffer.From(Bytes('x')));
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaisedSetPsk := True;
+  end;
+  CheckTrue(LRaisedSetPsk, 'SetPsk rejected after forget');
+
+  LRaisedDerive := False;
+  try
+    LSched.DeriveEpochSecrets(TTlsEpoch.Handshake, Bytes('hash_ch_sh'));
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaisedDerive := True;
+  end;
+  CheckTrue(LRaisedDerive, 'no silent handshake re-derivation after forget');
+end;
+
+procedure TTestTls13KeySchedule.TestForgetBeforeApplicationEpochRaises;
+var
+  LSched: ITls13KeySchedule;
+  LRaised: Boolean;
+begin
+  LSched := NewSchedule;
+  LSched.DeriveEpochSecrets(TTlsEpoch.Handshake, Bytes('hash_ch_sh'));
+  LRaised := False;
+  try
+    LSched.ForgetHandshakeSecrets; // application epoch not derived yet
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'forgetting before the application epoch exists is rejected');
+end;
+
+procedure TTestTls13KeySchedule.TestResumptionPskSurvivesForget;
+var
+  LKept, LReference: ITls13KeySchedule;
+begin
+  // the resumption secret (derived before forget) still yields a per-ticket PSK afterwards,
+  // matching a schedule that never forgot
+  LKept := NewSchedule;
+  LKept.DeriveEpochSecrets(TTlsEpoch.Application, Bytes('hash_ch_sf'));
+  LKept.DeriveResumptionMasterSecret(Bytes('hash_ch_cf'));
+  LKept.ForgetHandshakeSecrets;
+
+  LReference := NewSchedule;
+  LReference.DeriveEpochSecrets(TTlsEpoch.Application, Bytes('hash_ch_sf'));
+  LReference.DeriveResumptionMasterSecret(Bytes('hash_ch_cf'));
+
+  CheckEqualBytes('resumption PSK survives forget',
+    ToBytes(LReference.ResumptionPsk(Bytes('nonce'))),
+    ToBytes(LKept.ResumptionPsk(Bytes('nonce'))));
+end;
+
+procedure TTestTls13KeySchedule.TestForgetResumptionMasterMakesResumptionPskRaise;
+var
+  LSched: ITls13KeySchedule;
+  LRaised: Boolean;
+begin
+  // a server releases the resumption secret once its tickets are minted; ResumptionPsk then raises,
+  // while export and traffic keys stay available
+  LSched := NewSchedule;
+  LSched.DeriveEpochSecrets(TTlsEpoch.Application, Bytes('hash_ch_sf'));
+  LSched.DeriveResumptionMasterSecret(Bytes('hash_ch_cf'));
+  CheckTrue(LSched.ResumptionPsk(Bytes('nonce')) <> nil, 'resumption PSK before forget');
+  LSched.ForgetResumptionMasterSecret;
+  LRaised := False;
+  try
+    LSched.ResumptionPsk(Bytes('nonce'));
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'ResumptionPsk raises after the resumption secret is forgotten');
+  CheckTrue(LSched.CanExport, 'export still available after forgetting the resumption secret');
+end;
+
+procedure TTestTls13KeySchedule.TestLateStageInputRaises;
+var
+  LSched: ITls13KeySchedule;
+  LRaised: Boolean;
+begin
+  // a stage input set after the secret it feeds is derived would silently not take effect: raise
+  LSched := TTls13KeySchedule.Create(Crypto, THashAlgorithm.SHA_256, 16);
+  LSched.SetSharedSecret(TSecretBuffer.From(Bytes('shared_secret')));
+  LSched.DeriveEpochSecrets(TTlsEpoch.Handshake, Bytes('hash_ch_sh'));
+  LRaised := False;
+  try
+    LSched.SetSharedSecret(TSecretBuffer.From(Bytes('again')));
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'SetSharedSecret after the handshake secret is derived raises');
+  // the early secret is derived by now, so a late SetPsk must also raise
+  LRaised := False;
+  try
+    LSched.SetPsk(TSecretBuffer.From(Bytes('psk')));
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'SetPsk after the early secret is derived raises');
 end;
 
 initialization

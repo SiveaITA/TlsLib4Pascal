@@ -20,9 +20,7 @@
 /// </summary>
 unit TlpTlsConfigMemo;
 
-{$IFDEF FPC}
-{$MODE DELPHI}
-{$ENDIF FPC}
+{$I ..\Include\TlsLib.inc}
 
 interface
 
@@ -31,54 +29,50 @@ uses
   TlpITlsConfig,
   TlpITlsConfigMemo;
 
-/// <summary>A new empty server-config memo.</summary>
-function NewTlsServerConfigMemo: ITlsServerConfigMemo;
-/// <summary>A new empty client-config memo.</summary>
-function NewTlsClientConfigMemo: ITlsClientConfigMemo;
+type
+  /// <summary>Creates the config memos.</summary>
+  TTlsConfigMemos = class sealed(TObject)
+  public
+    /// <summary>A new empty server-config memo.</summary>
+    class function NewServer: ITlsServerConfigMemo; static;
+    /// <summary>A new empty client-config memo.</summary>
+    class function NewClient: ITlsClientConfigMemo; static;
+  end;
 
 implementation
 
 type
-  TTlsServerConfigMemo = class sealed(TInterfacedObject, ITlsServerConfigMemo)
+  /// <summary>The keyed build-once-reuse ring shared by both config variants: a fixed-capacity,
+  /// signature-keyed store guarded by a lock. The sealed server/client subclasses only bind T and
+  /// the matching interface; all behaviour lives here.</summary>
+  TTlsConfigMemoBase<T> = class abstract(TInterfacedObject)
   strict private
   var
     FLock: TCriticalSection;
     FSignatures: TArray<string>;
-    FConfigs: TArray<ITlsServerConfig>;
+    FConfigs: TArray<T>;
     FCount: Int32;
     FNext: Int32;
   public
     constructor Create;
     destructor Destroy; override;
-    function TryGet(const ASignature: string; out AConfig: ITlsServerConfig): Boolean;
-    function StoreOrAdopt(const ASignature: string;
-      const ABuilt: ITlsServerConfig): ITlsServerConfig;
+    function TryGet(const ASignature: string; out AConfig: T): Boolean;
+    function StoreOrAdopt(const ASignature: string; const ABuilt: T): T;
     procedure Clear;
   end;
 
-  TTlsClientConfigMemo = class sealed(TInterfacedObject, ITlsClientConfigMemo)
-  strict private
-  var
-    FLock: TCriticalSection;
-    FSignatures: TArray<string>;
-    FConfigs: TArray<ITlsClientConfig>;
-    FCount: Int32;
-    FNext: Int32;
-  public
-    constructor Create;
-    destructor Destroy; override;
-    function TryGet(const ASignature: string; out AConfig: ITlsClientConfig): Boolean;
-    function StoreOrAdopt(const ASignature: string;
-      const ABuilt: ITlsClientConfig): ITlsClientConfig;
-    procedure Clear;
+  TTlsServerConfigMemo = class sealed(TTlsConfigMemoBase<ITlsServerConfig>, ITlsServerConfigMemo)
   end;
 
-function NewTlsServerConfigMemo: ITlsServerConfigMemo;
+  TTlsClientConfigMemo = class sealed(TTlsConfigMemoBase<ITlsClientConfig>, ITlsClientConfigMemo)
+  end;
+
+class function TTlsConfigMemos.NewServer: ITlsServerConfigMemo;
 begin
   Result := TTlsServerConfigMemo.Create;
 end;
 
-function NewTlsClientConfigMemo: ITlsClientConfigMemo;
+class function TTlsConfigMemos.NewClient: ITlsClientConfigMemo;
 begin
   Result := TTlsClientConfigMemo.Create;
 end;
@@ -89,31 +83,31 @@ const
   // mints a fresh default STEK, so headroom here reduces needless ticket-key churn under load.
   MemoCapacity = 16;
 
-{ TTlsServerConfigMemo }
+{ TTlsConfigMemoBase<T> }
 
-constructor TTlsServerConfigMemo.Create;
+constructor TTlsConfigMemoBase<T>.Create;
 begin
   inherited Create;
-  System.SetLength(FSignatures, MemoCapacity);
-  System.SetLength(FConfigs, MemoCapacity);
+  SetLength(FSignatures, MemoCapacity);
+  SetLength(FConfigs, MemoCapacity);
   FCount := 0;
   FNext := 0;
   FLock := TCriticalSection.Create;
 end;
 
-destructor TTlsServerConfigMemo.Destroy;
+destructor TTlsConfigMemoBase<T>.Destroy;
 begin
   FLock.Free;
   inherited Destroy;
 end;
 
-function TTlsServerConfigMemo.TryGet(const ASignature: string;
-  out AConfig: ITlsServerConfig): Boolean;
+function TTlsConfigMemoBase<T>.TryGet(const ASignature: string;
+  out AConfig: T): Boolean;
 var
   LI: Int32;
 begin
   Result := False;
-  AConfig := nil;
+  AConfig := Default(T);
   FLock.Enter;
   try
     for LI := 0 to FCount - 1 do
@@ -127,8 +121,8 @@ begin
   end;
 end;
 
-function TTlsServerConfigMemo.StoreOrAdopt(const ASignature: string;
-  const ABuilt: ITlsServerConfig): ITlsServerConfig;
+function TTlsConfigMemoBase<T>.StoreOrAdopt(const ASignature: string;
+  const ABuilt: T): T;
 var
   LI: Int32;
 begin
@@ -149,7 +143,7 @@ begin
   end;
 end;
 
-procedure TTlsServerConfigMemo.Clear;
+procedure TTlsConfigMemoBase<T>.Clear;
 var
   LI: Int32;
 begin
@@ -158,84 +152,7 @@ begin
     for LI := 0 to MemoCapacity - 1 do
     begin
       FSignatures[LI] := '';
-      FConfigs[LI] := nil;
-    end;
-    FCount := 0;
-    FNext := 0;
-  finally
-    FLock.Leave;
-  end;
-end;
-
-{ TTlsClientConfigMemo }
-
-constructor TTlsClientConfigMemo.Create;
-begin
-  inherited Create;
-  System.SetLength(FSignatures, MemoCapacity);
-  System.SetLength(FConfigs, MemoCapacity);
-  FCount := 0;
-  FNext := 0;
-  FLock := TCriticalSection.Create;
-end;
-
-destructor TTlsClientConfigMemo.Destroy;
-begin
-  FLock.Free;
-  inherited Destroy;
-end;
-
-function TTlsClientConfigMemo.TryGet(const ASignature: string;
-  out AConfig: ITlsClientConfig): Boolean;
-var
-  LI: Int32;
-begin
-  Result := False;
-  AConfig := nil;
-  FLock.Enter;
-  try
-    for LI := 0 to FCount - 1 do
-      if FSignatures[LI] = ASignature then
-      begin
-        AConfig := FConfigs[LI];
-        Exit(True);
-      end;
-  finally
-    FLock.Leave;
-  end;
-end;
-
-function TTlsClientConfigMemo.StoreOrAdopt(const ASignature: string;
-  const ABuilt: ITlsClientConfig): ITlsClientConfig;
-var
-  LI: Int32;
-begin
-  FLock.Enter;
-  try
-    for LI := 0 to FCount - 1 do
-      if FSignatures[LI] = ASignature then
-        Exit(FConfigs[LI]);
-    FSignatures[FNext] := ASignature;
-    FConfigs[FNext] := ABuilt;
-    FNext := (FNext + 1) mod MemoCapacity;
-    if FCount < MemoCapacity then
-      Inc(FCount);
-    Result := ABuilt;
-  finally
-    FLock.Leave;
-  end;
-end;
-
-procedure TTlsClientConfigMemo.Clear;
-var
-  LI: Int32;
-begin
-  FLock.Enter;
-  try
-    for LI := 0 to MemoCapacity - 1 do
-    begin
-      FSignatures[LI] := '';
-      FConfigs[LI] := nil;
+      FConfigs[LI] := Default(T);
     end;
     FCount := 0;
     FNext := 0;

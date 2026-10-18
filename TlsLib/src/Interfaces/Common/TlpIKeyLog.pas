@@ -9,35 +9,29 @@
 
 (* &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&& *)
 
-unit TlpITlsEventSink;
+unit TlpIKeyLog;
 
 {$I ..\..\Include\TlsLib.inc}
 
 interface
 
 uses
-  TlpITlsEngine;
+  SysUtils;
 
 type
   /// <summary>
-  /// An optional push sink for engine events. The pollable queue (ITlsEngine.
-  /// NextEvent) is the canonical path; a caller that prefers push installs a sink
-  /// and is notified as each event is queued. Notifications run on the caller's
-  /// thread inside the engine call that produced them (no threads are introduced).
+  /// DANGEROUS. Receives each RFC 9850 connection secret as the key schedule derives it, so a
+  /// packet capture can be decrypted out of band (the SSLKEYLOGFILE format). ALabel is the
+  /// SSLKEYLOGFILE label (CLIENT_RANDOM for the TLS 1.2 master secret, per-secret labels for TLS
+  /// 1.3); a KeyUpdate logs no further traffic secret. AClientRandom is the 32-byte
+  /// ClientHello.random the line is keyed by - the inner ClientHello's when Encrypted Client
+  /// Hello was accepted, the outer's otherwise. ASecret is a transient copy wiped when the call
+  /// returns; a sink that keeps it holds live key material. Never installed unless a caller opts
+  /// in through the dangerous builder surface.
   /// </summary>
-  ITlsEventSink = interface(IInterface)
-    ['{6B2E9D74-1F3A-4C85-B0D6-7A2C4E619F30}']
-    procedure OnEvent(const AEvent: ITlsEvent);
-  end;
-
-  /// <summary>
-  /// Implemented by anything that can push events to a sink. The engine exposes it
-  /// so a caller can opt into push delivery; reach it with
-  /// Supports(engine, ITlsEventSource, source).
-  /// </summary>
-  ITlsEventSource = interface(IInterface)
-    ['{8D4A0F16-2B5C-4E79-A6D3-1F0B7C39E24A}']
-    procedure SetEventSink(const ASink: ITlsEventSink);
+  IKeyLog = interface(IInterface)
+    ['{0D74C940-A545-479A-8FB8-41E38DD16095}']
+    procedure Log(const ALabel: string; const AClientRandom, ASecret: TBytes);
   end;
 
 implementation

@@ -17,10 +17,8 @@ interface
 
 uses
   SysUtils,
-  TlpWireReader,
-  TlpWireVectorMarker,
-  TlpIWireWriter,
-  TlpWireWriter;
+  TlpCoreExtensions,
+  TlpExtensionVector;
 
 type
   /// <summary>
@@ -37,13 +35,19 @@ type
     class function ValueAt(AIndex: Int32): UInt16; static;
     /// <summary>A copy of AList with AValue prepended.</summary>
     class function Prepend(const AList: TArray<UInt16>; AValue: UInt16): TArray<UInt16>; static;
-    /// <summary>Splices an empty-bodied GREASE extension (type AType) at the front of
-    /// an already-serialized extensions block (2-byte length prefix + entries).</summary>
-    class function InjectExtension(const ABlock: TBytes; AType: UInt16): TBytes; static;
-    /// <summary>Splices an extension (type AType, body AData) at the front of an
-    /// already-serialized extensions block (2-byte length prefix + entries).</summary>
-    class function InjectExtensionData(const ABlock: TBytes; AType: UInt16;
-      const AData: TBytes): TBytes; static;
+    /// <summary>Splices an empty-bodied GREASE extension (type AType) into an already-serialized
+    /// extensions block (2-byte length prefix + entries), just before encrypted_client_hello (else
+    /// pre_shared_key, else at the end) so it stays in the compressible run of an ECH inner and
+    /// keeps pre_shared_key last (RFC 9846 4.3.11).</summary>
+    class function InjectExtension(const ABlock: TBytes; AType: UInt16): TBytes; overload; static;
+    /// <summary>As above, with the body ABody, so a hello carries GREASE extensions of varying
+    /// length and contents (RFC 8701 3.1).</summary>
+    class function InjectExtension(const ABlock: TBytes; AType: UInt16;
+      const ABody: TBytes): TBytes; overload; static;
+    /// <summary>Splices the two GREASE extensions a hello carries, one empty and one with a
+    /// one-byte body so the hello varies in length and contents (RFC 8701 3.1), at the
+    /// position InjectExtension picks. Their types are ValueAt(ASeed + 5) and ValueAt(ASeed + 6).</summary>
+    class function InjectPair(const ABlock: TBytes; ASeed: Int32): TBytes; static;
   end;
 
 implementation
@@ -77,46 +81,35 @@ end;
 
 class function TGrease.InjectExtension(const ABlock: TBytes;
   AType: UInt16): TBytes;
-var
-  LReader, LInner: TWireReader;
-  LEntries: TBytes;
-  LWriter: IWireWriter;
-  LMarker: TWireVectorMarker;
 begin
-  Result := nil;
-  LReader := TWireReader.Create(ABlock);
-  LInner := LReader.OpenVector(2);
-  LEntries := LInner.ReadBytes(LInner.Remaining);
-  LWriter := TWireWriter.Create;
-  LMarker := LWriter.OpenVector(2);
-  LWriter.WriteUInt16(AType);
-  LWriter.WriteUInt16(0); // empty extension_data
-  LWriter.WriteBytes(LEntries);
-  LWriter.CloseVector(LMarker);
-  Result := LWriter.ToBytes;
+  Result := InjectExtension(ABlock, AType, nil);
 end;
 
-class function TGrease.InjectExtensionData(const ABlock: TBytes; AType: UInt16;
-  const AData: TBytes): TBytes;
-var
-  LReader, LInner: TWireReader;
-  LEntries: TBytes;
-  LWriter: IWireWriter;
-  LMarker, LBody: TWireVectorMarker;
+class function TGrease.InjectPair(const ABlock: TBytes; ASeed: Int32): TBytes;
 begin
-  Result := nil;
-  LReader := TWireReader.Create(ABlock);
-  LInner := LReader.OpenVector(2);
-  LEntries := LInner.ReadBytes(LInner.Remaining);
-  LWriter := TWireWriter.Create;
-  LMarker := LWriter.OpenVector(2);
-  LWriter.WriteUInt16(AType);
-  LBody := LWriter.OpenVector(2);
-  LWriter.WriteBytes(AData);
-  LWriter.CloseVector(LBody);
-  LWriter.WriteBytes(LEntries);
-  LWriter.CloseVector(LMarker);
-  Result := LWriter.ToBytes;
+  Result := InjectExtension(ABlock, ValueAt(ASeed + 5));
+  Result := InjectExtension(Result, ValueAt(ASeed + 6), TBytes.Create(0));
+end;
+
+class function TGrease.InjectExtension(const ABlock: TBytes; AType: UInt16;
+  const ABody: TBytes): TBytes;
+var
+  LVector: TExtensionVector;
+  LIndex: Int32;
+begin
+  // GREASE is duplicated verbatim into an ECH ClientHelloOuter, so it belongs with the other
+  // compressible extensions - just before encrypted_client_hello - and one ech_outer_extensions
+  // run then covers it. Fall back to before pre_shared_key (which must stay last, RFC 9846
+  // 4.3.11), else the end when neither is present.
+  LVector := TExtensionVector.Parse(ABlock);
+  LIndex := LVector.IndexOf(TExtensionTypes.EncryptedClientHello);
+  if LIndex < 0 then
+    LIndex := LVector.IndexOf(TExtensionTypes.PreSharedKey);
+  if LIndex < 0 then
+    LVector.Append(TExtensionEntry.Create(AType, ABody))
+  else
+    LVector.InsertAt(LIndex, TExtensionEntry.Create(AType, ABody));
+  Result := LVector.Encode;
 end;
 
 end.

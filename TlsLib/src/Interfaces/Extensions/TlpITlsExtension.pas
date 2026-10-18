@@ -17,7 +17,8 @@ interface
 
 uses
   SysUtils,
-  TlpExtensionContext;
+  TlpExtensionContext,
+  TlpExtensionVector;
 
 type
   /// <summary>
@@ -56,16 +57,20 @@ type
 
   /// <summary>
   /// Serializes and parses a message's extensions vector, driving the injectable
-  /// registry and enforcing the RFC 8446 4.2 rules (duplicate/wrong-context/unknown).
+  /// registry and enforcing the RFC 9846 4.3 rules (duplicate/wrong-context/unknown).
   /// </summary>
   IExtensionBlockCodec = interface(IInterface)
     ['{5F1B8C46-2A70-4E39-9C82-7D5A3E1F6B04}']
     /// <summary>Serializes the extensions vector for AKind from the shared context.</summary>
     function ProduceBlock(const AContext: TExtensionContext;
       AKind: TTlsExtensionContextKind): TBytes;
-    /// <summary>Parses an extensions vector for AKind, applying the 4.2 rules.</summary>
+    /// <summary>Parses an extensions vector for AKind, applying the RFC 9846 4.3 rules.</summary>
     procedure ConsumeBlock(const AContext: TExtensionContext;
-      AKind: TTlsExtensionContextKind; const ABlock: TBytes);
+      AKind: TTlsExtensionContextKind; const ABlock: TBytes); overload;
+    /// <summary>Applies the RFC 9846 4.3 rules to an already-parsed vector, so a caller that has
+    /// parsed the block for another purpose need not walk it again.</summary>
+    procedure ConsumeBlock(const AContext: TExtensionContext;
+      AKind: TTlsExtensionContextKind; const AVector: TExtensionVector); overload;
   end;
 
 implementation

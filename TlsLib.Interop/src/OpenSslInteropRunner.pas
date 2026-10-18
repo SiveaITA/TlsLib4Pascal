@@ -21,10 +21,15 @@ uses
   SysUtils,
   Classes,
   TlpICryptoProvider,
+  TlpIPkixProvider,
   TlpTlsCredential,
+  TlpITrustAnchorStore,
   TlpTrustPolicy,
   TlpNegotiationTypes,
+  TlpTlsVersion,
   TlpISession,
+  TlpSession,
+  TlpSecretBuffer,
   TlpSessionTicketKeys,
   TlpInMemorySessionCache,
   TlpITlsEngine,
@@ -33,6 +38,7 @@ uses
   TlpInMemoryEchKeyStore,
   InteropSocket,
   InteropEngine,
+  TlsLibTestProviders,
   InteropCredentials,
   InteropPump,
   InteropUtils;
@@ -50,6 +56,9 @@ type
     class function ArgValue(const AName: string; const ADefault: string): string; static;
     /// <summary>True when a bare presence flag (e.g. --request-ocsp) is on the command line.</summary>
     class function HasArg(const AName: string): Boolean; static;
+    /// <summary>The TLS 1.2 pre-shared key (RFC 5489) named by --psk (hex secret) and --psk-identity
+    /// (text); empty when --psk is absent.</summary>
+    class function ReadTls12Psks: TArray<TTls12Psk>; static;
     /// <summary>Maps soft/hard/off to the revocation posture (soft when unrecognised).</summary>
     class function ParsePosture(const ASpec: string): TRevocationPosture; static;
     /// <summary>Maps a comma-separated list of group names (e.g. "X25519,X25519MLKEM768")
@@ -62,7 +71,8 @@ type
       const AOcspStaple: TBytes; AAcceptCount: Int32;
       const AStek: ISessionTicketKeyManager;
       const AOfferedGroups: TArray<UInt16>;
-      const AEchKeyStore: IEchServerKeyStore): Int32; static;
+      const AEchKeyStore: IEchServerKeyStore; AClientAuth: TClientAuthMode;
+      const AClientTrust: ITrustAnchorStore): Int32; static;
     class function RunClient(APort: Word; const AHost, ACaPemFile, AMessage,
       AClientCredFile: string; AConnectionCount: Int32;
       const AOfferedGroups: TArray<UInt16>;
@@ -72,7 +82,7 @@ type
     /// handshake + echoed application data; when AExpectRejectAlert >= 0 the semantics invert -
     /// 0 iff the handshake aborts with exactly that alert (a completed handshake then fails).</summary>
     class function RunOneClient(const ASocket: TInteropSocket;
-      const AProvider: ICryptoProvider; const AOptions: TInteropEngineOptions;
+      const ACryptoProvider: ICryptoProvider; const AOptions: TInteropEngineOptions;
       const AMessage: string; AExpectRejectAlert: Int32): Int32; static;
   public
     /// <summary>Parses --role/--port/... and runs one exchange; returns the exit code.</summary>
@@ -92,6 +102,16 @@ begin
   for LI := 1 to ParamCount - 1 do
     if ParamStr(LI) = AName then
       Exit(ParamStr(LI + 1));
+end;
+
+class function TOpenSslInteropRunner.ReadTls12Psks: TArray<TTls12Psk>;
+begin
+  Result := nil;
+  if ArgValue('--psk', '') = '' then
+    Exit;
+  SetLength(Result, 1);
+  Result[0].Identity := BytesOf(ArgValue('--psk-identity', ''));
+  Result[0].Secret := TSecretBuffer.From(TInteropUtils.DecodeHex(ArgValue('--psk', '')));
 end;
 
 class function TOpenSslInteropRunner.HasArg(const AName: string): Boolean;
@@ -158,18 +178,19 @@ class function TOpenSslInteropRunner.RunServer(APort: Word;
   const ACredential: TTlsCredential; const AOcspStaple: TBytes;
   AAcceptCount: Int32; const AStek: ISessionTicketKeyManager;
   const AOfferedGroups: TArray<UInt16>;
-  const AEchKeyStore: IEchServerKeyStore): Int32;
+  const AEchKeyStore: IEchServerKeyStore; AClientAuth: TClientAuthMode;
+  const AClientTrust: ITrustAnchorStore): Int32;
 var
   LListener: TInteropListener;
   LSocket: TInteropSocket;
-  LProvider: ICryptoProvider;
+  LCrypto: ICryptoProvider;
   LOptions: TInteropEngineOptions;
   LEngine: ITlsEngine;
   LResult: TInteropResult;
   LConn: Int32;
 begin
   Result := 1;
-  LProvider := TInteropEngine.DefaultProvider;
+  LCrypto := TTlsLibTestProviders.Crypto;
   LListener := TInteropListener.Bind('127.0.0.1', APort);
   try
     Writeln('listening on 127.0.0.1:', LListener.Port);
@@ -184,11 +205,15 @@ begin
         LOptions.Role := TInteropRole.Server;
         LOptions.HasCredential := True;
         LOptions.Credential := ACredential;
+        // a TLS 1.2 PSK server serves PSK clients; it keeps the certificate for the others
+        LOptions.Tls12Psks := ReadTls12Psks;
         LOptions.OcspStaple := AOcspStaple;
         LOptions.SessionTicketKeys := AStek;
         LOptions.OfferedGroups := AOfferedGroups;
         LOptions.EchKeyStore := AEchKeyStore;
-        LEngine := TInteropEngine.Build(LProvider, LOptions);
+        LOptions.ClientAuth := AClientAuth;
+        LOptions.Trust := AClientTrust;
+        LEngine := TInteropEngine.Build(LCrypto, LOptions);
 
         LResult := TInteropPump.DriveHandshake(LEngine, LSocket);
         if LResult.Status <> TInteropStatus.Ok then
@@ -196,7 +221,7 @@ begin
           Writeln(ErrOutput, 'server handshake failed: ', LResult.Detail);
           Exit(1);
         end;
-        Writeln('ech-status: ', EchStatusName(LEngine.EchStatus));
+        Writeln('ech-status: ', EchStatusName(LEngine.ConnectionInfo.EchStatus));
         Writeln('handshake complete; echoing');
         repeat
           LResult := TInteropPump.PumpAppData(LEngine, LSocket);
@@ -226,13 +251,15 @@ class function TOpenSslInteropRunner.RunClient(APort: Word; const AHost,
   AExpectRejectAlert: Int32): Int32;
 var
   LSocket: TInteropSocket;
-  LProvider: ICryptoProvider;
+  LCrypto: ICryptoProvider;
+  LPkix: IPkixProvider;
   LOptions: TInteropEngineOptions;
   LCache: ISessionCache;
   LConn: Int32;
 begin
   Result := 1;
-  LProvider := TInteropEngine.DefaultProvider;
+  LCrypto := TTlsLibTestProviders.Crypto;
+  LPkix := TTlsLibTestProviders.Pkix;
   // one shared cache carries a ticket from an earlier connection so a later one resumes it
   LCache := nil;
   if AConnectionCount > 1 then
@@ -242,9 +269,23 @@ begin
   LOptions.Role := TInteropRole.Client;
   LOptions.ServerName := AHost;
   LOptions.CheckServerName := True;
-  LOptions.Trust := TInteropCredentials.TrustFromPem(LProvider, ACaPemFile);
+  // a client holding a TLS 1.2 PSK authenticates the server by it: no certificate trust, TLS 1.2 only
+  LOptions.Tls12Psks := ReadTls12Psks;
+  if System.Length(LOptions.Tls12Psks) > 0 then
+  begin
+    LOptions.Tls12PskRequired := True;
+    LOptions.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls12);
+  end
+  else
+    LOptions.Trust := TInteropCredentials.TrustFromPem(LPkix, ACaPemFile);
   LOptions.SessionCache := LCache;
+  // a shared scope so the per-connection rebuilt client configs resume each other's sessions
+  if LCache <> nil then
+    LOptions.SessionScope := LCrypto.Primitives.GetRandom.GenerateBytes(16);
   LOptions.OfferedGroups := AOfferedGroups;
+  // a TLS 1.2-only client builds its own ClientHello, which the dual-version one does not
+  if HasArg('--tls12-only') then
+    LOptions.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls12);
   LOptions.EchConfigList := AEchConfigList;
   // offer status_request and pin a revocation posture so a stapled-revoked peer is evaluated
   LOptions.RequestOcsp := ARequestOcsp;
@@ -255,14 +296,14 @@ begin
   begin
     LOptions.HasCredential := True;
     LOptions.Credential :=
-      TInteropCredentials.ServerCredentialFromFieldFile(LProvider, AClientCredFile);
+      TInteropCredentials.ServerCredentialFromFieldFile(LCrypto, LPkix, AClientCredFile);
   end;
 
   for LConn := 1 to AConnectionCount do
   begin
     LSocket := TInteropSocket.Connect(AHost, APort);
     try
-      Result := RunOneClient(LSocket, LProvider, LOptions, AMessage, AExpectRejectAlert);
+      Result := RunOneClient(LSocket, LCrypto, LOptions, AMessage, AExpectRejectAlert);
     finally
       LSocket.Free;
     end;
@@ -272,7 +313,7 @@ begin
 end;
 
 class function TOpenSslInteropRunner.RunOneClient(const ASocket: TInteropSocket;
-  const AProvider: ICryptoProvider; const AOptions: TInteropEngineOptions;
+  const ACryptoProvider: ICryptoProvider; const AOptions: TInteropEngineOptions;
   const AMessage: string; AExpectRejectAlert: Int32): Int32;
 var
   LEngine: ITlsEngine;
@@ -281,7 +322,7 @@ var
   LI: Int32;
 begin
   Result := 1;
-  LEngine := TInteropEngine.Build(AProvider, AOptions);
+  LEngine := TInteropEngine.Build(ACryptoProvider, AOptions);
 
   LEngine.StartHandshake;
   LResult := TInteropPump.DriveHandshake(LEngine, ASocket);
@@ -307,7 +348,7 @@ begin
     Writeln(ErrOutput, 'client handshake failed: ', LResult.Detail);
     Exit(1);
   end;
-  Writeln('ech-status: ', EchStatusName(LEngine.EchStatus));
+  Writeln('ech-status: ', EchStatusName(LEngine.ConnectionInfo.EchStatus));
   Writeln('handshake complete; sending');
 
   // a trailing newline lets a line-oriented openssl peer (s_server -rev) flush
@@ -351,7 +392,8 @@ var
   LDataDir, LCredentialFile: string;
   LResumeCount: Int32;
   LStek: ISessionTicketKeyManager;
-  LProvider: ICryptoProvider;
+  LCrypto: ICryptoProvider;
+  LPkix: IPkixProvider;
   LCredential: TTlsCredential;
   LStaple: TBytes;
   LFields: TStringList;
@@ -363,6 +405,8 @@ var
   LPostureStr: string;
   LPosture: TRevocationPosture;
   LExpectReject: Int32;
+  LClientAuth: TClientAuthMode;
+  LClientTrust: ITrustAnchorStore;
 begin
   LRole := ArgValue('--role', 'server');
   LPort := Word(StrToIntDef(ArgValue('--port', '0'), 0));
@@ -411,16 +455,17 @@ begin
     begin
       LStek := nil;
       if LResumeCount > 0 then
-        LStek := TStekTicketKeyManager.Create(TInteropEngine.DefaultProvider.Primitives.GetRandom)
+        LStek := TStekTicketKeyManager.Create(TTlsLibTestProviders.Crypto.Primitives.GetRandom)
           as ISessionTicketKeyManager;
-      LProvider := TInteropEngine.DefaultProvider;
+      LCrypto := TTlsLibTestProviders.Crypto;
+      LPkix := TTlsLibTestProviders.Pkix;
       LStaple := nil;
       if LStapleField <> '' then
       begin
         LCredentialFile := LDataDir + PathDelim + 'Certs' + PathDelim +
           'OcspStapling.txt';
         LCredential := TInteropCredentials.ServerStaplingCredentialFromFieldFile(
-          LProvider, LCredentialFile);
+          LCrypto, LCredentialFile);
         LFields := TStringList.Create;
         try
           TInteropUtils.LoadFieldFile(LCredentialFile, LFields);
@@ -431,13 +476,23 @@ begin
       end
       else
         LCredential := TInteropCredentials.ServerCredentialFromFieldFile(
-          LProvider, LCredentialFile);
+          LCrypto, LPkix, LCredentialFile);
       LEchKeyStore := nil;
       if LEchKeyFile <> '' then
         LEchKeyStore := TInMemoryEchKeyStore.FromPem(
-          BytesOf(TInteropUtils.ReadAllText(LEchKeyFile)), LProvider);
+          BytesOf(TInteropUtils.ReadAllText(LEchKeyFile)), LCrypto);
+      // --client-auth requested|required asks the peer for a certificate, verified against the
+      // --client-ca PEM
+      LClientAuth := TClientAuthMode.None;
+      LClientTrust := nil;
+      if SameText(ArgValue('--client-auth', ''), 'required') then
+        LClientAuth := TClientAuthMode.Required
+      else if SameText(ArgValue('--client-auth', ''), 'requested') then
+        LClientAuth := TClientAuthMode.Requested;
+      if ArgValue('--client-ca', '') <> '' then
+        LClientTrust := TInteropCredentials.TrustFromPem(LPkix, ArgValue('--client-ca', ''));
       Result := RunServer(LPort, LCredential, LStaple, LResumeCount + 1, LStek,
-        LOfferedGroups, LEchKeyStore);
+        LOfferedGroups, LEchKeyStore, LClientAuth, LClientTrust);
     end;
   except
     on E: Exception do

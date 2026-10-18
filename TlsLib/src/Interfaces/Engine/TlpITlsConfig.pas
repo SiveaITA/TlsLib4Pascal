@@ -18,10 +18,12 @@ interface
 uses
   SysUtils,
   TlpICryptoProvider,
+  TlpIPkixProvider,
   TlpINamedGroup,
   TlpINegotiation,
   TlpNegotiationTypes,
   TlpICertificateTrust,
+  TlpITrustAnchorStore,
   TlpICertificateVerifierSource,
   TlpICertificateCompression,
   TlpICertificateCompressionCache,
@@ -32,7 +34,9 @@ uses
   TlpITlsCredentialResolver,
   TlpISession,
   TlpIClock,
+  TlpIKeyLog,
   TlpIEch,
+  TlpServerName,
   TlpSession;
 
 type
@@ -43,32 +47,38 @@ type
   /// built once, frozen, and reused.
   /// </summary>
   ITlsCommonConfig = interface(IInterface)
-    ['{7C2A9E15-4D83-4B70-A1F6-3E5C0D7B92A8}']
-    function Provider: ICryptoProvider;
+    ['{B1854E25-E01F-451D-BE8B-BC5671D9387C}']
+    function Crypto: ICryptoProvider;
+    /// <summary>The PKIX provider: X.509 inspection, path validation, revocation.</summary>
+    function Pkix: IPkixProvider;
     function CipherSuites: ICipherSuiteRegistry;
     function SignatureSchemes: ISignatureSchemeRegistry;
     function NamedGroups: INamedGroupRegistry;
     function SupportedVersions: TArray<UInt16>;
     /// <summary>The named-group codes in preference order (the client's key_share order).</summary>
     function PreferredGroups: TArray<UInt16>;
-    function AlpnProtocols: TArray<string>;
-    /// <summary>The certificate-compression algorithms this endpoint compresses a sent
-    /// Certificate with (RFC 8879); empty never sends a CompressedCertificate.</summary>
+    function AlpnProtocols: TArray<TBytes>;
+    /// <summary>The inbound-record size this endpoint offers under record_size_limit (RFC 8449);
+    /// counted as TLSInnerPlaintext in TLS 1.3. 0 (the default) offers nothing.</summary>
+    function RecordSizeLimit: Int32;
+    /// <summary>TLS 1.3 only: the certificate-compression algorithms this endpoint compresses a
+    /// sent Certificate with (RFC 8879); empty never sends a CompressedCertificate.</summary>
     function CertificateCompressors: TArray<ICertificateCompressor>;
-    /// <summary>The certificate-compression algorithms this endpoint can decompress,
-    /// advertised in compress_certificate; empty omits the extension.</summary>
+    /// <summary>TLS 1.3 only: the certificate-compression algorithms this endpoint can decompress,
+    /// advertised in compress_certificate (a client in its ClientHello, a server in its
+    /// CertificateRequest); empty omits the extension.</summary>
     function CertificateDecompressors: TArray<ICertificateDecompressor>;
-    /// <summary>The optional cross-connection cache memoizing the server's compressed
+    /// <summary>The optional cross-connection cache memoizing this endpoint's compressed
     /// Certificate (RFC 8879), so a stable certificate is deflated once rather than every
     /// handshake. Shared across the connections built from this config; nil (the default)
-    /// compresses each time.</summary>
+    /// compresses each time. TLS 1.3 only.</summary>
     function CertificateCompressionCache: ICertificateCompressionCache;
     /// <summary>This endpoint's own credential: the server certificate, or (mutual TLS)
     /// the client certificate. Empty when the endpoint presents none.</summary>
     function Credential: TTlsCredential;
     /// <summary>Trusts the peer certificate chain (the server chain for a client, or the
-    /// client chain when a server requests one). Required for a client; required for a
-    /// server only when it requests client authentication.</summary>
+    /// client chain when a server requests one). nil for a PSK-only or skip-verify client, or a
+    /// whole-verifier configuration; otherwise the composed anchor roots.</summary>
     function TrustStore: ITrustAnchorStore;
     /// <summary>The certificate-chain resource caps applied before PKIX validation.</summary>
     function CertificateChainLimits: TCertificateChainLimits;
@@ -77,7 +87,8 @@ type
     /// <summary>The revocation posture (RFC 6960): Soft (default), Hard, or Off. Governs how an
     /// indeterminate revocation is treated for the peer certificate this endpoint verifies - the
     /// server certificate on a client, or the client certificate on a mutual-TLS server;
-    /// must-staple (RFC 7633) is enforced regardless.</summary>
+    /// must-staple (RFC 7633) binds only to an initial-handshake server certificate the client
+    /// requested a staple for.</summary>
     function RevocationPosture: TRevocationPosture;
     /// <summary>Optional SPKI-SHA256 pins: when non-empty, some certificate in the peer
     /// chain must have a SubjectPublicKeyInfo whose SHA-256 matches one pin (public-key
@@ -89,57 +100,61 @@ type
     /// only trust anchors anchor a path - and they never bypass validation. Empty (the
     /// default) validates the peer chain exactly as received.</summary>
     function IntermediateCertificates: TArray<TBytes>;
-    /// <summary>Whether TLS 1.2 requires extended_master_secret (RFC 7627); when False,
-    /// a peer that does not offer it falls back to the plain master secret.</summary>
+    /// <summary>TLS 1.2 only: whether it requires extended_master_secret (RFC 7627); when False,
+    /// a peer that does not offer it falls back to the plain master secret. A server then also
+    /// applies NonEmsResumption to resumption of such sessions.</summary>
     function RequireExtendedMasterSecret: Boolean;
-    /// <summary>Whether a server that received a server_name (SNI) echoes the empty
-    /// server_name acknowledgement (RFC 6066 3); default True.</summary>
-    function ServerNameAcknowledgement: Boolean;
-    /// <summary>How the server resolves the cipher suite: ServerOrder (default) imposes the
-    /// server's own preference; ClientOrder honors the client's offered order. Server-only; a
-    /// client config ignores it.</summary>
-    function CipherSuitePreference: TServerCipherPreference;
-    /// <summary>Whether a server rejects ALPN unconditionally: on any client ALPN offer it
-    /// aborts with no_application_protocol (RFC 7301) rather than selecting or declining;
-    /// default False.</summary>
-    function AlpnRejectAll: Boolean;
-    /// <summary>The DER-encoded DistinguishedName issuers a server names in its CertificateRequest
-    /// certificate_authorities (RFC 8446 4.2.4 / RFC 5246 7.4.4); empty names none.</summary>
-    function ClientCertificateAuthorities: TArray<TBytes>;
-    /// <summary>Whether a client sprinkles GREASE values (RFC 8701) across its offers to keep
-    /// peers tolerant of unknown values. Optional per the RFC; default True.</summary>
-    function Grease: Boolean;
     /// <summary>The dangerous escape hatches for the peer-certificate decision: an
     /// InsecureSkipVerify that bypasses the built-in trust pipeline, and an augment-only
     /// VerifyCallback that can only additionally reject. Both default off.</summary>
     function DangerousTrust: TDangerousTrust;
-    /// <summary>The asynchronous peer-certificate verdict setting. When enabled, the engine
-    /// parks the handshake after its built-in trust pipeline accepts the chain and raises a
-    /// CertificateReceived event so a host can decide out-of-band, resuming with
-    /// SetCertificateVerdict (augment-only, fail-closed). Disabled by default (inline).</summary>
+    /// <summary>The peer-certificate verdict-deferral setting. When the deferral mode is not
+    /// None, the engine parks the handshake after its built-in trust pipeline accepts the chain
+    /// so a host (HostDecision) or a live OCSP/CRL resolver (LiveRevocation) can decide
+    /// out-of-band, resuming with SetCertificateVerdict (augment-only, fail-closed). None by
+    /// default (inline).</summary>
     function AsyncCertificateVerdict: TAsyncCertificateVerdict;
-    /// <summary>Whether session resumption is engaged (RFC 8446 4.6.1 / RFC 5077). When
+    /// <summary>Whether session resumption is engaged (RFC 9846 4.7.1 / RFC 5077). When
     /// False, the endpoint neither offers/uses (client) nor issues/accepts (server) a
     /// resumed session even if a cache/store is configured. Presets set the default;
     /// hardened profiles may default it off.</summary>
     function Resumption: Boolean;
     /// <summary>The out-of-band external pre-shared keys (RFC 9258), in preference order.
-    /// A client imports and offers them (TLS 1.3 only); a server imports and matches an
+    /// A client imports and offers them; a server imports and matches an
     /// offered pre_shared_key against them, preferring a matching PSK over its
-    /// certificate. Empty leaves external PSK off. Independent of Resumption.</summary>
+    /// certificate. Empty leaves external PSK off. Independent of Resumption. TLS 1.3
+    /// only.</summary>
     function ExternalPsks: TArray<TExternalPsk>;
+    /// <summary>TLS 1.2 only: the pre-shared keys (RFC 4279 / RFC 5489). A client holds at most
+    /// one, which it presents when the server selects a PSK suite; a server holds the set it
+    /// accepts, looked up by the identity the client presents. Empty leaves the TLS 1.2 PSK suites off.
+    /// Distinct from ExternalPsks, which are TLS 1.3 only.</summary>
+    function Tls12Psks: TArray<TTls12Psk>;
     /// <summary>The clock this endpoint reads for time-dependent decisions - a resumption PSK's
     /// obfuscated_ticket_age and ticket-lifetime expiry, a server's 0-RTT anti-replay window,
-    /// and certificate/OCSP freshness (RFC 8446 4.2.11 / 4.6.1). Never nil: the builder defaults
+    /// and certificate/OCSP freshness (RFC 9846 4.3.11 / 4.7.1). Never nil: the builder defaults
     /// it to the system clock.</summary>
     function Clock: ITlsClock;
+    /// <summary>The elapsed-time source the connection layer measures its handshake read cap on
+    /// (pass it to the ATicks overload of TLiveRevocationChecker to share it). The engine itself
+    /// never reads it. Never nil: the builder defaults it to the system source.</summary>
+    function MonotonicClock: ITlsMonotonicClock;
+    /// <summary>The dangerous key-log sink; nil (the default) reports nothing.</summary>
+    function KeyLog: IKeyLog;
   end;
 
   /// <summary>A frozen client endpoint config: a trust source is mandatory.</summary>
   ITlsClientConfig = interface(ITlsCommonConfig)
     ['{2E9C6A14-5D73-4F80-B1A8-6C3E0D5B94F7}']
-    /// <summary>Whether the server certificate must match the connected host (RFC 6125).</summary>
+    /// <summary>Whether a client sprinkles GREASE values (RFC 8701) across its offers to keep
+    /// peers tolerant of unknown values. Optional per the RFC; default True.</summary>
+    function Grease: Boolean;
+    /// <summary>Whether the server certificate must match the connected host (RFC 9525); False for
+    /// a PSK-only client.</summary>
     function CheckServerName: Boolean;
+    /// <summary>Whether the client sends its host as server_name (SNI); Send by default.
+    /// Independent of CheckServerName.</summary>
+    function ServerNameIndication: TServerNameIndication;
     /// <summary>The source the engine builds the peer server-certificate verifier from, per
     /// connection: the built-in PKIX source by default, else a wrapped injected verifier, else
     /// an OS trust delegate (e.g. from TlsLib.Trust.System). Always non-nil after Build; the
@@ -151,27 +166,53 @@ type
     /// <summary>The client-side session cache resumption draws from and stores into; nil
     /// disables client resumption.</summary>
     function SessionCache: ISessionCache;
+    /// <summary>The opaque scope that partitions this configuration's sessions inside a possibly
+    /// shared cache, so trust does not leak across configurations; empty when no cache is set.</summary>
+    function SessionScope: TBytes;
     /// <summary>How the client verifies a resumed server: ReuseOriginal (default) reuses the
-    /// original authentication; Reverify re-runs the certificate verifier against the stored chain.</summary>
+    /// original authentication; Reverify re-runs the certificate verifier against the stored chain
+    /// before the session is offered.</summary>
     function ResumeVerification: TResumeVerification;
-    /// <summary>Whether the client offers TLS 1.3 early data (0-RTT) when a cached ticket
-    /// authorizes it. Off by default; a separate, explicit opt-in.</summary>
+    /// <summary>TLS 1.3 only: whether the client offers early data (0-RTT) when a cached ticket
+    /// authorizes it. Off by default.</summary>
     function EarlyData: Boolean;
     /// <summary>Whether a client that configured external PSKs requires the server to select
     /// one: when True (the default), a ServerHello that omits pre_shared_key is fatal rather
     /// than a fall-through to certificate authentication. Set False to also accept a
-    /// certificate handshake. No effect without configured external PSKs.</summary>
+    /// certificate handshake. No effect without configured external PSKs. TLS 1.3 only.</summary>
     function ExternalPskRequired: Boolean;
-    /// <summary>The frozen Encrypted Client Hello policy (RFC 9849), or nil when ECH is
-    /// not offered.</summary>
+    /// <summary>Whether a client that configured a TLS 1.2 PSK offers only the PSK suites for
+    /// TLS 1.2, so a TLS 1.2 handshake cannot fall back to certificate authentication. When True
+    /// (the default) the PSK suites replace the certificate suites; when False both are offered.
+    /// No effect without a configured TLS 1.2 PSK.</summary>
+    function Tls12PreSharedKeyRequired: Boolean;
+    /// <summary>TLS 1.3 only: the frozen Encrypted Client Hello policy (RFC 9849), or nil when ECH
+    /// is not offered.</summary>
     function EncryptedClientHello: IEchClientPolicy;
   end;
 
-  /// <summary>A frozen server endpoint config: a certificate credential is mandatory.</summary>
+  /// <summary>A frozen server endpoint config: it authenticates with a certificate credential or an external PSK.</summary>
   ITlsServerConfig = interface(ITlsCommonConfig)
     ['{9A4E1C28-6D50-4B63-8F17-2E6C0A5F84D3}']
+    /// <summary>Whether a server that received a server_name (SNI) echoes the empty
+    /// server_name acknowledgement (RFC 6066 3); default True.</summary>
+    function ServerNameAcknowledgement: Boolean;
+    /// <summary>How the server resolves the cipher suite: ServerOrder (default) imposes the
+    /// server's own preference; ClientOrder honors the client's offered order.</summary>
+    function CipherSuitePreference: TServerCipherPreference;
+    /// <summary>TLS 1.2 only: how a server treats a resumption of a session established without
+    /// extended_master_secret when the hello does not offer it either (RFC 7627 5.3); Decline by
+    /// default. Moot when RequireExtendedMasterSecret is set.</summary>
+    function NonEmsResumption: TNonEmsResumption;
+    /// <summary>Whether a server rejects ALPN unconditionally: on any client ALPN offer it
+    /// aborts with no_application_protocol (RFC 7301) rather than selecting or declining;
+    /// default False.</summary>
+    function AlpnRejectAll: Boolean;
+    /// <summary>The DER-encoded DistinguishedName issuers a server names in its CertificateRequest
+    /// certificate_authorities (RFC 9846 4.3.4 / RFC 5246 7.4.4); empty names none.</summary>
+    function ClientCertificateAuthorities: TArray<TBytes>;
     /// <summary>Whether the server requests a client certificate and how strictly
-    /// (RFC 8446 4.3.2 / RFC 5246 7.4.4).</summary>
+    /// (RFC 9846 4.4.2 / RFC 5246 7.4.4).</summary>
     function ClientAuth: TClientAuthMode;
     /// <summary>The source the engine builds the peer client-certificate verifier from, per
     /// connection (mTLS): the built-in PKIX source by default, else a wrapped injected verifier,
@@ -184,26 +225,32 @@ type
     /// <summary>The session-ticket encryption keys for stateless tickets; nil disables
     /// stateless ticket issuance.</summary>
     function SessionTicketKeys: ISessionTicketKeyManager;
+    /// <summary>The opaque scope sealed into issued tickets/sessions and required to match on
+    /// resumption, partitioning configurations that share a ticket key or store; empty when none.</summary>
+    function ResumptionScope: TBytes;
     /// <summary>Selects the server certificate per handshake from the client's SNI (virtual
     /// hosting). Composed at build from WithCredential / WithSniCredential / a custom
     /// WithCredentialResolver. nil for a PSK-only server (no certificate). The Credential
     /// accessor still returns the no-SNI / no-match default.</summary>
     function CredentialResolver: ITlsServerCredentialResolver;
-    /// <summary>The anti-replay register guarding accepted 0-RTT early data; required for
-    /// the server to accept early data.</summary>
+    /// <summary>TLS 1.3 only: the anti-replay register guarding accepted 0-RTT early data;
+    /// required for the server to accept early data.</summary>
     function AntiReplay: IAntiReplayStrategy;
     /// <summary>The lifetime advertised for issued sessions and tickets, in seconds.</summary>
     function TicketLifetimeSeconds: UInt32;
-    /// <summary>How many TLS 1.3 NewSessionTickets to issue per handshake.</summary>
+    /// <summary>TLS 1.3 only: how many NewSessionTickets to issue per handshake.</summary>
     function TicketCount: Int32;
-    /// <summary>The 0-RTT early-data byte budget the server authorizes (0 = no early data).</summary>
+    /// <summary>The psk_identity_hint a server sends in its ECDHE_PSK ServerKeyExchange (RFC 4279
+    /// 5.2); empty (the default) sends none. A client ignores it.</summary>
+    function Tls12PskIdentityHint: TBytes;
+    /// <summary>TLS 1.3 only: the 0-RTT early-data byte budget the server authorizes (0 = no early
+    /// data).</summary>
     function MaxEarlyData: UInt32;
-    /// <summary>The Encrypted Client Hello key store the server decrypts with and advertises as
-    /// retry_configs (RFC 9849), or nil when ECH is not configured.</summary>
-    function EchKeyStore: IEchServerKeyStore;
-    /// <summary>Whether the server trial-decrypts an ECH offer against every key on a config_id
-    /// miss (RFC 9849 sec. 7.1).</summary>
-    function EchTrialDecrypt: Boolean;
+    /// <summary>TLS 1.3 only: the server's Encrypted Client Hello policy (RFC 9849): a keyed
+    /// server's store and trial-decrypt setting, or a split-mode backend. nil when ECH is not
+    /// configured; an inner-type
+    /// ech at a server that is not a backend is illegal_parameter.</summary>
+    function EncryptedClientHello: IEchServerPolicy;
   end;
 
 implementation

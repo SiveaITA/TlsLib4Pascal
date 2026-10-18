@@ -20,8 +20,11 @@ interface
 uses
   SysUtils,
   TlpICryptoProvider,
+  TlpIPkixProvider,
   TlpTlsPresets,
+  TlpTlsCredential,
   TlpITlsConfigBuilder,
+  TlpCertificateVerifierSource,
   TlpITlsConfig,
   TlpTlsEngineFactory,
   TlpITlsEngine,
@@ -35,7 +38,7 @@ type
   /// SSL_CTX - and each RunOneHandshake creates a fresh engine pair and drives a full
   /// 1-RTT handshake to completion over an in-memory pump (no sockets), analogous to
   /// SSL_new + the handshake. Peer-certificate PKIX validation is disabled on the client
-  /// (WithDangerousInsecureSkipVerify) so the measurement isolates the handshake proper -
+  /// (TServerVerification.DangerousSkip) so the measurement isolates the handshake proper -
   /// the ECDHE key exchange plus the ECDSA-P256 CertificateVerify - matching the OpenSSL
   /// peer's SSL_VERIFY_NONE. The offered version and ECDHE group are pinned on both ends.
   /// </summary>
@@ -46,13 +49,14 @@ type
     FServerConfig: ITlsServerConfig;
     FScratch: TBytes;
     /// <summary>The ECDHE group to benchmark, plus the leaf certificate's own curve when it
-    /// differs: an ECDSA leaf's curve must appear in supported_groups (RFC 8422 5.4) whatever
+    /// differs: an ECDSA leaf's curve must appear in supported_groups (RFC 8422 5.3) whatever
     /// the negotiated ECDHE group. ACertGroup is 0 for a non-ECDSA leaf (no such constraint).</summary>
     class function OfferedGroups(AGroupCode, ACertGroup: UInt16): TArray<UInt16>; static;
     /// <summary>Drains everything ASrc has queued into ADst; True if any bytes moved.</summary>
     function Pump(const ASrc, ADst: ITlsEngine): Boolean;
   public
-    constructor Create(const AProvider: ICryptoProvider;
+    constructor Create(const ACryptoProvider: ICryptoProvider;
+      const APkix: IPkixProvider;
       const ACredential: TTlsBenchmarkCredential; AWireVersion, AGroupCode: UInt16);
     /// <summary>One complete client+server handshake; raises on a non-completing exchange.</summary>
     procedure RunOneHandshake;
@@ -77,41 +81,42 @@ begin
     Result := TArray<UInt16>.Create(AGroupCode, ACertGroup);
 end;
 
-constructor TTlsLibHandshakePeer.Create(const AProvider: ICryptoProvider;
+constructor TTlsLibHandshakePeer.Create(const ACryptoProvider: ICryptoProvider;
+  const APkix: IPkixProvider;
   const ACredential: TTlsBenchmarkCredential; AWireVersion, AGroupCode: UInt16);
 var
   LClientBuilder: ITlsConfigBuilder;
   LServerBuilder: ITlsConfigBuilder;
   LClient: ITlsClientConfigBuilder;
   LServer: ITlsServerConfigBuilder;
-  LKind: TCertKeyKind;
+  LKind: TSignatureKeyKind;
   LCertCurve, LCertGroup: UInt16;
 begin
   inherited Create;
   SetLength(FScratch, CPumpBuffer);
 
-  // the leaf's own curve (RFC 8422 5.4 fallback), read from the certificate so the peer is
+  // the leaf's own curve (RFC 8422 5.3 fallback), read from the certificate so the peer is
   // not tied to one curve; 0 (offer nothing extra) for a non-ECDSA leaf
   LCertGroup := 0;
-  if AProvider.Certificates.KeyKind(ACredential.LeafCertDer, LKind, LCertCurve)
-    and (LKind = TCertKeyKind.Ecdsa) then
+  if APkix.Certificates.KeyKind(ACredential.LeafCertDer, LKind, LCertCurve)
+    and (LKind = TSignatureKeyKind.Ecdsa) then
     LCertGroup := LCertCurve;
 
   // hold the builder in an interface local while configuring: the facets keep only a raw
-  // back-reference, so a captured owner is what refcounts and frees it after Build
-  LClientBuilder := TTlsPresets.Compatible(AProvider);
+  // back-reference, so the local is what owns and frees it after Build
+  LClientBuilder := TTlsPresets.Compatible(ACryptoProvider, APkix);
   LClient := LClientBuilder.Client;
   LClient.WithSupportedVersions(TArray<UInt16>.Create(AWireVersion));
   LClient.WithPreferredGroups(OfferedGroups(AGroupCode, LCertGroup));
-  LClient.WithDangerousInsecureSkipVerify(True);
-  LClient.WithTrustAnchors(ACredential.RootCertDer); // a trust source is still required by Build
+  LClient.WithServerVerification(TServerVerification.DangerousSkip);
   FClientConfig := LClient.Build;
 
-  LServerBuilder := TTlsPresets.Compatible(AProvider);
+  LServerBuilder := TTlsPresets.Compatible(ACryptoProvider, APkix);
   LServer := LServerBuilder.Server;
   LServer.WithSupportedVersions(TArray<UInt16>.Create(AWireVersion));
   LServer.WithPreferredGroups(OfferedGroups(AGroupCode, LCertGroup)); // AGroupCode first -> negotiated
-  LServer.WithCredential(ACredential.LeafCertDer, ACredential.LeafKeyDer);
+  LServer.WithCredential(TTlsCredential.Load(ACryptoProvider, APkix,
+    ACredential.LeafCertDer, ACredential.LeafKeyDer));
   FServerConfig := LServer.Build;
 end;
 

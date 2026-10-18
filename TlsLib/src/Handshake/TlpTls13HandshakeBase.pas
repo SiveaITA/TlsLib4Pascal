@@ -23,15 +23,17 @@ uses
   TlpTlsLibExceptions,
   TlpNegotiationTypes,
   TlpIKeySchedule,
+  TlpHandshakeMessages,
   TlpHandshakeMessage,
   TlpHandshakeEffect,
+  TlpHandshakeStage,
   TlpITlsEngine,
   TlpHandshakeMachineBase;
 
 type
   /// <summary>
   /// The TLS 1.3 handshake base: the shared version-neutral plumbing plus the 1.3 key
-  /// schedule and the post-handshake KeyUpdate machinery (RFC 8446 4.6.3), which both the
+  /// schedule and the post-handshake KeyUpdate machinery (RFC 9846 4.7.3), which both the
   /// client and server share once Connected. A concrete 1.3 machine supplies Start, Route
   /// and its role's read/write directions.
   /// </summary>
@@ -39,9 +41,13 @@ type
   strict protected
     FSchedule: ITls13KeySchedule;
     /// <summary>Whether a peer update_requested is awaiting our single coalesced response,
-    /// flushed just before our next application write (RFC 8446 4.6.3): any number of
-    /// requests collapses to one response, which also bounds a KeyUpdate flood (18.6).</summary>
+    /// flushed just before our next application write (RFC 9846 4.7.3): any number of
+    /// requests collapses to one response, which also bounds a KeyUpdate flood.</summary>
     FKeyUpdateResponsePending: Boolean;
+    FKeyUpdatesSent: UInt64;
+    /// <summary>True while an update_requested we sent has not been answered by a KeyUpdate from
+    /// the peer (RFC 9846 4.7.3).</summary>
+    FKeyUpdateRequestOutstanding: Boolean;
     /// <summary>This endpoint's own write (send) traffic direction.</summary>
     function WriteDirection: TTlsDirection; virtual; abstract;
     /// <summary>The peer's write direction, i.e. this endpoint's read direction.</summary>
@@ -50,34 +56,38 @@ type
     /// installs the fresh keys on the matching record side.</summary>
     function RekeyEffect(ADirection: TTlsDirection;
       ASide: TRecordSide): THandshakeEffect;
-    function BuildKeyUpdate(ARequestPeerUpdate: Boolean): TBytes;
+    function BuildKeyUpdate(ARequest: TKeyUpdateRequest): TBytes;
+    /// <summary>The engine's 0-RTT byte budget for a ticket's max_early_data_size.</summary>
+    class function EarlyDataBudget(AMaxEarlyData: UInt32): Int32; static;
     /// <summary>Handles an inbound post-handshake KeyUpdate: rekeys the read epoch, and on
     /// update_requested marks a single response pending (coalescing repeats). Call from the
     /// Connected route.</summary>
     function HandleInboundKeyUpdate(const AMessage: TTlsHandshakeMessage)
       : TArray<THandshakeEffect>;
-    /// <summary>Whether the exporter must be withheld even though its secret is derived: False
-    /// by default; the client overrides to withhold while its reverify-on-resume verdict is open.
-    /// (FPhase/TPhase are strict-private to each concrete machine and differ by role, so this is
-    /// a virtual hook rather than a base-level phase check.)</summary>
-    function ExportWithheld: Boolean; virtual;
+  strict private
+    function CanSendKeyUpdate: Boolean;
   public
-    function RequestKeyUpdate(ARequestPeerUpdate: Boolean)
+    function RequestKeyUpdate(ARequest: TKeyUpdateRequest)
       : TArray<THandshakeEffect>; override;
     /// <summary>If a response to a peer update_requested is pending, emits it (one
     /// KeyUpdate + a write rekey) and clears the flag; the engine flushes this just before
     /// the next application write, so exactly one response precedes our next data.</summary>
     function TakePendingKeyUpdate: TArray<THandshakeEffect>; override;
+    function ExportKeyingMaterial(const ALabel: string;
+      ALength: Int32): TBytes; overload; override;
     function ExportKeyingMaterial(const ALabel: string; const AContext: TBytes;
-      AUseContext: Boolean; ALength: Int32): TBytes; override;
+      ALength: Int32): TBytes; overload; override;
     function CanExportKeyingMaterial: Boolean; override;
+    function ExportEarlyKeyingMaterial(const ALabel: string; const AContext: TBytes;
+      ALength: Int32): TBytes; override;
+    function CanExportEarlyKeyingMaterial: Boolean; override;
   end;
 
 implementation
 
 const
-  KeyUpdateNotRequested = Byte(0);
-  KeyUpdateRequested = Byte(1);
+  // the key-update count may not exceed 2^48-1 (RFC 9846 4.7.3)
+  MaxKeyUpdatesSent = UInt64($FFFFFFFFFFFF);
 
 resourcestring
   SBadKeyUpdate = 'malformed KeyUpdate (request_update must be a single 0 or 1 byte)';
@@ -89,31 +99,53 @@ function TTls13HandshakeBase.RekeyEffect(ADirection: TTlsDirection;
 begin
   FSchedule.AdvanceKeyUpdate(ADirection);
   Result := THandshakeEffects.InstallKeys(FSchedule.TrafficKeys(TTlsEpoch.Application,
-    ADirection), ASide, FSelectedSuite.Common.Aead, TTlsVersion.Tls13);
+    ADirection), ASide, FSelectedSuite.Common.Aead, TTlsVersion.Tls13, TTlsEpoch.Application);
 end;
 
-function TTls13HandshakeBase.BuildKeyUpdate(ARequestPeerUpdate: Boolean): TBytes;
-var
-  LFlag: Byte;
+function TTls13HandshakeBase.CanSendKeyUpdate: Boolean;
 begin
-  if ARequestPeerUpdate then
-    LFlag := KeyUpdateRequested
+  Result := FKeyUpdatesSent < MaxKeyUpdatesSent;
+end;
+
+function TTls13HandshakeBase.BuildKeyUpdate(ARequest: TKeyUpdateRequest): TBytes;
+begin
+  Result := THandshakeFraming.Frame(TTlsHandshakeType.KeyUpdate, TBytes.Create(ARequest.ToByte));
+end;
+
+class function TTls13HandshakeBase.EarlyDataBudget(AMaxEarlyData: UInt32): Int32;
+begin
+  // max_early_data_size is a uint32 on the wire (0xFFFFFFFF is commonly "unbounded") while
+  // the engine budgets in Int32: a plain cast would go negative and silently close the window
+  if AMaxEarlyData > UInt32(High(Int32)) then
+    Result := High(Int32)
   else
-    LFlag := KeyUpdateNotRequested;
-  Result := THandshakeFraming.Frame(TTlsHandshakeType.KeyUpdate, TBytes.Create(LFlag));
+    Result := Int32(AMaxEarlyData);
 end;
 
 function TTls13HandshakeBase.RequestKeyUpdate(
-  ARequestPeerUpdate: Boolean): TArray<THandshakeEffect>;
+  ARequest: TKeyUpdateRequest): TArray<THandshakeEffect>;
 var
   LMessage: TBytes;
+  LRequest: TKeyUpdateRequest;
 begin
   Result := nil;
-  // only meaningful once the application epoch exists (the engine also guards on complete)
-  if FSchedule = nil then
+  // only meaningful once the handshake is established (the application epoch exists); the engine
+  // also guards on complete
+  if (Stage <> THandshakeStage.Connected) or not CanSendKeyUpdate then
     Exit;
+  LRequest := ARequest;
+  // a second update_requested before the peer answers goes out as update_not_requested; the write
+  // keys still update (RFC 9846 4.7.3)
+  if LRequest = TKeyUpdateRequest.UpdateRequested then
+  begin
+    if FKeyUpdateRequestOutstanding then
+      LRequest := TKeyUpdateRequest.UpdateNotRequested
+    else
+      FKeyUpdateRequestOutstanding := True;
+  end;
   // the KeyUpdate goes out under the current write keys; the write epoch rekeys after it
-  LMessage := BuildKeyUpdate(ARequestPeerUpdate);
+  Inc(FKeyUpdatesSent);
+  LMessage := BuildKeyUpdate(LRequest);
   Result := TArray<THandshakeEffect>.Create(
     THandshakeEffects.SendHandshake(LMessage),
     RekeyEffect(WriteDirection, TRecordSide.WriteSide));
@@ -122,20 +154,22 @@ end;
 function TTls13HandshakeBase.HandleInboundKeyUpdate(
   const AMessage: TTlsHandshakeMessage): TArray<THandshakeEffect>;
 var
-  LPeerRequested: Boolean;
+  LRequest: TKeyUpdateRequest;
 begin
-  if (System.Length(AMessage.Body) <> 1) or (AMessage.Body[0] > KeyUpdateRequested) then
+  // decode_error is local policy; RFC 9846 4.7.3 names illegal_parameter
+  if (System.Length(AMessage.Body) <> 1) or not TKeyUpdateRequest.TryFromByte(AMessage.Body[0], LRequest) then
     raise EFatalAlertTlsLibException.CreateRes(TTlsAlertDescription.DecodeError,
       @SBadKeyUpdate);
-  LPeerRequested := AMessage.Body[0] = KeyUpdateRequested;
 
+  // a KeyUpdate from the peer answers our outstanding update_requested (RFC 9846 4.7.3)
+  FKeyUpdateRequestOutstanding := False;
   // the peer advanced its send keys; rekey our read epoch so later records decrypt
   Result := TArray<THandshakeEffect>.Create(
     RekeyEffect(ReadDirection, TRecordSide.ReadSide));
 
   // update_requested: mark one response pending (repeats coalesce to a single response,
-  // flushed just before our next application write - RFC 8446 4.6.3)
-  if LPeerRequested then
+  // flushed just before our next application write - RFC 9846 4.7.3)
+  if LRequest = TKeyUpdateRequest.UpdateRequested then
     FKeyUpdateResponsePending := True;
 
   TArrayUtilities.Append<THandshakeEffect>(Result,
@@ -148,34 +182,61 @@ begin
   if not FKeyUpdateResponsePending then
     Exit;
   FKeyUpdateResponsePending := False;
+  // at the epoch cap update_requested is ignored (RFC 9846 4.7.3)
+  if not CanSendKeyUpdate then
+    Exit;
+  Inc(FKeyUpdatesSent);
   // the responding KeyUpdate (never update_requested, so no loop) goes out under the
   // current write keys; the write epoch rekeys after it
   Result := TArray<THandshakeEffect>.Create(
-    THandshakeEffects.SendHandshake(BuildKeyUpdate(False)),
+    THandshakeEffects.SendHandshake(BuildKeyUpdate(TKeyUpdateRequest.UpdateNotRequested)),
     RekeyEffect(WriteDirection, TRecordSide.WriteSide));
-end;
-
-function TTls13HandshakeBase.ExportWithheld: Boolean;
-begin
-  Result := False;
 end;
 
 function TTls13HandshakeBase.CanExportKeyingMaterial: Boolean;
 begin
-  // available once the exporter_master_secret is derived - for a server that is half-RTT (after
-  // its Finished), before the peer's Finished (RFC 8446 7.5) - unless a role-specific gate
-  // withholds it (the client during its reverify-on-resume park)
-  Result := (FSchedule <> nil) and FSchedule.HasExporterSecret and not ExportWithheld;
+  // available once the exporter_secret is derived - for a server that is half-RTT (after
+  // its Finished), before the peer's Finished (RFC 9846 7.5) - but never while parked on an
+  // out-of-band peer-certificate verdict: neither side exports over a peer identity still being
+  // decided (the client during its reverify-on-resume park; the server while an async
+  // client-certificate verdict is open). Export resumes the moment the verdict clears the park.
+  Result := (FSchedule <> nil) and FSchedule.CanExport and
+    (Stage <> THandshakeStage.ParkedForVerdict);
 end;
 
 function TTls13HandshakeBase.ExportKeyingMaterial(const ALabel: string;
-  const AContext: TBytes; AUseContext: Boolean; ALength: Int32): TBytes;
+  ALength: Int32): TBytes;
 begin
   // query and operation agree: nothing to export until the secret is available (and not withheld)
   Result := nil;
   if not CanExportKeyingMaterial then
     Exit;
-  Result := FSchedule.ExportKeyingMaterial(ALabel, AContext, AUseContext, ALength);
+  Result := FSchedule.ExportKeyingMaterial(ALabel, ALength);
+end;
+
+function TTls13HandshakeBase.ExportKeyingMaterial(const ALabel: string;
+  const AContext: TBytes; ALength: Int32): TBytes;
+begin
+  Result := nil;
+  if not CanExportKeyingMaterial then
+    Exit;
+  Result := FSchedule.ExportKeyingMaterial(ALabel, AContext, ALength);
+end;
+
+function TTls13HandshakeBase.CanExportEarlyKeyingMaterial: Boolean;
+begin
+  // the early exporter binds only the ClientHello - no peer identity is pending in it - so unlike
+  // the main exporter it is not gated on the verdict park (RFC 9846 7.5)
+  Result := (FSchedule <> nil) and FSchedule.CanExportEarly;
+end;
+
+function TTls13HandshakeBase.ExportEarlyKeyingMaterial(const ALabel: string;
+  const AContext: TBytes; ALength: Int32): TBytes;
+begin
+  Result := nil;
+  if not CanExportEarlyKeyingMaterial then
+    Exit;
+  Result := FSchedule.ExportEarlyKeyingMaterial(ALabel, AContext, ALength);
 end;
 
 end.

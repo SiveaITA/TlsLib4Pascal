@@ -22,15 +22,24 @@ uses
 
 type
   /// <summary>
-  /// RFC 6125 endpoint identity matching. A DNS host is matched against the
-  /// certificate's dNSName SANs (a single left-most wildcard label is honored:
-  /// <c>*.example.com</c> matches <c>a.example.com</c> but not <c>example.com</c>
-  /// or <c>a.b.example.com</c>; matching is case-insensitive). An IP-literal host
-  /// is matched only against iPAddress SANs, never against dNSName/wildcards. The
-  /// host is classified once, up front, into a <see cref="TServerName"/>.
+  /// RFC 9525 endpoint identity matching. A DNS host is matched against the
+  /// certificate's dNSName SANs (a single wildcard is honored only as the entire leftmost label
+  /// and only when it leaves at least two labels below it: <c>*.example.com</c> matches
+  /// <c>a.example.com</c> but not <c>example.com</c>, <c>a.b.example.com</c>, or a public suffix
+  /// like <c>*.com</c>; matching is case-insensitive). An ill-formed presented name (empty or
+  /// non-LDH label, or a wildcard that is not the whole leftmost label) is ignored, never
+  /// compared as a literal. An IP-literal host is matched only against iPAddress SANs, never
+  /// against dNSName/wildcards. The host is classified once, up front, into a
+  /// <see cref="TServerName"/>.
   /// </summary>
   TEndpointIdentity = class sealed(TObject)
   strict private
+    class function CountDots(const AText: string): Int32; static;
+    class function IsLdhLabel(const ALabel: string;
+      AAllowWildcard: Boolean): Boolean; static;
+    class function IsWellFormedDnsName(const AName: string;
+      AAllowWildcard: Boolean): Boolean; static;
+    class function HasNumericFinalLabel(const AName: string): Boolean; static;
     class function MatchesOneDns(const AHostName, ADnsName: string): Boolean; static;
     class function MatchesDns(const AHostName: string;
       const ADnsNames: TArray<string>): Boolean; static;
@@ -42,6 +51,20 @@ type
     class function Matches(const AName: TServerName;
       const ADnsNames: TArray<string>;
       const AIpAddresses: TArray<TBytes>): Boolean; static;
+    /// <summary>Whether a presented dNSName / SNI pattern is well-formed (RFC 9525 6.3): all
+    /// labels non-empty and LDH (letters, digits, hyphen; underscore tolerated), with an
+    /// optional single wildcard that must be the entire leftmost label. An ill-formed presented
+    /// name is ignored for matching; an ill-formed SNI pattern is rejected at configuration.</summary>
+    class function IsValidPresentedDnsName(const AName: string): Boolean; static;
+    /// <summary>Whether AName is a usable reference host to verify against: a valid DNS name
+    /// with no wildcard (a client verifies a concrete host, never a pattern) whose last label is
+    /// not all digits or a 0x hex number, since a resolver would read that as an address.</summary>
+    class function IsValidReferenceHostName(const AName: string): Boolean; static;
+    /// <summary>Whether AName is a DNS pattern that can actually match at runtime: well-formed,
+    /// and any wildcard leaves at least two labels below it (never a public suffix like *.com).
+    /// This is exactly what MatchesOneDns accepts, so a configured SNI pattern and the matcher
+    /// can never disagree.</summary>
+    class function IsMatchableDnsPattern(const AName: string): Boolean; static;
   end;
 
 implementation
@@ -57,7 +80,14 @@ begin
   if (AHostName = '') or (ADnsName = '') then
     Exit(False);
 
-  // DNS name comparison is case-insensitive (RFC 6125 / RFC 9525)
+  // an ill-formed or unmatchable presented name (empty/non-LDH label, a wildcard that is not the
+  // entire leftmost label, or a wildcard over a public suffix like *.com) is ignored entirely,
+  // never compared as a literal (the wildcard shape is RFC 9525 6.3; the public-suffix floor is
+  // local policy)
+  if not IsMatchableDnsPattern(ADnsName) then
+    Exit(False);
+
+  // DNS name comparison is case-insensitive (RFC 9525)
   if SameText(ADnsName, AHostName) then
     Exit(True);
 
@@ -74,6 +104,128 @@ begin
   end;
 
   Result := False;
+end;
+
+class function TEndpointIdentity.CountDots(const AText: string): Int32;
+var
+  LI: Int32;
+begin
+  Result := 0;
+  for LI := 1 to System.Length(AText) do
+    if AText[LI] = '.' then
+      Inc(Result);
+end;
+
+class function TEndpointIdentity.IsLdhLabel(const ALabel: string;
+  AAllowWildcard: Boolean): Boolean;
+var
+  LI: Int32;
+  LCh: Char;
+begin
+  Result := False;
+  if ALabel = '' then
+    Exit;
+  // a wildcard label is the entire "*" and nothing else
+  if AAllowWildcard and (ALabel = '*') then
+    Exit(True);
+  // RFC 1035: a label is at most 63 octets and may not begin or end with a hyphen
+  if System.Length(ALabel) > 63 then
+    Exit;
+  if (ALabel[1] = '-') or (ALabel[System.Length(ALabel)] = '-') then
+    Exit;
+  for LI := 1 to System.Length(ALabel) do
+  begin
+    LCh := ALabel[LI];
+    // letters/digits/hyphen (RFC 1123), plus underscore by local policy
+    if not (((LCh >= 'A') and (LCh <= 'Z')) or ((LCh >= 'a') and (LCh <= 'z')) or
+      ((LCh >= '0') and (LCh <= '9')) or (LCh = '-') or (LCh = '_')) then
+      Exit;
+  end;
+  Result := True;
+end;
+
+class function TEndpointIdentity.IsWellFormedDnsName(const AName: string;
+  AAllowWildcard: Boolean): Boolean;
+var
+  LI, LStart: Int32;
+  LFirstLabel: Boolean;
+begin
+  Result := False;
+  if AName = '' then
+    Exit;
+  // RFC 1035 2.3.4: the whole name is at most 255 wire octets (253 in text form follows)
+  if System.Length(AName) > 253 then
+    Exit;
+  LFirstLabel := True;
+  LStart := 1;
+  for LI := 1 to System.Length(AName) + 1 do
+    if (LI > System.Length(AName)) or (AName[LI] = '.') then
+    begin
+      // a wildcard is only ever valid as the entire leftmost label
+      if not IsLdhLabel(System.Copy(AName, LStart, LI - LStart),
+        AAllowWildcard and LFirstLabel) then
+        Exit;
+      LFirstLabel := False;
+      LStart := LI + 1;
+    end;
+  Result := True;
+end;
+
+class function TEndpointIdentity.IsValidPresentedDnsName(const AName: string): Boolean;
+begin
+  Result := IsWellFormedDnsName(AName, True);
+end;
+
+class function TEndpointIdentity.HasNumericFinalLabel(const AName: string): Boolean;
+var
+  LLast: string;
+  LI, LDot, LFirst: Int32;
+  LHex: Boolean;
+  LCh: Char;
+begin
+  LDot := 0;
+  for LI := System.Length(AName) downto 1 do
+    if AName[LI] = '.' then
+    begin
+      LDot := LI;
+      Break;
+    end;
+  LLast := System.Copy(AName, LDot + 1, System.Length(AName) - LDot);
+  // RFC 1123 2.1: a host name's last label is never all-numeric; 0x... is the hex form a
+  // resolver also reads as a number
+  LHex := (System.Length(LLast) >= 2) and (LLast[1] = '0') and
+    ((LLast[2] = 'x') or (LLast[2] = 'X'));
+  if LHex then
+    LFirst := 3
+  else
+    LFirst := 1;
+  Result := LLast <> '';
+  for LI := LFirst to System.Length(LLast) do
+  begin
+    LCh := LLast[LI];
+    if not (((LCh >= '0') and (LCh <= '9')) or
+      (LHex and (((LCh >= 'a') and (LCh <= 'f')) or ((LCh >= 'A') and (LCh <= 'F'))))) then
+      Exit(False);
+  end;
+end;
+
+class function TEndpointIdentity.IsValidReferenceHostName(const AName: string): Boolean;
+begin
+  Result := IsWellFormedDnsName(AName, False) and not HasNumericFinalLabel(AName);
+end;
+
+class function TEndpointIdentity.IsMatchableDnsPattern(const AName: string): Boolean;
+begin
+  if not IsValidPresentedDnsName(AName) then
+    Exit(False);
+  // a wildcard must leave at least two labels below it (never a public suffix such as *.com, and
+  // never a bare "*"): the suffix after the leading "*" then has two dots, e.g. ".example.com"
+  // (a local policy beyond RFC 9525 6.3; public-suffix protection is out of its scope, RFC 9525 7.1).
+  // A well-formed name starting with "*" is "*" or "*.<rest>".
+  if (System.Length(AName) > 0) and (AName[1] = '*') then
+    Result := CountDots(System.Copy(AName, 2, System.Length(AName) - 1)) >= 2
+  else
+    Result := True;
 end;
 
 class function TEndpointIdentity.MatchesDns(const AHostName: string;
@@ -102,7 +254,7 @@ class function TEndpointIdentity.Matches(const AName: TServerName;
   const ADnsNames: TArray<string>; const AIpAddresses: TArray<TBytes>): Boolean;
 begin
   if AName.IsIp then
-    // an IP-literal host matches only iPAddress SANs (RFC 6125 forbids wildcard/dNSName)
+    // an IP-literal host matches only iPAddress SANs (RFC 9525 6.4)
     Result := MatchesIp(AName.AsIpBytes, AIpAddresses)
   else
     Result := MatchesDns(AName.AsDns, ADnsNames);

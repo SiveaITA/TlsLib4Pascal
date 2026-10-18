@@ -34,7 +34,7 @@
         <PackageName Value="FCL"/>
       </Item5>
     </RequiredPackages>
-    <Units Count="69">
+    <Units Count="104">
       <Unit0>
         <Filename Value="TlsLibConsole.lpr"/>
         <IsPartOfProject Value="True"/>
@@ -311,6 +311,146 @@
         <Filename Value="..\src\ServerSideLiveRevocationTests.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit68>
+      <Unit69>
+        <Filename Value="..\src\MockHttpFetcher.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit69>
+      <Unit70>
+        <Filename Value="..\src\MockSink.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit70>
+      <Unit71>
+        <Filename Value="..\src\MockRecordInstaller.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit71>
+      <Unit72>
+        <Filename Value="..\src\MockTransport.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit72>
+      <Unit73>
+        <Filename Value="..\src\MockPlatformChainEngine.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit73>
+      <Unit74>
+        <Filename Value="..\src\TlsConnectionTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit74>
+      <Unit75>
+        <Filename Value="..\src\MockPkixProvider.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit75>
+      <Unit76>
+        <Filename Value="..\src\MockKeyLog.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit76>
+      <Unit77>
+        <Filename Value="..\src\KeyLogTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit77>
+      <Unit78>
+        <Filename Value="..\src\ClientSessionPolicyTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit78>
+      <Unit79>
+        <Filename Value="..\src\NativeCryptoProviderTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit79>
+      <Unit80>
+        <Filename Value="..\src\TlsLibTestProviders.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit80>
+      <Unit81>
+        <Filename Value="..\src\TlsLibTestHandshakeDecoder.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit81>
+      <Unit82>
+        <Filename Value="..\src\PemTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit82>
+      <Unit83>
+        <Filename Value="..\src\DynamicLibraryTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit83>
+      <Unit84>
+        <Filename Value="..\src\SystemTimeUtilitiesTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit84>
+      <Unit85>
+        <Filename Value="..\src\IpLiteralTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit85>
+      <Unit86>
+        <Filename Value="..\src\HttpUrlTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit86>
+      <Unit87>
+        <Filename Value="..\src\SocketHttpFetcherTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit87>
+      <Unit88>
+        <Filename Value="..\src\Tls12PskTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit88>
+      <Unit89>
+        <Filename Value="..\src\MockVerifyHooks.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit89>
+      <Unit90>
+        <Filename Value="..\src\NetSocketTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit90>
+      <Unit91>
+        <Filename Value="..\src\SocketHttpExchangeTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit91>
+      <Unit92>
+        <Filename Value="..\src\AppleAlertMapTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit92>
+      <Unit93>
+        <Filename Value="..\src\BundleTrustTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit93>
+      <Unit94>
+        <Filename Value="..\src\ExtensionVectorTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit94>
+      <Unit95>
+        <Filename Value="..\src\RootGenKeyingTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit95>
+      <Unit96>
+        <Filename Value="..\src\TlsLibTestCertificates.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit96>
+      <Unit97>
+        <Filename Value="..\src\TlsLibHandshakeTestBase.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit97>
+      <Unit98>
+        <Filename Value="..\src\MockCertificateVerifiers.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit98>
+      <Unit99>
+        <Filename Value="..\src\MockCertificateCompression.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit99>
+      <Unit100>
+        <Filename Value="..\src\MockNamedGroups.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit100>
+      <Unit101>
+        <Filename Value="..\src\Pkcs12IdentityTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit101>
+      <Unit102>
+        <Filename Value="..\src\ArrayUtilitiesTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit102>
+      <Unit103>
+        <Filename Value="..\src\SystemCryptoHelperTests.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit103>
     </Units>
   </ProjectOptions>
   <CompilerOptions>
@@ -321,7 +461,7 @@
     </Target>
     <SearchPaths>
       <IncludeFiles Value="$(ProjOutDir)"/>
-      <OtherUnitFiles Value="..\src;..\..\TlsLib.Tools\RootGen\src;..\..\TlsLib.Tools\EchKeyGen\src;..\..\TlsLib.Net"/>
+      <OtherUnitFiles Value="..\src;..\..\TlsLib.Tools\RootGen\src;..\..\TlsLib.Tools\EchKeyGen\src;..\..\TlsLib.Net\src"/>
       <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
     </SearchPaths>
     <Other>

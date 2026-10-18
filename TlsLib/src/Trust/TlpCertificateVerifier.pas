@@ -21,7 +21,9 @@ uses
   TlpTlsLibExceptions,
   TlpArrayUtilities,
   TlpCryptoDomainTypes,
+  TlpPkixDomainTypes,
   TlpICryptoProvider,
+  TlpIPkixProvider,
   TlpServerName,
   TlpEndpointIdentity,
   TlpCertificateLimits,
@@ -30,39 +32,42 @@ uses
   TlpCertificateStrengthPolicy,
   TlpDateTimeUtilities,
   TlpIClock,
+  TlpTrustTypes,
+  TlpITrustAnchorStore,
   TlpICertificateTrust;
 
 type
-  /// <summary>The stapled OCSP outcome the trust decision acts on (RFC 6960): a current
-  /// Good response, a definitive Revoked, or an indeterminate outcome (absent,
-  /// unauthorized, unknown, or outside its validity window).</summary>
-  TStapleVerdict = (GoodFresh, Revoked, Indeterminate);
-
-  /// <summary>A default in-memory trust store over a fixed set of root CA DERs.</summary>
-  TTrustAnchorStore = class sealed(TInterfacedObject, ITrustAnchorStore)
-  strict private
-  var
-    FRoots: TArray<TBytes>;
-  public
-    constructor Create(const ARoots: TArray<TBytes>);
-    function RootCertificates: TArray<TBytes>;
-  end;
-
-  /// <summary>Unions several anchor sources: RootCertificates is the concatenation of
-  /// every child store's roots, resolved on each call. Used when more than one anchor
-  /// contribution is configured. (A harvested OS store is an immutable snapshot; per-call
-  /// resolution matters only for a caller-supplied store whose own roots vary.)</summary>
-  TUnionTrustAnchorStore = class sealed(TInterfacedObject, ITrustAnchorStore)
-  strict private
-  var
-    FStores: TArray<ITrustAnchorStore>;
-  public
-    constructor Create(const AStores: TArray<ITrustAnchorStore>);
-    function RootCertificates: TArray<TBytes>;
+  /// <summary>The optional tuning knobs for a <see cref="TCertificateVerifier" />, beyond the four
+  /// mandatory role inputs (provider, clock, trust store, host-name check). A freshly declared value
+  /// carries the conservative defaults - default chain limits, soft-fail revocation, no dangerous
+  /// escape hatch, no out-of-band deferral, no seeded intermediates, must-staple off - so a caller
+  /// sets only the fields it needs.</summary>
+  TCertificateVerifierOptions = record
+    /// <summary>The certificate-chain resource caps applied before PKIX validation.</summary>
+    ChainLimits: TCertificateChainLimits;
+    /// <summary>The stapled-revocation posture (RFC 6960): Soft (default), Hard, or Off.</summary>
+    RevocationPosture: TRevocationPosture;
+    /// <summary>The dangerous escape hatches: InsecureSkipVerify bypasses the built-in pipeline,
+    /// and a VerifyCallback that can only additionally reject.</summary>
+    Dangerous: TDangerousTrust;
+    /// <summary>How an indeterminate verdict is deferred out-of-band; only LiveRevocation defers a
+    /// stapled outcome to the resolver (the live OCSP/CRL fetch at the park).</summary>
+    Deferral: TVerdictDeferral;
+    /// <summary>Untrusted intermediates seeded into PKIX path building for a peer that sends an
+    /// incomplete chain; they never anchor a path and never bypass validation.</summary>
+    Intermediates: TArray<TBytes>;
+    /// <summary>Whether the client offered status_request: must-staple (RFC 7633 4.3.3) binds only
+    /// when it did.</summary>
+    StatusRequestOffered: Boolean;
+    /// <summary>Whether this is the initial handshake or a resumption; must-staple binds only to an
+    /// initial-handshake server certificate.</summary>
+    Occasion: TVerificationOccasion;
+    class operator Initialize({$IFDEF FPC}var{$ELSE}out{$ENDIF}
+      AOptions: TCertificateVerifierOptions);
   end;
 
   /// <summary>
-  /// The ordered certificate-trust pipeline (RFC 8446 4.4.2 / RFC 5280 / RFC 6125),
+  /// The ordered certificate-trust pipeline (RFC 9846 4.5.1 / RFC 5280 / RFC 9525),
   /// fail-closed: the provider validates the chain to a trusted root for the role's
   /// extendedKeyUsage (certificate_expired / unknown_ca / bad_certificate /
   /// unsupported_certificate), then - for a server certificate - matches the leaf's SANs
@@ -73,225 +78,236 @@ type
     IClientCertificateVerifier)
   strict private
   var
-    FProvider: ICryptoProvider;
+    FPkix: IPkixProvider;
     FClock: ITlsClock;
     FTrustStore: ITrustAnchorStore;
     FCheckHostName: Boolean;
     FChainLimits: TCertificateChainLimits;
     FRevocationPosture: TRevocationPosture;
-    /// <summary>Untrusted intermediates that seed PKIX path building when the peer sends an
-    /// incomplete chain; empty validates the chain exactly as received.</summary>
+    /// <summary>Untrusted intermediates that pool with the peer's certificates to seed PKIX path
+    /// building; empty builds the path only from what the peer sent.</summary>
     FIntermediates: TArray<TBytes>;
     FDangerous: TDangerousTrust;
-    /// <summary>Whether an out-of-band async certificate-verdict resolver runs after the pipeline
-    /// (the live OCSP/CRL fetch at the park). When set, an indeterminate stapled outcome is
-    /// DEFERRED to that resolver instead of being decided inline by the posture.</summary>
-    FAsyncVerdictEnabled: Boolean;
-    /// <summary>The chain-algorithm policy (advertised-scheme filter + key-strength floors),
-    /// applied only when the engine set it via SetChainAlgorithmPolicy; a verifier built through
-    /// the bare constructors (no advertised set to filter against) does not run it.</summary>
+    /// <summary>How a verdict is deferred out-of-band. Only LiveRevocation defers an indeterminate
+    /// stapled outcome to the resolver (the live OCSP/CRL fetch at the park); None and HostDecision
+    /// decide it inline by the posture.</summary>
+    FDeferral: TVerdictDeferral;
+    /// <summary>Whether the client offered status_request, and whether this is the initial
+    /// handshake or a resumption: must-staple binds only to an initial-handshake server
+    /// certificate the client actually asked to have stapled (RFC 7633 4.3.3).</summary>
+    FStatusRequestOffered: Boolean;
+    FOccasion: TVerificationOccasion;
+    /// <summary>The advertised-scheme filter and caller-chosen key-strength floors, applied only
+    /// when the engine set them via SetChainAlgorithmPolicy. When unset (the bare constructors
+    /// have no advertised set to filter against) the pipeline still applies the baseline: the
+    /// MD5/SHA-1 refusal and the default key-strength floors.</summary>
     FChainPolicyEnabled: Boolean;
     FStrengthPolicy: TCertificateStrengthPolicy;
     FAdvertisedSchemes: TArray<UInt16>;
     /// <summary>The injected clock as a UTC wall-clock instant, so every time-based cert
     /// check (chain validity, PKIX path date, OCSP responder validity) shares one source.</summary>
     function ValidationTimeUtc: TDateTime;
+    /// <summary>ACerts from index AFirst on, minus any distrusted certificate (the entries before
+    /// AFirst are kept as they are); each dropped certificate is appended to AWithheld.</summary>
+    class function WithoutDistrusted(const AStore: ITrustAnchorStore;
+      const ACerts: TArray<TBytes>; AFirst: Int32;
+      var AWithheld: TArray<TBytes>): TArray<TBytes>; static;
+    /// <summary>Whether the issuer line from ALeaf through the supplied and the withheld
+    /// certificates reaches a configured anchor by way of a withheld one: names a distrust failure
+    /// without a second path build. Expiry and EKU of the line are not weighed. Each certificate is
+    /// parsed and expanded once, so the cost stays quadratic in signature checks whatever the peer
+    /// sends, and the non-self-signed certificates on a line are capped at the path builder's
+    /// limit (self-signed stands in for the builder's self-issued).</summary>
+    function DistrustDecidedTheFailure(const ALeaf: TBytes;
+      const AWithheld, APresented, AIntermediates: TArray<TBytes>): Boolean;
+    /// <summary>True when any certificate of ACerts is distrusted.</summary>
+    class function AnyDistrusted(const AStore: ITrustAnchorStore;
+      const ACerts: TArray<TBytes>): Boolean; static;
+    /// <summary>The certificates of APath that are configured anchors: the only ones the
+    /// chain-algorithm policy exempts.</summary>
+    class function AnchorsOnPath(const AStore: ITrustAnchorStore;
+      const APath: TArray<TBytes>): TArray<TBytes>; static;
     /// <summary>The built-in trust pipeline (chain caps, PKIX with the role's EKU, revocation,
     /// endpoint identity, pinning), run unless InsecureSkipVerify bypasses it. ACheckName
-    /// enables the RFC 6125 match against AServerName (a server certificate only); AKeyPurpose
+    /// enables the RFC 9525 match against AServerName (a server certificate only); AKeyPurpose
     /// is the extendedKeyUsage the path must carry.</summary>
     function VerifyPipeline(const AChain: TArray<TBytes>;
       const AServerName: TServerName; ACheckName: Boolean; const AOcspStaple: TBytes;
       AKeyPurpose: TCertKeyPurpose; out AValidatedChain: TArray<TBytes>;
-      out AAlert: TTlsAlertDescription): Boolean;
+      out ARevocationSettled: Boolean; out AAlert: TTlsAlertDescription): Boolean;
     /// <summary>The stapled-OCSP revocation + must-staple step (RFC 6960 / RFC 7633),
     /// in-band only. A malformed TLS Feature extension is a hard bad_certificate. A
     /// definitive Revoked fails (certificate_revoked); a current Good passes. A must-staple
-    /// leaf demands a current Good staple regardless of posture. An indeterminate outcome is
-    /// deferred to the async verdict resolver when one runs (live OCSP/CRL), else accepted under
-    /// Soft/Off and rejected under Hard.</summary>
+    /// leaf demands a current Good staple only when the client asked for one on the initial
+    /// handshake (RFC 7633 4.3.3). An indeterminate outcome is deferred to the live-revocation
+    /// resolver when one runs, else accepted under Soft/Off and rejected under Hard.</summary>
     function CheckRevocation(const AChain: TArray<TBytes>; const AOcspStaple: TBytes;
+      AKeyPurpose: TCertKeyPurpose; out ASettled: Boolean;
       out AAlert: TTlsAlertDescription): Boolean;
   public
-    /// <summary>The stapled OCSP verdict for a leaf (RFC 6960), shared by the built-in
-    /// pipeline and an OS delegate that runs its own post-check: a current Good response, a
-    /// definitive Revoked, or an indeterminate outcome (absent, unauthorized, unknown, or
-    /// outside its validity window). A nil provider or clock cannot render a verdict, so it
-    /// returns Indeterminate. AClock supplies both the responder-validity time and the
-    /// freshness window.</summary>
-    class function StapleVerdict(const AProvider: ICryptoProvider;
-      const AClock: ITlsClock; const AChain: TArray<TBytes>;
-      const AStaple: TBytes): TStapleVerdict; static;
-    /// <summary>A verifier with the conservative default chain limits and soft-fail
-    /// revocation. AClock backs the stapled-OCSP freshness window (RFC 6960).</summary>
-    constructor Create(const AProvider: ICryptoProvider; const AClock: ITlsClock;
+    /// <summary>A verifier with the conservative default options (default chain limits, soft-fail
+    /// revocation, no escape hatch, no deferral, no seeded intermediates, must-staple off). AClock
+    /// backs the stapled-OCSP freshness window (RFC 6960).</summary>
+    constructor Create(const APkix: IPkixProvider; const AClock: ITlsClock;
       const ATrustStore: ITrustAnchorStore; ACheckHostName: Boolean); overload;
-    /// <summary>A verifier with caller-tuned chain limits and revocation posture.</summary>
-    constructor Create(const AProvider: ICryptoProvider; const AClock: ITlsClock;
+    /// <summary>A verifier with caller-tuned options beyond the four mandatory role inputs; a
+    /// freshly declared <see cref="TCertificateVerifierOptions" /> carries the conservative
+    /// defaults, so a caller sets only the fields it needs.</summary>
+    constructor Create(const APkix: IPkixProvider; const AClock: ITlsClock;
       const ATrustStore: ITrustAnchorStore; ACheckHostName: Boolean;
-      const AChainLimits: TCertificateChainLimits;
-      ARevocationPosture: TRevocationPosture); overload;
-    /// <summary>As above, plus the dangerous escape hatches (InsecureSkipVerify bypasses the
-    /// built-in pipeline, and a VerifyCallback that can only additionally reject) and
-    /// AAsyncVerdictEnabled: when True, an indeterminate stapled-revocation outcome is deferred to
-    /// the out-of-band verdict resolver (live OCSP/CRL) rather than decided inline by the posture.</summary>
-    constructor Create(const AProvider: ICryptoProvider; const AClock: ITlsClock;
-      const ATrustStore: ITrustAnchorStore; ACheckHostName: Boolean;
-      const AChainLimits: TCertificateChainLimits;
-      ARevocationPosture: TRevocationPosture;
-      const ADangerous: TDangerousTrust;
-      AAsyncVerdictEnabled: Boolean); overload;
-    /// <summary>As above, plus AIntermediates: untrusted intermediate certificates seeded into
-    /// PKIX path building for a peer that sends an incomplete chain (e.g. a leaf-only server).
-    /// They never anchor a path and never bypass validation; empty behaves exactly as the
-    /// overload without it.</summary>
-    constructor Create(const AProvider: ICryptoProvider; const AClock: ITlsClock;
-      const ATrustStore: ITrustAnchorStore; ACheckHostName: Boolean;
-      const AChainLimits: TCertificateChainLimits;
-      ARevocationPosture: TRevocationPosture;
-      const ADangerous: TDangerousTrust; AAsyncVerdictEnabled: Boolean;
-      const AIntermediates: TArray<TBytes>); overload;
-    /// <summary>Turns on the chain-algorithm policy for this verifier: the peer chain must be
+      const AOptions: TCertificateVerifierOptions); overload;
+    /// <summary>Arms the full chain-algorithm policy for this verifier: the peer chain must be
     /// signed only with a scheme in AAdvertised (and never MD5/SHA-1) and its keys must meet
     /// APolicy. The engine calls this from the verifier source with the connection's advertised
-    /// signature schemes; a bare-constructed verifier leaves it off.</summary>
+    /// signature schemes; a bare-constructed verifier gets only the baseline (MD5/SHA-1 refusal
+    /// and the default key-strength floors) with no scheme filter.</summary>
     procedure SetChainAlgorithmPolicy(const APolicy: TCertificateStrengthPolicy;
       const AAdvertised: TArray<UInt16>);
     function VerifyServerCertificate(const AChain: TArray<TBytes>;
       const AServerName: TServerName; const AOcspStaple: TBytes;
-      out AValidatedChain: TArray<TBytes>;
+      out AVerified: TVerifiedChain;
       out AAlert: TTlsAlertDescription): Boolean;
     function VerifyClientCertificate(const AChain: TArray<TBytes>;
-      out AValidatedChain: TArray<TBytes>;
+      out AVerified: TVerifiedChain;
       out AAlert: TTlsAlertDescription): Boolean;
   end;
 
   /// <summary>
   /// SPKI public-key pinning as a decorator over any server-certificate verifier (augments,
-  /// never a bypass): the inner verifier must accept the chain AND some presented certificate's
-  /// SubjectPublicKeyInfo SHA-256 must match a configured pin, else bad_certificate. Composing
-  /// it over the source output pins uniformly over the built-in pipeline and an OS delegate.
+  /// never a bypass): the inner verifier must accept the chain AND some certificate on the
+  /// validated path must carry a SubjectPublicKeyInfo whose SHA-256 matches a configured pin, else
+  /// bad_certificate. Composing it over the source output pins uniformly over the built-in pipeline
+  /// and an OS delegate.
   /// </summary>
   TPinningVerifier = class sealed(TInterfacedObject, IServerCertificateVerifier)
   strict private
   var
     FInner: IServerCertificateVerifier;
     FPins: TArray<TBytes>;
-    FProvider: ICryptoProvider;
-    function PinsMatch(const AChain: TArray<TBytes>): Boolean;
+    FCrypto: ICryptoProvider;
+    FPkix: IPkixProvider;
   public
     constructor Create(const AInner: IServerCertificateVerifier;
-      const APins: TArray<TBytes>; const AProvider: ICryptoProvider);
+      const APins: TArray<TBytes>; const ACryptoProvider: ICryptoProvider;
+      const APkixProvider: IPkixProvider);
     function VerifyServerCertificate(const AChain: TArray<TBytes>;
       const AServerName: TServerName; const AOcspStaple: TBytes;
-      out AValidatedChain: TArray<TBytes>;
+      out AVerified: TVerifiedChain;
+      out AAlert: TTlsAlertDescription): Boolean;
+  end;
+
+  /// <summary>
+  /// The server-side counterpart of <see cref="TPinningVerifier" />: SPKI public-key pinning as a
+  /// decorator over any client-certificate verifier (augments, never a bypass). The inner verifier
+  /// must accept the client chain AND some certificate on the validated path must match a configured
+  /// pin, else bad_certificate. Composing it over the source output pins uniformly over the built-in
+  /// pipeline and an OS client delegate.
+  /// </summary>
+  TClientPinningVerifier = class sealed(TInterfacedObject, IClientCertificateVerifier)
+  strict private
+  var
+    FInner: IClientCertificateVerifier;
+    FPins: TArray<TBytes>;
+    FCrypto: ICryptoProvider;
+    FPkix: IPkixProvider;
+  public
+    constructor Create(const AInner: IClientCertificateVerifier;
+      const APins: TArray<TBytes>; const ACryptoProvider: ICryptoProvider;
+      const APkixProvider: IPkixProvider);
+    function VerifyClientCertificate(const AChain: TArray<TBytes>;
+      out AVerified: TVerifiedChain;
+      out AAlert: TTlsAlertDescription): Boolean;
+  end;
+
+  /// <summary>
+  /// Applies the augment-only VerifyCallback to a caller-supplied server-certificate verifier: the
+  /// inner verifier decides first and the callback can only additionally reject. Composed over an
+  /// instance verifier, which cannot receive the callback through its trust context.
+  /// </summary>
+  TVerifyCallbackVerifier = class sealed(TInterfacedObject, IServerCertificateVerifier)
+  strict private
+  var
+    FInner: IServerCertificateVerifier;
+    FCallback: TTlsCertificateVerifyCallback;
+  public
+    constructor Create(const AInner: IServerCertificateVerifier;
+      const ACallback: TTlsCertificateVerifyCallback);
+    function VerifyServerCertificate(const AChain: TArray<TBytes>;
+      const AServerName: TServerName; const AOcspStaple: TBytes;
+      out AVerified: TVerifiedChain;
+      out AAlert: TTlsAlertDescription): Boolean;
+  end;
+
+  /// <summary>
+  /// The client-certificate counterpart of <see cref="TVerifyCallbackVerifier" />.
+  /// </summary>
+  TClientVerifyCallbackVerifier = class sealed(TInterfacedObject, IClientCertificateVerifier)
+  strict private
+  var
+    FInner: IClientCertificateVerifier;
+    FCallback: TTlsCertificateVerifyCallback;
+  public
+    constructor Create(const AInner: IClientCertificateVerifier;
+      const ACallback: TTlsCertificateVerifyCallback);
+    function VerifyClientCertificate(const AChain: TArray<TBytes>;
+      out AVerified: TVerifiedChain;
       out AAlert: TTlsAlertDescription): Boolean;
   end;
 
 implementation
 
-{ TTrustAnchorStore }
+resourcestring
+  SNilVerifierInput = 'a PKIX provider and clock are required (pass instances, not nil)';
+  SNilPinningInput = 'an inner verifier, a crypto provider and a PKIX provider are required ' +
+    '(pass instances, not nil)';
+  SEmptyPins = 'at least one SPKI pin is required (pass pins, or do not compose a pinning verifier)';
+  SNilCallbackInput = 'an inner verifier and a verify callback are required (pass instances, not nil)';
 
-constructor TTrustAnchorStore.Create(const ARoots: TArray<TBytes>);
+{ TCertificateVerifierOptions }
+
+class operator TCertificateVerifierOptions.Initialize({$IFDEF FPC}var{$ELSE}out{$ENDIF}
+  AOptions: TCertificateVerifierOptions);
 begin
-  inherited Create;
-  FRoots := ARoots;
-end;
-
-function TTrustAnchorStore.RootCertificates: TArray<TBytes>;
-var
-  LI: Int32;
-begin
-  // a deep defensive copy: System.Copy alone shares the inner TBytes, so copy each
-  // entry too - a caller cannot mutate the frozen trust store's certificates
-  Result := nil;
-  SetLength(Result, System.Length(FRoots));
-  for LI := 0 to System.High(FRoots) do
-    Result[LI] := System.Copy(FRoots[LI]);
-end;
-
-{ TUnionTrustAnchorStore }
-
-constructor TUnionTrustAnchorStore.Create(const AStores: TArray<ITrustAnchorStore>);
-begin
-  inherited Create;
-  FStores := AStores;
-end;
-
-function TUnionTrustAnchorStore.RootCertificates: TArray<TBytes>;
-var
-  LI, LJ, LPos, LTotal: Int32;
-  LChildResults: TArray<TArray<TBytes>>;
-begin
-  SetLength(LChildResults, System.Length(FStores));
-  LTotal := 0;
-  for LI := 0 to System.High(FStores) do
-  begin
-    if FStores[LI] = nil then
-      Continue;
-    LChildResults[LI] := FStores[LI].RootCertificates;
-    Inc(LTotal, System.Length(LChildResults[LI]));
-  end;
-  Result := nil;
-  SetLength(Result, LTotal);
-  LPos := 0;
-  for LI := 0 to System.High(LChildResults) do
-    for LJ := 0 to System.High(LChildResults[LI]) do
-    begin
-      Result[LPos] := LChildResults[LI][LJ];
-      Inc(LPos);
-    end;
+  // a freshly declared options value means the conservative defaults, so an omitted knob is safe;
+  // Dangerous self-initialises through its own Initialize operator
+  AOptions.ChainLimits := TCertificateChainLimits.Defaults;
+  AOptions.RevocationPosture := TRevocationPosture.Soft;
+  AOptions.Deferral := TVerdictDeferral.None;
+  AOptions.Intermediates := nil;
+  AOptions.StatusRequestOffered := False;
+  AOptions.Occasion := TVerificationOccasion.InitialHandshake;
 end;
 
 { TCertificateVerifier }
 
-constructor TCertificateVerifier.Create(const AProvider: ICryptoProvider;
+constructor TCertificateVerifier.Create(const APkix: IPkixProvider;
   const AClock: ITlsClock; const ATrustStore: ITrustAnchorStore;
   ACheckHostName: Boolean);
-begin
-  Create(AProvider, AClock, ATrustStore, ACheckHostName,
-    TCertificateChainLimits.Defaults, TRevocationPosture.Soft);
-end;
-
-constructor TCertificateVerifier.Create(const AProvider: ICryptoProvider;
-  const AClock: ITlsClock; const ATrustStore: ITrustAnchorStore;
-  ACheckHostName: Boolean; const AChainLimits: TCertificateChainLimits;
-  ARevocationPosture: TRevocationPosture);
 var
-  LNoDangerous: TDangerousTrust;
+  LOptions: TCertificateVerifierOptions;
 begin
-  LNoDangerous := Default(TDangerousTrust);
-  Create(AProvider, AClock, ATrustStore, ACheckHostName, AChainLimits,
-    ARevocationPosture, LNoDangerous, False);
+  // a freshly declared options value carries the conservative defaults (Initialize)
+  Create(APkix, AClock, ATrustStore, ACheckHostName, LOptions);
 end;
 
-constructor TCertificateVerifier.Create(const AProvider: ICryptoProvider;
+constructor TCertificateVerifier.Create(const APkix: IPkixProvider;
   const AClock: ITlsClock; const ATrustStore: ITrustAnchorStore;
-  ACheckHostName: Boolean; const AChainLimits: TCertificateChainLimits;
-  ARevocationPosture: TRevocationPosture;
-  const ADangerous: TDangerousTrust; AAsyncVerdictEnabled: Boolean);
-begin
-  Create(AProvider, AClock, ATrustStore, ACheckHostName, AChainLimits,
-    ARevocationPosture, ADangerous, AAsyncVerdictEnabled, nil);
-end;
-
-constructor TCertificateVerifier.Create(const AProvider: ICryptoProvider;
-  const AClock: ITlsClock; const ATrustStore: ITrustAnchorStore;
-  ACheckHostName: Boolean; const AChainLimits: TCertificateChainLimits;
-  ARevocationPosture: TRevocationPosture;
-  const ADangerous: TDangerousTrust; AAsyncVerdictEnabled: Boolean;
-  const AIntermediates: TArray<TBytes>);
+  ACheckHostName: Boolean; const AOptions: TCertificateVerifierOptions);
 begin
   inherited Create;
-  FProvider := AProvider;
+  if (APkix = nil) or (AClock = nil) then
+    raise EArgumentTlsLibException.CreateRes(@SNilVerifierInput);
+  FPkix := APkix;
   FClock := AClock;
   FTrustStore := ATrustStore;
   FCheckHostName := ACheckHostName;
-  FChainLimits := AChainLimits;
-  FRevocationPosture := ARevocationPosture;
-  FIntermediates := AIntermediates;
-  FDangerous := ADangerous;
-  FAsyncVerdictEnabled := AAsyncVerdictEnabled;
+  FChainLimits := AOptions.ChainLimits;
+  FRevocationPosture := AOptions.RevocationPosture;
+  FIntermediates := AOptions.Intermediates;
+  FDangerous := AOptions.Dangerous;
+  FDeferral := AOptions.Deferral;
+  FStatusRequestOffered := AOptions.StatusRequestOffered;
+  FOccasion := AOptions.Occasion;
 end;
 
 function TCertificateVerifier.ValidationTimeUtc: TDateTime;
@@ -308,70 +324,45 @@ begin
   FChainPolicyEnabled := True;
 end;
 
-class function TCertificateVerifier.StapleVerdict(const AProvider: ICryptoProvider;
-  const AClock: ITlsClock; const AChain: TArray<TBytes>;
-  const AStaple: TBytes): TStapleVerdict;
-var
-  LStatus: TOcspStatus;
-  LThisUpdate, LNextUpdate: TDateTime;
-  LNowMs: Int64;
-begin
-  Result := TStapleVerdict.Indeterminate;
-  // a public entry point: without a provider or a clock no verdict can be rendered
-  if (AProvider = nil) or (AClock = nil) then
-    Exit;
-  // a staple needs the issuer (the next chain entry) to authenticate it
-  if (System.Length(AStaple) = 0) or (System.Length(AChain) < 2) then
-    Exit;
-  if not AProvider.Revocation.ValidateOcspStaple(AChain[0], AChain[1], AStaple,
-    TDateTimeUtilities.UnixMsToDateTime(Int64(AClock.NowUnixMillis)), LStatus,
-    LThisUpdate, LNextUpdate) then
-    Exit;
-  if LStatus = TOcspStatus.Revoked then
-  begin
-    Result := TStapleVerdict.Revoked;
-    Exit;
-  end;
-  if LStatus = TOcspStatus.Good then
-  begin
-    // accept a Good response only inside its own validity window
-    LNowMs := Int64(AClock.NowUnixMillis);
-    if (LNowMs >= TDateTimeUtilities.DateTimeToUnixMs(LThisUpdate)) and
-      ((LNextUpdate = 0) or
-      (LNowMs < TDateTimeUtilities.DateTimeToUnixMs(LNextUpdate))) then
-      Result := TStapleVerdict.GoodFresh;
-  end;
-  // an Unknown status, or a Good one outside its window, stays Indeterminate
-end;
-
 function TCertificateVerifier.CheckRevocation(const AChain: TArray<TBytes>;
-  const AOcspStaple: TBytes; out AAlert: TTlsAlertDescription): Boolean;
-const
-  // RFC 7633 TLS Feature id: status_request means the certificate is must-staple
-  MustStapleFeature = UInt16(5);
+  const AOcspStaple: TBytes; AKeyPurpose: TCertKeyPurpose; out ASettled: Boolean;
+  out AAlert: TTlsAlertDescription): Boolean;
 var
   LFeatures: TArray<UInt16>;
   LMustStaple: Boolean;
   LVerdict: TStapleVerdict;
   LI: Int32;
 begin
+  // settled = a definitive, authenticated revocation verdict was reached inline (a current Good, or
+  // a Revoked that rejects); an indeterminate outcome deferred to the live park is NOT settled
+  ASettled := False;
   // the RFC 7633 TLS Feature extension well-formedness is a hard invariant, enforced
-  // regardless of posture: a value that is not a SEQUENCE OF INTEGER is fatal
-  if not FProvider.Certificates.TlsFeatures(AChain[0], LFeatures) then
+  // regardless of posture, role, or occasion: a value that is not a SEQUENCE OF INTEGER is fatal
+  if not FPkix.Certificates.TlsFeatures(AChain[0], LFeatures) then
   begin
     AAlert := TTlsAlertDescription.BadCertificate;
     Result := False;
     Exit;
   end;
-  LMustStaple := False;
-  for LI := 0 to System.High(LFeatures) do
-    if LFeatures[LI] = MustStapleFeature then
-    begin
-      LMustStaple := True;
-      Break;
-    end;
+  // must-staple binds only to a server certificate on the initial handshake that the client
+  // asked to have stapled (RFC 7633 4.3.3): a client never asks to staple a client certificate,
+  // no Certificate is on the wire on a resumption, and a client that did not offer status_request
+  // cannot demand what it did not request
+  LMustStaple := FStatusRequestOffered and
+    (FOccasion = TVerificationOccasion.InitialHandshake) and
+    (AKeyPurpose = TCertKeyPurpose.ServerAuth);
+  if LMustStaple then
+  begin
+    LMustStaple := False;
+    for LI := 0 to System.High(LFeatures) do
+      if LFeatures[LI] = TTlsFeatureCodes.StatusRequest then
+      begin
+        LMustStaple := True;
+        Break;
+      end;
+  end;
 
-  LVerdict := StapleVerdict(FProvider, FClock, AChain, AOcspStaple);
+  LVerdict := TOcspStaplePolicy.Verdict(FPkix, FClock, AChain, AOcspStaple);
 
   if LVerdict = TStapleVerdict.Revoked then
   begin
@@ -384,89 +375,298 @@ begin
 
   if LVerdict = TStapleVerdict.GoodFresh then
   begin
+    // a current, authenticated Good settles revocation inline: a configured live-revocation park
+    // would only re-fetch what the staple already answered, so the caller may skip it
+    ASettled := True;
+    Result := True;
+    Exit;
+  end;
+
+  if LVerdict = TStapleVerdict.GoodUnbounded then
+  begin
+    // without nextUpdate the responder promises newer information at any time (RFC 6960 4.2.2.1),
+    // so this Good satisfies the inline gate but does not stand in for a configured live check
     Result := True;
     Exit;
   end;
 
   // indeterminate outcome (no staple / unauthorized / unknown / stale):
-  //  - a must-staple leaf still requires a current Good staple, even under Soft/Off, and even
-  //    when a live resolver exists - a leaf that demands stapling is not satisfied by a live
-  //    fetch (RFC 7633). Always reject.
-  //  - else, when an out-of-band verdict resolver will run (live OCSP/CRL at the park), DEFER
-  //    to it: accept here so the handshake reaches the park, where the resolver renders the
-  //    posture's verdict over a live fetch. This is what makes a Hard posture reachable for a
-  //    peer that carries no staple (e.g. a client certificate, which is never stapled).
-  //  - else (no live channel), decide inline by the posture: only Hard rejects.
+  //  - a must-staple leaf still requires a current Good staple even under Soft/Off, and even
+  //    when a live resolver exists (a live fetch does not satisfy a leaf that demands stapling:
+  //    local policy, stricter than the SHOULD of RFC 7633 4.2.3.1): always reject.
+  //  - else, when the verdict is deferred to a live-revocation resolver (the live OCSP/CRL fetch
+  //    at the park), accept here so the handshake reaches the park and the resolver renders the
+  //    posture's verdict. This makes a Hard posture reachable for a staple-less peer (e.g. a
+  //    client certificate, never stapled). A host-decision park does not defer the revocation
+  //    gate: the posture still decides inline, as with no deferral.
+  //  - else, decide inline by the posture: only Hard rejects.
   if LMustStaple then
-    Result := False
-  else if FAsyncVerdictEnabled then
-    Result := True
-  else
-    Result := FRevocationPosture <> TRevocationPosture.Hard;
-  if not Result then
+  begin
     AAlert := TTlsAlertDescription.BadCertificateStatusResponse;
+    Result := False;
+  end
+  else
+    Result := TRevocationDecision.Decide(TLiveRevocationOutcome.Indeterminate,
+      FRevocationPosture, FDeferral = TVerdictDeferral.LiveRevocation, AAlert);
+end;
+
+class function TCertificateVerifier.WithoutDistrusted(
+  const AStore: ITrustAnchorStore; const ACerts: TArray<TBytes>;
+  AFirst: Int32; var AWithheld: TArray<TBytes>): TArray<TBytes>;
+var
+  LI, LCount: Int32;
+begin
+  Result := nil;
+  SetLength(Result, System.Length(ACerts));
+  LCount := 0;
+  for LI := 0 to System.High(ACerts) do
+    if (LI >= AFirst) and AStore.IsDistrusted(ACerts[LI]) then
+      TArrayUtilities.Append<TBytes>(AWithheld, ACerts[LI])
+    else
+    begin
+      Result[LCount] := ACerts[LI];
+      Inc(LCount);
+    end;
+  SetLength(Result, LCount);
+end;
+
+function TCertificateVerifier.DistrustDecidedTheFailure(const ALeaf: TBytes;
+  const AWithheld, APresented, AIntermediates: TArray<TBytes>): Boolean;
+var
+  LCandidates, LPool: TArray<TBytes>;
+  LIssuer: TBytes;
+  LIssuedBy: array of TArray<Boolean>;
+  LCost: TArray<Int32>;
+  LExpanded, LWithheldAt, LAnchorKnown, LAnchored: TArray<Boolean>;
+  LSubject, LIssuerName: TArray<string>;
+  LRootSubject: TArray<string>;
+  LMatches, LRoots: TArray<TBytes>;
+  LCount, LA, LB, LC, LNext, LTo: Int32;
+  LKnown, LChanged: Boolean;
+  LCommonName, LSerial, LRootIssuer: string;
+
+  // which pool certificates signed AIndex; the diagonal tells whether it is self-signed
+  procedure Expand(AIndex: Int32);
+  var
+    LJ: Int32;
+  begin
+    if LExpanded[AIndex] then
+      Exit;
+    LExpanded[AIndex] := True;
+    SetLength(LIssuedBy[AIndex], LCount);
+    // the name match is a prefilter on the names parsed once, so a signature is only tried on a hit
+    for LJ := 0 to LCount - 1 do
+      LIssuedBy[AIndex][LJ] := (LIssuerName[AIndex] <> '') and
+        SameText(LIssuerName[AIndex], LSubject[LJ]) and
+        FPkix.Revocation.TryFindIssuer(LPool[AIndex], TArray<TBytes>.Create(LPool[LJ]), LIssuer);
+  end;
+
+begin
+  LCandidates := TArrayUtilities.Concat<TBytes>(APresented, AIntermediates);
+  LCandidates := TArrayUtilities.Concat<TBytes>(LCandidates, AWithheld);
+  LPool := TArray<TBytes>.Create(ALeaf);
+  for LA := 0 to System.High(LCandidates) do
+  begin
+    LKnown := False;
+    for LB := 0 to System.High(LPool) do
+      if TArrayUtilities.AreEqual(LPool[LB], LCandidates[LA]) then
+        LKnown := True;
+    if not LKnown then
+      TArrayUtilities.Append<TBytes>(LPool, LCandidates[LA]);
+  end;
+  LCount := System.Length(LPool);
+  SetLength(LIssuedBy, LCount);
+  SetLength(LExpanded, LCount);
+  SetLength(LAnchorKnown, LCount);
+  SetLength(LAnchored, LCount);
+  SetLength(LWithheldAt, LCount);
+  SetLength(LSubject, LCount);
+  SetLength(LIssuerName, LCount);
+  for LA := 0 to LCount - 1 do
+    if not FPkix.Certificates.PeerInfo(LPool[LA], LSubject[LA], LIssuerName[LA], LCommonName,
+      LSerial) then
+    begin
+      LSubject[LA] := '';
+      LIssuerName[LA] := '';
+    end;
+  SetLength(LCost, LCount * 2);
+  for LA := 0 to LCount - 1 do
+    for LB := 0 to System.High(AWithheld) do
+      if TArrayUtilities.AreEqual(LPool[LA], AWithheld[LB]) then
+        LWithheldAt[LA] := True;
+  for LA := 0 to System.High(LCost) do
+    LCost[LA] := System.High(Int32);
+  // a state is (certificate, crossed a withheld one), costed in non-self-signed certificates above the leaf
+  LCost[0] := 0;
+  repeat
+    LChanged := False;
+    for LA := 0 to LCount - 1 do
+      for LC := 0 to 1 do
+      begin
+        if LCost[LA * 2 + LC] > TPathBuildLimits.MaxBuiltPathLength then
+          Continue;
+        Expand(LA);
+        if LC = 1 then
+        begin
+          if not LAnchorKnown[LA] then
+          begin
+            LAnchorKnown[LA] := True;
+            if LRootSubject = nil then
+            begin
+              LRoots := FTrustStore.RootCertificates;
+              SetLength(LRootSubject, System.Length(LRoots));
+              for LB := 0 to System.High(LRoots) do
+                if not FPkix.Certificates.PeerInfo(LRoots[LB], LRootSubject[LB], LRootIssuer,
+                  LCommonName, LSerial) then
+                  LRootSubject[LB] := '';
+            end;
+            LMatches := nil;
+            for LB := 0 to System.High(LRoots) do
+              if (LIssuerName[LA] <> '') and SameText(LIssuerName[LA], LRootSubject[LB]) then
+                TArrayUtilities.Append<TBytes>(LMatches, LRoots[LB]);
+            LAnchored[LA] := FPkix.Revocation.TryFindIssuer(LPool[LA], LMatches, LIssuer);
+          end;
+          if LAnchored[LA] then
+            Exit(True);
+        end;
+        for LB := 0 to LCount - 1 do
+        begin
+          if (LB = LA) or not LIssuedBy[LA][LB] then
+            Continue;
+          Expand(LB);
+          LNext := LCost[LA * 2 + LC];
+          if not LIssuedBy[LB][LB] then
+            Inc(LNext);
+          LTo := LB * 2 + LC;
+          if LWithheldAt[LB] then
+            LTo := LB * 2 + 1;
+          if (LNext <= TPathBuildLimits.MaxBuiltPathLength) and (LNext < LCost[LTo]) then
+          begin
+            LCost[LTo] := LNext;
+            LChanged := True;
+          end;
+        end;
+      end;
+  until not LChanged;
+  Result := False;
+end;
+
+class function TCertificateVerifier.AnyDistrusted(
+  const AStore: ITrustAnchorStore; const ACerts: TArray<TBytes>): Boolean;
+var
+  LI: Int32;
+begin
+  Result := True;
+  for LI := 0 to System.High(ACerts) do
+    if AStore.IsDistrusted(ACerts[LI]) then
+      Exit;
+  Result := False;
+end;
+
+class function TCertificateVerifier.AnchorsOnPath(const AStore: ITrustAnchorStore;
+  const APath: TArray<TBytes>): TArray<TBytes>;
+var
+  LI: Int32;
+begin
+  Result := nil;
+  for LI := 0 to System.High(APath) do
+    if AStore.IsAnchor(APath[LI]) then
+      TArrayUtilities.Append<TBytes>(Result, APath[LI]);
 end;
 
 function TCertificateVerifier.VerifyPipeline(const AChain: TArray<TBytes>;
   const AServerName: TServerName; ACheckName: Boolean; const AOcspStaple: TBytes;
   AKeyPurpose: TCertKeyPurpose; out AValidatedChain: TArray<TBytes>;
-  out AAlert: TTlsAlertDescription): Boolean;
+  out ARevocationSettled: Boolean; out AAlert: TTlsAlertDescription): Boolean;
 var
-  LI, LTotal: Int32;
   // the chain PKIX actually validated: when the peer sent an incomplete chain that path
   // building completed from the configured intermediates, this carries the assembled path
   // (with the recovered issuer), so revocation sees it rather than the bare leaf
   LEffectiveChain: TArray<TBytes>;
+  LPresented, LIntermediates, LAnchors: TArray<TBytes>;
   LLeaf: IInspectedCertificate;
+  LWithheld: TArray<TBytes>;
 begin
   Result := False;
   AValidatedChain := nil;
+  ARevocationSettled := False;
   AAlert := TTlsAlertDescription.BadCertificate;
   if System.Length(AChain) = 0 then
     Exit;
-
-  // resource caps before any PKIX work: an over-long chain or oversize certificate is
-  // rejected up front (anti-DoS) rather than handed to the path builder
-  if System.Length(AChain) > FChainLimits.MaxChainLength then
-    Exit;
-  LTotal := 0;
-  for LI := 0 to System.High(AChain) do
+  // no configured anchor set means there is no basis to trust any certificate: surface the
+  // precise alert rather than dereference a nil store (a PSK-only client is refused at Build,
+  // so this is the belt-and-braces backstop)
+  if FTrustStore = nil then
   begin
-    if System.Length(AChain[LI]) > FChainLimits.MaxCertificateLength then
-      Exit;
-    Inc(LTotal, System.Length(AChain[LI]));
-    if LTotal > FChainLimits.MaxTotalChainLength then
-      Exit;
+    AAlert := TTlsAlertDescription.UnknownCa;
+    Exit;
   end;
+  // resource caps before any PKIX work: an over-count, oversize or over-total chain is rejected up
+  // front (anti-DoS) rather than handed to the path builder, which explores presented certificates
+  if not FChainLimits.AdmitsChain(AChain) then
+    Exit;
+
+  // an OS-distrusted certificate is refused outright: a distrusted leaf cannot be rescued by
+  // another path, while a distrusted intermediate is kept out of the pool so a valid alternative
+  // path the peer also sent (a cross-signed twin) still verifies
+  LPresented := AChain;
+  LIntermediates := FIntermediates;
+  LWithheld := nil;
+  if FTrustStore.IsDistrusted(AChain[0]) then
+    Exit;
+  LPresented := WithoutDistrusted(FTrustStore, AChain, 1, LWithheld);
+  LIntermediates := WithoutDistrusted(FTrustStore, FIntermediates, 0, LWithheld);
 
   // path validation (validity + PKIX) is the provider's job; it raises the reason, and hands
   // back the chain it actually validated (the assembled path when it completed an incomplete one)
-  LEffectiveChain := AChain;
+  LEffectiveChain := LPresented;
   try
-    FProvider.PathValidation.ValidateCertificatePath(AChain, FTrustStore.RootCertificates,
-      FIntermediates, ValidationTimeUtc, AKeyPurpose, LEffectiveChain);
+    FPkix.PathValidation.ValidateCertificatePath(LPresented, FTrustStore,
+      LIntermediates, ValidationTimeUtc, AKeyPurpose, LEffectiveChain);
   except
     on E: EFatalAlertTlsLibException do
     begin
       AAlert := E.AlertDescription;
+      // no path is a distrust failure only when the leaf's issuer line ran through a withheld certificate
+      if (System.Length(LWithheld) > 0) and (AAlert = TTlsAlertDescription.UnknownCa) and
+        DistrustDecidedTheFailure(AChain[0], LWithheld, LPresented, LIntermediates) then
+        AAlert := TTlsAlertDescription.BadCertificate;
       Exit;
     end;
   end;
+  // the validated path is re-encoded canonically, so a distrusted certificate sent in another
+  // encoding is caught here rather than by the pre-filter
+  if AnyDistrusted(FTrustStore, LEffectiveChain) then
+  begin
+    AAlert := TTlsAlertDescription.BadCertificate;
+    Exit;
+  end;
 
   // chain-algorithm policy over the validated chain: every non-anchor certificate must be
-  // signed with an advertised scheme (MD5/SHA-1 refused outright) and meet the key-strength
-  // floors. Post-PKIX so it sees the assembled path; the anchor exemption keys off the roots.
-  if FChainPolicyEnabled and
-    (not TChainAlgorithmPolicy.Check(FProvider.Certificates, LEffectiveChain,
-    FTrustStore.RootCertificates, FStrengthPolicy, FAdvertisedSchemes, AAlert)) then
+  // signed with an advertised scheme (MD5 refused outright, SHA-1 unless the policy admits it) and
+  // meet the key-strength floors. Post-PKIX so it sees the assembled path; the anchor exemption keys off the configured
+  // anchors on it. A verifier without an armed policy still gets the weak-hash refusal and
+  // default floors.
+  LAnchors := AnchorsOnPath(FTrustStore, LEffectiveChain);
+  if FChainPolicyEnabled then
+  begin
+    if not TChainAlgorithmPolicy.Check(FPkix.Certificates, LEffectiveChain,
+      LAnchors, FStrengthPolicy, FAdvertisedSchemes, AAlert) then
+      Exit;
+  end
+  else if not TChainAlgorithmPolicy.CheckBaseline(FPkix.Certificates, LEffectiveChain,
+    LAnchors, AAlert) then
+    Exit;
+  if not TEndEntityPolicy.Admits(FPkix.Certificates, LEffectiveChain, LAnchors, AAlert) then
     Exit;
 
   // revocation via the stapled OCSP response (RFC 6960), in-band only; run over the validated
   // chain so a staple can be authenticated against a recovered issuer the peer did not send
-  if not CheckRevocation(LEffectiveChain, AOcspStaple, AAlert) then
+  if not CheckRevocation(LEffectiveChain, AOcspStaple, AKeyPurpose, ARevocationSettled,
+    AAlert) then
     Exit;
 
-  // endpoint identity (RFC 6125) over the leaf's dNSName / iPAddress SANs (server cert only)
+  // endpoint identity (RFC 9525) over the leaf's dNSName / iPAddress SANs (server cert only)
   if ACheckName then
   begin
     // an empty name cannot verify against anything; the factory fails closed before a
@@ -476,7 +676,7 @@ begin
       AAlert := TTlsAlertDescription.BadCertificate;
       Exit;
     end;
-    LLeaf := FProvider.Certificates.Parse(AChain[0]);
+    LLeaf := FPkix.Certificates.Parse(AChain[0]);
     if not TEndpointIdentity.Matches(AServerName, LLeaf.DnsNames, LLeaf.IpAddresses) then
     begin
       AAlert := TTlsAlertDescription.BadCertificate;
@@ -492,120 +692,242 @@ end;
 
 function TCertificateVerifier.VerifyServerCertificate(const AChain: TArray<TBytes>;
   const AServerName: TServerName; const AOcspStaple: TBytes;
-  out AValidatedChain: TArray<TBytes>;
+  out AVerified: TVerifiedChain;
   out AAlert: TTlsAlertDescription): Boolean;
+var
+  LValidated: TArray<TBytes>;
+  LSettled: Boolean;
 begin
   Result := False;
-  AValidatedChain := nil;
+  AVerified := Default(TVerifiedChain);
   AAlert := TTlsAlertDescription.BadCertificate;
   if System.Length(AChain) = 0 then
     Exit;
   // the loud escape hatch: skip the built-in pipeline entirely (tests / pinned dev peers)
   if FDangerous.InsecureSkipVerify then
-    // with no path validation nothing binds AChain[1..] to the leaf, so a pin may only be a
-    // leaf pin here: the validated chain is the leaf alone (never the peer-supplied rest)
-    AValidatedChain := TArray<TBytes>.Create(System.Copy(AChain[0]))
-  else if not VerifyPipeline(AChain, AServerName, FCheckHostName, AOcspStaple,
-    TCertKeyPurpose.ServerAuth, AValidatedChain, AAlert) then
-    Exit;
+  begin
+    // nothing binds the rest of the chain to the leaf, so the path is the leaf alone (a leaf pin only)
+    AVerified.Path := TArray<TBytes>.Create(System.Copy(AChain[0]));
+    AVerified.Outcome := TVerificationOutcome.Unvalidated;
+  end
+  else
+  begin
+    if not VerifyPipeline(AChain, AServerName, FCheckHostName, AOcspStaple,
+      TCertKeyPurpose.ServerAuth, LValidated, LSettled, AAlert) then
+      Exit;
+    AVerified.Path := LValidated;
+    if LSettled then
+      AVerified.Outcome := TVerificationOutcome.RevocationSettledInline;
+  end;
   // the augment-only hook runs last and can only additionally reject; it can never rescue a
   // chain the pipeline (when run) already rejected, since a rejection has returned above
-  if Assigned(FDangerous.VerifyCallback) then
-    if not FDangerous.VerifyCallback(AChain, AServerName.ToString) then
-    begin
-      // a custom augment verifier's rejection is an unspecified acceptability problem, not a
-      // corrupt/bad-signature certificate: certificate_unknown, not bad_certificate (RFC 8446 6.2)
-      AValidatedChain := nil;
-      AAlert := TTlsAlertDescription.CertificateUnknown;
-      Exit;
-    end;
+  if not TVerifyCallbackGate.Admits(FDangerous.VerifyCallback, AChain, AVerified,
+    AServerName.ToString, AAlert) then
+  begin
+    AVerified := Default(TVerifiedChain);
+    Exit;
+  end;
   Result := True;
 end;
 
 function TCertificateVerifier.VerifyClientCertificate(const AChain: TArray<TBytes>;
-  out AValidatedChain: TArray<TBytes>;
+  out AVerified: TVerifiedChain;
   out AAlert: TTlsAlertDescription): Boolean;
+var
+  LValidated: TArray<TBytes>;
+  LSettled: Boolean;
 begin
   Result := False;
-  AValidatedChain := nil;
+  AVerified := Default(TVerifiedChain);
   AAlert := TTlsAlertDescription.BadCertificate;
   if System.Length(AChain) = 0 then
     Exit;
   // a client certificate carries no host identity and is never stapled: verify the chain
   // for the clientAuth role, with no endpoint-identity match and no OCSP staple
   if FDangerous.InsecureSkipVerify then
-    AValidatedChain := TArray<TBytes>.Create(System.Copy(AChain[0]))
-  else if not VerifyPipeline(AChain, Default(TServerName), False, nil,
-    TCertKeyPurpose.ClientAuth, AValidatedChain, AAlert) then
-    Exit;
-  if Assigned(FDangerous.VerifyCallback) then
-    if not FDangerous.VerifyCallback(AChain, '') then
-    begin
-      AValidatedChain := nil;
-      AAlert := TTlsAlertDescription.CertificateUnknown;
+  begin
+    AVerified.Path := TArray<TBytes>.Create(System.Copy(AChain[0]));
+    AVerified.Outcome := TVerificationOutcome.Unvalidated;
+  end
+  else
+  begin
+    if not VerifyPipeline(AChain, Default(TServerName), False, nil,
+      TCertKeyPurpose.ClientAuth, LValidated, LSettled, AAlert) then
       Exit;
-    end;
+    AVerified.Path := LValidated;
+    if LSettled then
+      AVerified.Outcome := TVerificationOutcome.RevocationSettledInline;
+  end;
+  if not TVerifyCallbackGate.Admits(FDangerous.VerifyCallback, AChain, AVerified, '',
+    AAlert) then
+  begin
+    AVerified := Default(TVerifiedChain);
+    Exit;
+  end;
   Result := True;
 end;
 
-{ TPinningVerifier }
+type
+  // shared by both pinning decorators
+  TSpkiPins = class sealed(TObject)
+  public
+    class function Match(const ACrypto: ICryptoProvider; const APkix: IPkixProvider;
+      const AChain, APins: TArray<TBytes>): Boolean; static;
+  end;
 
-constructor TPinningVerifier.Create(const AInner: IServerCertificateVerifier;
-  const APins: TArray<TBytes>; const AProvider: ICryptoProvider);
-begin
-  inherited Create;
-  FInner := AInner;
-  FPins := APins;
-  FProvider := AProvider;
-end;
+{ TSpkiPins }
 
-function TPinningVerifier.PinsMatch(const AChain: TArray<TBytes>): Boolean;
+class function TSpkiPins.Match(const ACrypto: ICryptoProvider; const APkix: IPkixProvider;
+  const AChain, APins: TArray<TBytes>): Boolean;
 var
   LHash: IHash;
   LSpki, LDigest: TBytes;
   LI, LJ: Int32;
 begin
-  Result := True;
-  if System.Length(FPins) = 0 then
-    Exit;
   // some certificate on the validated path must carry a pinned public key (SPKI-SHA256)
   for LI := 0 to System.High(AChain) do
   begin
     try
-      LSpki := FProvider.Certificates.PublicKeyInfo(AChain[LI]);
+      LSpki := APkix.Certificates.PublicKeyInfo(AChain[LI]);
     except
       // defensive: a parse/encode failure yields no SPKI, so the cert cannot match a pin - it
       // must never turn a pin decision into a raised internal_error
       on Exception do
         Continue;
     end;
-    LHash := FProvider.Primitives.CreateHash(THashAlgorithm.SHA_256);
+    LHash := ACrypto.Primitives.CreateHash(THashAlgorithm.SHA_256);
     LHash.Update(LSpki, 0, System.Length(LSpki));
     LDigest := LHash.DoFinal;
-    for LJ := 0 to System.High(FPins) do
-      if TArrayUtilities.AreEqual(LDigest, FPins[LJ]) then
-        Exit;
+    for LJ := 0 to System.High(APins) do
+      if TArrayUtilities.AreEqual(LDigest, APins[LJ]) then
+        Exit(True);
   end;
   Result := False;
 end;
 
+{ TPinningVerifier }
+
+constructor TPinningVerifier.Create(const AInner: IServerCertificateVerifier;
+  const APins: TArray<TBytes>; const ACryptoProvider: ICryptoProvider;
+  const APkixProvider: IPkixProvider);
+begin
+  inherited Create;
+  if (AInner = nil) or (ACryptoProvider = nil) or (APkixProvider = nil) then
+    raise EArgumentTlsLibException.CreateRes(@SNilPinningInput);
+  if System.Length(APins) = 0 then
+    raise EArgumentTlsLibException.CreateRes(@SEmptyPins);
+  FInner := AInner;
+  FPins := APins;
+  FCrypto := ACryptoProvider;
+  FPkix := APkixProvider;
+end;
+
 function TPinningVerifier.VerifyServerCertificate(const AChain: TArray<TBytes>;
   const AServerName: TServerName; const AOcspStaple: TBytes;
-  out AValidatedChain: TArray<TBytes>;
+  out AVerified: TVerifiedChain;
   out AAlert: TTlsAlertDescription): Boolean;
 begin
   // pinning augments the inner verdict; it can only additionally reject. It matches the pin
-  // against the chain the inner verifier actually validated (RFC 7469 6), never the presented
+  // against the chain the inner verifier actually validated (RFC 7469 2.6), never the presented
   // certificates, so an attacker cannot append a pinned leaf to a chain that validated by
   // another path.
   Result := FInner.VerifyServerCertificate(AChain, AServerName, AOcspStaple,
-    AValidatedChain, AAlert);
+    AVerified, AAlert);
   if not Result then
     Exit;
-  if not PinsMatch(AValidatedChain) then
+  if not TSpkiPins.Match(FCrypto, FPkix, AVerified.Path, FPins) then
   begin
-    AValidatedChain := nil;
+    AVerified := Default(TVerifiedChain);
     AAlert := TTlsAlertDescription.BadCertificate;
+    Result := False;
+  end;
+end;
+
+{ TClientPinningVerifier }
+
+constructor TClientPinningVerifier.Create(const AInner: IClientCertificateVerifier;
+  const APins: TArray<TBytes>; const ACryptoProvider: ICryptoProvider;
+  const APkixProvider: IPkixProvider);
+begin
+  inherited Create;
+  if (AInner = nil) or (ACryptoProvider = nil) or (APkixProvider = nil) then
+    raise EArgumentTlsLibException.CreateRes(@SNilPinningInput);
+  if System.Length(APins) = 0 then
+    raise EArgumentTlsLibException.CreateRes(@SEmptyPins);
+  FInner := AInner;
+  FPins := APins;
+  FCrypto := ACryptoProvider;
+  FPkix := APkixProvider;
+end;
+
+function TClientPinningVerifier.VerifyClientCertificate(const AChain: TArray<TBytes>;
+  out AVerified: TVerifiedChain;
+  out AAlert: TTlsAlertDescription): Boolean;
+begin
+  // the server-side pin check mirrors the client's: it matches the pin against the chain the
+  // inner verifier actually validated (RFC 7469 2.6), never the presented certificates
+  Result := FInner.VerifyClientCertificate(AChain, AVerified, AAlert);
+  if not Result then
+    Exit;
+  if not TSpkiPins.Match(FCrypto, FPkix, AVerified.Path, FPins) then
+  begin
+    AVerified := Default(TVerifiedChain);
+    AAlert := TTlsAlertDescription.BadCertificate;
+    Result := False;
+  end;
+end;
+
+{ TVerifyCallbackVerifier }
+
+constructor TVerifyCallbackVerifier.Create(const AInner: IServerCertificateVerifier;
+  const ACallback: TTlsCertificateVerifyCallback);
+begin
+  inherited Create;
+  if (AInner = nil) or not Assigned(ACallback) then
+    raise EArgumentTlsLibException.CreateRes(@SNilCallbackInput);
+  FInner := AInner;
+  FCallback := ACallback;
+end;
+
+function TVerifyCallbackVerifier.VerifyServerCertificate(const AChain: TArray<TBytes>;
+  const AServerName: TServerName; const AOcspStaple: TBytes;
+  out AVerified: TVerifiedChain;
+  out AAlert: TTlsAlertDescription): Boolean;
+begin
+  Result := FInner.VerifyServerCertificate(AChain, AServerName, AOcspStaple,
+    AVerified, AAlert);
+  if not Result then
+    Exit;
+  if not TVerifyCallbackGate.Admits(FCallback, AChain, AVerified, AServerName.ToString,
+    AAlert) then
+  begin
+    AVerified := Default(TVerifiedChain);
+    Result := False;
+  end;
+end;
+
+{ TClientVerifyCallbackVerifier }
+
+constructor TClientVerifyCallbackVerifier.Create(const AInner: IClientCertificateVerifier;
+  const ACallback: TTlsCertificateVerifyCallback);
+begin
+  inherited Create;
+  if (AInner = nil) or not Assigned(ACallback) then
+    raise EArgumentTlsLibException.CreateRes(@SNilCallbackInput);
+  FInner := AInner;
+  FCallback := ACallback;
+end;
+
+function TClientVerifyCallbackVerifier.VerifyClientCertificate(const AChain: TArray<TBytes>;
+  out AVerified: TVerifiedChain;
+  out AAlert: TTlsAlertDescription): Boolean;
+begin
+  Result := FInner.VerifyClientCertificate(AChain, AVerified, AAlert);
+  if not Result then
+    Exit;
+  if not TVerifyCallbackGate.Admits(FCallback, AChain, AVerified, '', AAlert) then
+  begin
+    AVerified := Default(TVerifiedChain);
     Result := False;
   end;
 end;

@@ -24,103 +24,69 @@ uses
 {$ELSE}
   Androidapi.Jni,
 {$ENDIF}
-  TlpICryptoProvider,
-  TlpICertificateTrust,
-  TlpICertificateVerifierSource,
-  TlpCertificateVerifier,
-  TlpCertificateStrengthPolicy,
-  TlpChainAlgorithmPolicy,
+  TlpArrayUtilities,
   TlpTrustPolicy,
-  TlpIClock,
-  TlpEndpointIdentity,
-  TlpServerName,
-  TlpPosixDynLib,
+  TlpDynamicLibrary,
+  TlpSystemTrustBase,
+  TlpIPlatformChainEngine,
   TlpTlsAlert;
 
 type
-  /// <summary>
-  /// Delegates chain trust to the platform's Java engine over JNI - roots, revocation,
-  /// network-security-config (per-domain trust, user-CA opt-in, pinning) - via
-  /// android.net.http.X509TrustManagerExtensions.checkServerTrusted. The platform TrustManager
-  /// does not consult a stapled OCSP response, so a revocation post-check over the injected
-  /// provider and clock decides the staple (a definitive Revoked always rejects; an indeterminate
-  /// outcome rejects only under a Hard posture) - run before the RFC 6125 hostname identity so a
-  /// revoked certificate is not masked by a name mismatch. Hostname identity is enforced
-  /// in-library because checkServerTrusted validates the chain but NOT the host (Android splits
-  /// TrustManager from HostnameVerifier). Construction is init-independent; the JVM is acquired
-  /// lazily inside Verify (Delphi resolves it automatically, FPC needs TlsLibAndroidInitTrust).
-  /// Fail-closed.
-  /// </summary>
-  TAndroidDelegateVerifier = class sealed(TInterfacedObject, IServerCertificateVerifier)
-  strict private
-    FProvider: ICryptoProvider;
-    FPosture: TRevocationPosture;
-    FClock: ITlsClock;
-    FStrengthPolicy: TCertificateStrengthPolicy;
-    FAdvertised: TArray<UInt16>;
+  /// <summary>What a Java trust-manager rejection exposes: whether it is a CertificateException, a
+  /// time-validity one, and whether its cause is a CertPathValidatorException with that cause's path
+  /// index and message; and whether a network-security-config domain-config governs the host.</summary>
+  TJavaTrustFacts = record
+    CertificateException: Boolean;
+    TimeInvalid: Boolean;
+    PathValidatorCause: Boolean;
+    CauseIndex: Int32;
+    CauseMessage: string;
+    DomainScoped: Boolean;
+  end;
+
+  /// <summary>Classifies a Java trust-manager rejection from its facts. Only a CertificateException
+  /// is a peer trust failure (anything else is an internal error); it is NoTrustAnchor only when its
+  /// cause is a path-validation failure at index -1 whose message names the missing trust anchor
+  /// and no domain-config governs the host (that config alone decides, so a missing anchor there is
+  /// final), and every other shape (pin, expiry, revocation, unrecognised) is Other.</summary>
+  TJavaTrustClassifier = class sealed(TObject)
   public
-    constructor Create(const AProvider: ICryptoProvider;
-      APosture: TRevocationPosture; const AClock: ITlsClock;
-      const AStrengthPolicy: TCertificateStrengthPolicy;
-      const AAdvertised: TArray<UInt16>);
-    function VerifyServerCertificate(const AChain: TArray<TBytes>;
-      const AServerName: TServerName; const AOcspStaple: TBytes;
-      out AValidatedChain: TArray<TBytes>;
-      out AAlert: TTlsAlertDescription): Boolean;
+    class procedure Classify(const AFacts: TJavaTrustFacts; out AAlert: TTlsAlertDescription;
+      out AFailure: TPlatformChainFailure); static;
   end;
 
   /// <summary>
-  /// The Android server-certificate verifier source: builds a delegate from the connection's
-  /// trust context, so the provider, revocation posture and clock (the staple post-check) are
-  /// injected the same way the built-in verifier receives them.
+  /// The Android platform chain engine behind the OS trust delegate: builds and trusts a
+  /// certificate path with the platform's Java engine over JNI - the system trust store and its
+  /// network-security-config (per-domain trust, user-CA opt-in, pinning) for a server certificate
+  /// via android.net.http.X509TrustManagerExtensions.checkServerTrusted (or, given anchors, an
+  /// exclusive KeyStore of them that the network-security-config does not govern; the delegate
+  /// offers host roots that way only for hosts no network-security-config domain-config names), an
+  /// exclusive KeyStore of the configured client-CA anchors for a client certificate via
+  /// checkClientTrusted (never the OS or public-web-PKI roots). The platform TrustManager owns
+  /// revocation and exposes no cached outcome and no network-revocation knob, so the engine renders
+  /// an indeterminate revocation outcome and matches no host - posture, the strength policy, the
+  /// staple decision and the RFC 9525 identity belong to the delegate that owns it. The server host
+  /// is passed as the network-security-config domain key (a null host throws once a per-domain
+  /// config exists), never a name check. The platform validates at device time: the request's clock
+  /// is not used. Construction is init-independent; the JVM is acquired lazily inside the
+  /// evaluation (Delphi resolves it automatically, FPC needs TlsLibAndroidInitTrust). Stateless and
+  /// thread-reusable. Fail-closed.
   /// </summary>
-  TAndroidServerVerifierSource = class sealed(TInterfacedObject,
-    IServerCertificateVerifierSource)
+  TAndroidChainEngine = class sealed(TInterfacedObject, IPlatformChainEngine)
   public
-    function CreateServerVerifier(const AContext: TServerTrustContext)
-      : IServerCertificateVerifier;
-  end;
-
-  /// <summary>
-  /// Verifies a peer CLIENT certificate (mTLS) via the platform's Java engine, restricted to an
-  /// exclusive trust root built from the configured client-CA anchors alone - a KeyStore holding
-  /// only those anchors, never the OS or public-web-PKI roots. Applies the platform's client-auth
-  /// chain check (checkClientTrusted); a client certificate is not stapled. Fail-closed.
-  /// </summary>
-  TAndroidClientDelegateVerifier = class sealed(TInterfacedObject,
-    IClientCertificateVerifier)
-  strict private
-    FProvider: ICryptoProvider;
-    FAnchors: TArray<TBytes>;
-    FStrengthPolicy: TCertificateStrengthPolicy;
-    FAdvertised: TArray<UInt16>;
-  public
-    constructor Create(const AProvider: ICryptoProvider;
-      const AAnchors: TArray<TBytes>;
-      const AStrengthPolicy: TCertificateStrengthPolicy;
-      const AAdvertised: TArray<UInt16>);
-    function VerifyClientCertificate(const AChain: TArray<TBytes>;
-      out AValidatedChain: TArray<TBytes>;
-      out AAlert: TTlsAlertDescription): Boolean;
-  end;
-
-  /// <summary>
-  /// The Android client-certificate verifier source: builds a client delegate over the client-CA
-  /// anchors in the context (the exclusive trust root).
-  /// </summary>
-  TAndroidClientVerifierSource = class sealed(TInterfacedObject,
-    IClientCertificateVerifierSource)
-  public
-    function CreateClientVerifier(const AContext: TClientTrustContext)
-      : IClientCertificateVerifier;
+    function Capabilities: TPlatformChainCapabilities;
+    function EvaluateServer(const ARequest: TPlatformChainRequest;
+      out AResult: TPlatformChainResult; out AAlert: TTlsAlertDescription): Boolean;
+    function EvaluateClient(const ARequest: TPlatformChainRequest;
+      out AResult: TPlatformChainResult; out AAlert: TTlsAlertDescription): Boolean;
   end;
 
 /// <summary>
 /// Hands the library the running JavaVM, which lets Verify attach arbitrary (non-Java)
 /// handshake threads. Idempotent - the first non-nil call wins. On Delphi it is called
-/// automatically from this unit's initialization with System.JavaMachine (the RTL has set
-/// it by then), so a NativeActivity app needs nothing. On FPC it is REQUIRED (no RTL handle
-/// to auto-resolve): call it once with the JavaVM from your JNI_OnLoad, or Verify fails closed.
+/// automatically, so a NativeActivity app needs nothing. On FPC it is REQUIRED: call it once
+/// with the JavaVM from your JNI_OnLoad, or Verify fails closed.
 /// </summary>
 procedure TlsLibAndroidInitTrust(AJavaVM: Pointer);
 
@@ -198,7 +164,20 @@ type
     /// alias), the exclusive private trust root for client-auth. Nil on any failure.</summary>
     class function BuildAnchorKeyStore(AEnv: PJNIEnv;
       AAnchorArr: TJObjectArray): TJObject; static;
-    class function MapPendingException(AEnv: PJNIEnv): TTlsAlertDescription; static;
+    class function IsInstanceOfNamed(AEnv: PJNIEnv; AObj: TJObject;
+      const AClassName: PAnsiChar): Boolean; static;
+    /// <summary>True when the exception or one of its bounded causes is an expired or
+    /// not-yet-valid certificate; any lookup failure answers False.</summary>
+    class function HasTimeInvalidInChain(AEnv: PJNIEnv; AExc: TJThrowable): Boolean; static;
+    /// <summary>The facts of a trust-manager exception that the classifier decides on; a lookup
+    /// that fails leaves its fact unset, so the rejection classifies as Other.</summary>
+    class function ReadExceptionFacts(AEnv: PJNIEnv; AExc: TJThrowable)
+      : TJavaTrustFacts; static;
+    /// <summary>Takes and clears the pending exception and classifies it. Given the extensions
+    /// object and host (the pass over the system roots), a missing trust anchor is first checked
+    /// against the network-security-config: a host a domain-config names is scoped to it.</summary>
+    class function MapPendingException(AEnv: PJNIEnv; AExtObj, AHostStr: TJObject;
+      const AHostName: string; out AFailure: TPlatformChainFailure): TTlsAlertDescription; static;
     /// <summary>Reads the DER of a validated java.util.List&lt;X509Certificate&gt; (leaf first,
     /// anchor last) into APath. False on a nil list, a pending exception or an unreadable
     /// element, so the caller fails closed.</summary>
@@ -210,18 +189,14 @@ type
     class procedure Capture(AJavaVM: Pointer); static;
     /// <summary>Runs the platform CHAIN trust decision for the peer chain with no network fetch
     /// of our own (hostname identity is enforced by the caller), returning the validated path the
-    /// platform built (leaf first, anchor last) in AOsPath. Returns True when the OS trusts the
-    /// chain; on rejection or any failure returns False with AAlert set to the matching fatal
-    /// alert.</summary>
-    class function Evaluate(const AChain: TArray<TBytes>; const AHostName: string;
-      out AOsPath: TArray<TBytes>; out AAlert: TTlsAlertDescription): Boolean; static;
-    /// <summary>Runs the chain-algorithm/key-strength policy over AChain with ARoots exempt (the
-    /// OS-built path with its anchor for the server; the presented chain with the configured
-    /// anchors for the client). A nil provider or empty chain is internal_error.</summary>
-    class function ApplyStrengthPolicy(const AChain, ARoots: TArray<TBytes>;
-      const AProvider: ICryptoProvider;
-      const APolicy: TCertificateStrengthPolicy; const AAdvertised: TArray<UInt16>;
-      out AAlert: TTlsAlertDescription): Boolean; static;
+    /// platform built (leaf first, anchor last) in AOsPath. Non-empty AAnchors select an exclusive
+    /// KeyStore root in place of the system roots and their network-security-config. Returns True
+    /// when the OS trusts the chain; on rejection or any failure returns False with AAlert set to
+    /// the matching fatal alert and AFailure to its class. AHostRoots (host roots will follow a
+    /// missing anchor) enables the network-security-config domain probe.</summary>
+    class function Evaluate(const AChain, AAnchors: TArray<TBytes>; const AHostName: string;
+      AHostRoots: Boolean; out AOsPath: TArray<TBytes>; out AAlert: TTlsAlertDescription;
+      out AFailure: TPlatformChainFailure): Boolean; static;
     /// <summary>Runs the platform client-auth trust decision for the peer CLIENT chain against a
     /// KeyStore of the configured client-CA anchors alone (checkClientTrusted) - never the system
     /// roots. Zero anchors reject before the engine. Returns True when trusted; on rejection or
@@ -229,6 +204,28 @@ type
     class function EvaluateClient(const AChain, AAnchors: TArray<TBytes>;
       out AAlert: TTlsAlertDescription): Boolean; static;
   end;
+
+{ TJavaTrustClassifier }
+
+class procedure TJavaTrustClassifier.Classify(const AFacts: TJavaTrustFacts;
+  out AAlert: TTlsAlertDescription; out AFailure: TPlatformChainFailure);
+begin
+  AFailure := TPlatformChainFailure.Other;
+  if not AFacts.CertificateException then
+  begin
+    AAlert := TTlsAlertDescription.InternalError;
+    Exit;
+  end;
+  if AFacts.TimeInvalid then
+  begin
+    AAlert := TTlsAlertDescription.CertificateExpired;
+    Exit;
+  end;
+  AAlert := TTlsAlertDescription.UnknownCa;
+  if AFacts.PathValidatorCause and (AFacts.CauseIndex = -1) and
+    (Pos('trust anchor', LowerCase(AFacts.CauseMessage)) > 0) and (not AFacts.DomainScoped) then
+    AFailure := TPlatformChainFailure.NoTrustAnchor;
+end;
 
 { TAndroidTrustApi }
 
@@ -241,15 +238,15 @@ end;
 class procedure TAndroidTrustApi.ResolveDynamicImports;
 begin
   // liblog exports __android_log_write; an absent library or symbol leaves FLogWrite nil
-  FLogLibHandle := TPosixDynLib.Open(ANDROID_LOG_LIB);
+  FLogLibHandle := TDynamicLibrary.Open(ANDROID_LOG_LIB);
   FLogWrite := TAndroidLogWriteFunc(
-    TPosixDynLib.Resolve(FLogLibHandle, '__android_log_write'));
+    TDynamicLibrary.Resolve(FLogLibHandle, '__android_log_write'));
 end;
 
 class procedure TAndroidTrustApi.ReleaseDynamicImports;
 begin
   FLogWrite := nil;
-  TPosixDynLib.Close(FLogLibHandle);
+  TDynamicLibrary.Close(FLogLibHandle);
   FLogLibHandle := 0;
 end;
 
@@ -341,7 +338,10 @@ begin
     '(Ljava/io/InputStream;)Ljava/security/cert/Certificate;');
   LBaisCtor := AEnv^^.GetMethodID(AEnv, LBaisClass, '<init>', '([B)V');
   if (LGetInstance = nil) or (LGenerate = nil) or (LBaisCtor = nil) then
+  begin
+    ClearPending(AEnv);
     Exit;
+  end;
 
   LTypeStr := AEnv^^.NewStringUTF(AEnv, 'X.509');
   LArgs[0].l := LTypeStr;
@@ -421,7 +421,10 @@ begin
   LGetPubKey := AEnv^^.GetMethodID(AEnv, LX509Class, 'getPublicKey',
     '()Ljava/security/PublicKey;');
   if LGetPubKey = nil then
+  begin
+    ClearPending(AEnv);
     Exit;
+  end;
   LPubKey := AEnv^^.CallObjectMethodA(AEnv, ALeaf, LGetPubKey, nil);
   if (LPubKey = nil) or (AEnv^^.ExceptionCheck(AEnv) <> 0) then
   begin
@@ -438,7 +441,10 @@ begin
   LGetAlg := AEnv^^.GetMethodID(AEnv, LKeyClass, 'getAlgorithm',
     '()Ljava/lang/String;');
   if LGetAlg = nil then
+  begin
+    ClearPending(AEnv);
     Exit;
+  end;
   LAlgStr := AEnv^^.CallObjectMethodA(AEnv, LPubKey, LGetAlg, nil);
   if (LAlgStr = nil) or (AEnv^^.ExceptionCheck(AEnv) <> 0) then
   begin
@@ -488,7 +494,10 @@ begin
     '()[Ljavax/net/ssl/TrustManager;');
   if (LGetDefAlg = nil) or (LGetInstance = nil) or (LInit = nil) or
     (LGetTms = nil) then
+  begin
+    ClearPending(AEnv);
     Exit;
+  end;
 
   LAlgStr := AEnv^^.CallStaticObjectMethodA(AEnv, LTmfClass, LGetDefAlg, nil);
   if (LAlgStr = nil) or (AEnv^^.ExceptionCheck(AEnv) <> 0) then
@@ -534,34 +543,186 @@ begin
   end;
 end;
 
-class function TAndroidTrustApi.MapPendingException(AEnv: PJNIEnv)
-  : TTlsAlertDescription;
+class function TAndroidTrustApi.IsInstanceOfNamed(AEnv: PJNIEnv; AObj: TJObject;
+  const AClassName: PAnsiChar): Boolean;
 var
-  LExc: TJThrowable;
   LClass: TJClass;
 begin
-  // A pending exception aborts the next JNI call, so capture then clear immediately.
-  Result := TTlsAlertDescription.UnknownCa;
-  LExc := AEnv^^.ExceptionOccurred(AEnv);
-  AEnv^^.ExceptionClear(AEnv);
-  if LExc = nil then
-    Exit;
-
-  // Refine only the two cheaply inspectable cases; every other reason (and the common
-  // CertificateException wrapper) stays unknown_ca - a rejection is never softened.
-  LClass := AEnv^^.FindClass(AEnv,
-    'java/security/cert/CertificateExpiredException');
-  if (LClass <> nil) and (AEnv^^.IsInstanceOf(AEnv, LExc, LClass) <> 0) then
+  LClass := AEnv^^.FindClass(AEnv, AClassName);
+  if LClass = nil then
   begin
-    Result := TTlsAlertDescription.CertificateExpired;
+    ClearPending(AEnv);
+    Exit(False);
+  end;
+  Result := AEnv^^.IsInstanceOf(AEnv, AObj, LClass) <> 0;
+end;
+
+class function TAndroidTrustApi.HasTimeInvalidInChain(AEnv: PJNIEnv;
+  AExc: TJThrowable): Boolean;
+const
+  MAX_CAUSE_DEPTH = 4;
+var
+  LThrowableClass: TJClass;
+  LGetCause: TJMethodID;
+  LCur: TJObject;
+  LDepth: Integer;
+begin
+  Result := False;
+  LThrowableClass := AEnv^^.FindClass(AEnv, 'java/lang/Throwable');
+  if LThrowableClass = nil then
+  begin
+    ClearPending(AEnv);
+    Exit;
+  end;
+  LGetCause := AEnv^^.GetMethodID(AEnv, LThrowableClass, 'getCause',
+    '()Ljava/lang/Throwable;');
+  if LGetCause = nil then
+  begin
+    ClearPending(AEnv);
+    Exit;
+  end;
+  LCur := AExc;
+  for LDepth := 0 to MAX_CAUSE_DEPTH do
+  begin
+    if IsInstanceOfNamed(AEnv, LCur, 'java/security/cert/CertificateExpiredException') or
+      IsInstanceOfNamed(AEnv, LCur, 'java/security/cert/CertificateNotYetValidException') then
+      Exit(True);
+    LCur := AEnv^^.CallObjectMethodA(AEnv, LCur, LGetCause, nil);
+    if (LCur = nil) or (AEnv^^.ExceptionCheck(AEnv) <> 0) then
+    begin
+      ClearPending(AEnv);
+      Exit;
+    end;
+  end;
+end;
+
+class function TAndroidTrustApi.ReadExceptionFacts(AEnv: PJNIEnv;
+  AExc: TJThrowable): TJavaTrustFacts;
+var
+  LThrowableClass, LCpvClass: TJClass;
+  LGetCause, LGetMessage, LGetIndex: TJMethodID;
+  LCause, LMessage: TJObject;
+  LChars: PAnsiChar;
+begin
+  Result := Default(TJavaTrustFacts);
+  if AExc = nil then
+    Exit;
+  Result.CertificateException := IsInstanceOfNamed(AEnv, AExc,
+    'java/security/cert/CertificateException');
+  if not Result.CertificateException then
+    Exit;
+  Result.TimeInvalid := HasTimeInvalidInChain(AEnv, AExc);
+
+  LThrowableClass := AEnv^^.FindClass(AEnv, 'java/lang/Throwable');
+  LCpvClass := AEnv^^.FindClass(AEnv, 'java/security/cert/CertPathValidatorException');
+  if (LThrowableClass = nil) or (LCpvClass = nil) then
+  begin
+    ClearPending(AEnv);
+    Exit;
+  end;
+  LGetCause := AEnv^^.GetMethodID(AEnv, LThrowableClass, 'getCause',
+    '()Ljava/lang/Throwable;');
+  LGetMessage := AEnv^^.GetMethodID(AEnv, LThrowableClass, 'getMessage',
+    '()Ljava/lang/String;');
+  LGetIndex := AEnv^^.GetMethodID(AEnv, LCpvClass, 'getIndex', '()I');
+  if (LGetCause = nil) or (LGetMessage = nil) or (LGetIndex = nil) then
+  begin
     ClearPending(AEnv);
     Exit;
   end;
 
-  LClass := AEnv^^.FindClass(AEnv,
-    'java/security/cert/CertificateNotYetValidException');
-  if (LClass <> nil) and (AEnv^^.IsInstanceOf(AEnv, LExc, LClass) <> 0) then
-    Result := TTlsAlertDescription.CertificateExpired;
+  LCause := AEnv^^.CallObjectMethodA(AEnv, AExc, LGetCause, nil);
+  if (LCause = nil) or (AEnv^^.ExceptionCheck(AEnv) <> 0) or
+    (AEnv^^.IsInstanceOf(AEnv, LCause, LCpvClass) = 0) then
+  begin
+    ClearPending(AEnv);
+    Exit;
+  end;
+  Result.CauseIndex := AEnv^^.CallIntMethodA(AEnv, LCause, LGetIndex, nil);
+  if AEnv^^.ExceptionCheck(AEnv) <> 0 then
+  begin
+    ClearPending(AEnv);
+    Result.CauseIndex := 0;
+    Exit;
+  end;
+  Result.PathValidatorCause := True;
+  LMessage := AEnv^^.CallObjectMethodA(AEnv, LCause, LGetMessage, nil);
+  if AEnv^^.ExceptionCheck(AEnv) <> 0 then
+  begin
+    ClearPending(AEnv);
+    Exit;
+  end;
+  if LMessage = nil then
+    Exit;
+  LChars := AEnv^^.GetStringUTFChars(AEnv, LMessage, nil);
+  if LChars = nil then
+  begin
+    ClearPending(AEnv);
+    Exit;
+  end;
+  try
+    Result.CauseMessage := string(AnsiString(LChars));
+  finally
+    AEnv^^.ReleaseStringUTFChars(AEnv, LMessage, LChars);
+  end;
+end;
+
+class function TAndroidTrustApi.MapPendingException(AEnv: PJNIEnv; AExtObj, AHostStr: TJObject;
+  const AHostName: string; out AFailure: TPlatformChainFailure): TTlsAlertDescription;
+var
+  LExc: TJThrowable;
+  LFacts: TJavaTrustFacts;
+  LExtClass: TJClass;
+  LSameConfig: TJMethodID;
+  LEmptyStr: TJString;
+  LThrew: Boolean;
+  LArgs: array [0 .. 1] of TJValue;
+begin
+  LThrew := False;
+  // A pending exception aborts the next JNI call, so capture then clear immediately.
+  LExc := AEnv^^.ExceptionOccurred(AEnv);
+  AEnv^^.ExceptionClear(AEnv);
+  LFacts := ReadExceptionFacts(AEnv, LExc);
+  TJavaTrustClassifier.Classify(LFacts, Result, AFailure);
+  // a throw or false stays scoped; a missing method is API 23, which has no NSC
+  if (AFailure = TPlatformChainFailure.NoTrustAnchor) and (AExtObj <> nil) and
+    (AHostStr <> nil) then
+  begin
+    LFacts.DomainScoped := True;
+    LExtClass := AEnv^^.FindClass(AEnv, 'android/net/http/X509TrustManagerExtensions');
+    LSameConfig := nil;
+    if LExtClass <> nil then
+      LSameConfig := AEnv^^.GetMethodID(AEnv, LExtClass, 'isSameTrustConfiguration',
+        '(Ljava/lang/String;Ljava/lang/String;)Z');
+    if LSameConfig = nil then
+    begin
+      ClearPending(AEnv);
+      LFacts.DomainScoped := False;
+    end
+    else
+    begin
+      LEmptyStr := AEnv^^.NewStringUTF(AEnv, '');
+      if LEmptyStr <> nil then
+      begin
+        LArgs[0].l := AHostStr;
+        LArgs[1].l := LEmptyStr;
+        LFacts.DomainScoped := AEnv^^.CallBooleanMethodA(AEnv, AExtObj, LSameConfig,
+          @LArgs[0]) = 0;
+      end;
+      LThrew := AEnv^^.ExceptionCheck(AEnv) <> 0;
+      if LThrew then
+        LFacts.DomainScoped := True;
+    end;
+    if LFacts.DomainScoped then
+    begin
+      if LThrew then
+        LogError('host roots not applied to ' + AHostName + ': the NSC domain probe threw')
+      else
+        LogError('host roots do not apply to ' + AHostName + ': a network-security-config ' +
+          'domain entry governs it; add the root to that domain''s trust-anchors');
+      TJavaTrustClassifier.Classify(LFacts, Result, AFailure);
+    end;
+  end;
   ClearPending(AEnv);
 end;
 
@@ -590,7 +751,10 @@ begin
   LGet := AEnv^^.GetMethodID(AEnv, LListClass, 'get', '(I)Ljava/lang/Object;');
   LGetEncoded := AEnv^^.GetMethodID(AEnv, LX509Class, 'getEncoded', '()[B');
   if (LSize = nil) or (LGet = nil) or (LGetEncoded = nil) then
+  begin
+    ClearPending(AEnv);
     Exit;
+  end;
   LCount := AEnv^^.CallIntMethodA(AEnv, AList, LSize, nil);
   if LCount <= 0 then
     Exit;
@@ -627,31 +791,17 @@ begin
   Result := True;
 end;
 
-class function TAndroidTrustApi.ApplyStrengthPolicy(const AChain,
-  ARoots: TArray<TBytes>; const AProvider: ICryptoProvider;
-  const APolicy: TCertificateStrengthPolicy; const AAdvertised: TArray<UInt16>;
-  out AAlert: TTlsAlertDescription): Boolean;
-begin
-  Result := False;
-  if (AProvider = nil) or (Length(AChain) = 0) then
-  begin
-    AAlert := TTlsAlertDescription.InternalError;
-    Exit;
-  end;
-  Result := TChainAlgorithmPolicy.Check(AProvider.Certificates, AChain, ARoots,
-    APolicy, AAdvertised, AAlert);
-end;
-
-class function TAndroidTrustApi.Evaluate(const AChain: TArray<TBytes>;
-  const AHostName: string; out AOsPath: TArray<TBytes>;
-  out AAlert: TTlsAlertDescription): Boolean;
+class function TAndroidTrustApi.Evaluate(const AChain, AAnchors: TArray<TBytes>;
+  const AHostName: string; AHostRoots: Boolean; out AOsPath: TArray<TBytes>;
+  out AAlert: TTlsAlertDescription; out AFailure: TPlatformChainFailure): Boolean;
 var
   LVm: PJavaVM;
   LEnv: PJNIEnv;
   LAttached: Boolean;
   LExtClass: TJClass;
   LExtCtor, LCheck: TJMethodID;
-  LX509Tm, LExtObj, LChainArr, LLeaf, LAuthStr, LHostStr, LList: TJObject;
+  LX509Tm, LExtObj, LKeyStore, LLeaf, LAuthStr, LHostStr, LList: TJObject;
+  LChainArr, LAnchorArr: TJObjectArray;
   LAuthUtf8, LHostUtf8: UTF8String;
   LBuildAlert: TTlsAlertDescription;
   LOneArg: array [0 .. 0] of TJValue;
@@ -660,6 +810,7 @@ begin
   Result := False;
   AOsPath := nil;
   AAlert := TTlsAlertDescription.InternalError;
+  AFailure := TPlatformChainFailure.None;
 
   if Length(AChain) = 0 then
   begin
@@ -681,7 +832,7 @@ begin
   end;
   try
     // one frame reclaims the chain build, trust call and returned-list refs
-    if LEnv^^.PushLocalFrame(LEnv, 32 + Length(AChain) * 4) <> 0 then
+    if LEnv^^.PushLocalFrame(LEnv, 48 + (Length(AChain) + Length(AAnchors)) * 4) <> 0 then
     begin
       ClearPending(LEnv);
       Exit;
@@ -698,7 +849,19 @@ begin
       LAuthUtf8 := UTF8String(DeriveAuthType(LEnv, LLeaf));
       LAuthStr := LEnv^^.NewStringUTF(LEnv, PAnsiChar(LAuthUtf8));
 
-      LX509Tm := DefaultX509TrustManager(LEnv, nil);
+      // a nil KeyStore selects the system roots with the app's network-security-config; configured
+      // anchors select an exclusive root that config does not govern
+      LKeyStore := nil;
+      if Length(AAnchors) > 0 then
+      begin
+        LAnchorArr := BuildChainArray(LEnv, AAnchors, LBuildAlert);
+        if LAnchorArr = nil then
+          Exit;
+        LKeyStore := BuildAnchorKeyStore(LEnv, LAnchorArr);
+        if LKeyStore = nil then
+          Exit;
+      end;
+      LX509Tm := DefaultX509TrustManager(LEnv, LKeyStore);
       if LX509Tm = nil then
         Exit;
 
@@ -717,7 +880,10 @@ begin
         '([Ljava/security/cert/X509Certificate;Ljava/lang/String;' +
         'Ljava/lang/String;)Ljava/util/List;');
       if (LExtCtor = nil) or (LCheck = nil) then
+      begin
+        ClearPending(LEnv);
         Exit;
+      end;
       LOneArg[0].l := LX509Tm;
       LExtObj := LEnv^^.NewObjectA(LEnv, LExtClass, LExtCtor, @LOneArg[0]);
       if (LExtObj = nil) or (LEnv^^.ExceptionCheck(LEnv) <> 0) then
@@ -738,7 +904,11 @@ begin
 
       if LEnv^^.ExceptionCheck(LEnv) <> 0 then
       begin
-        AAlert := MapPendingException(LEnv);
+        // only the system-roots pass is NSC-governed, and only host roots make the probe matter
+        if (Length(AAnchors) = 0) and AHostRoots then
+          AAlert := MapPendingException(LEnv, LExtObj, LHostStr, AHostName, AFailure)
+        else
+          AAlert := MapPendingException(LEnv, nil, nil, AHostName, AFailure);
         Exit;
       end;
 
@@ -790,7 +960,10 @@ begin
     '(Ljava/lang/String;Ljava/security/cert/Certificate;)V');
   if (LGetDefType = nil) or (LGetInstance = nil) or (LLoad = nil) or
     (LSetEntry = nil) then
+  begin
+    ClearPending(AEnv);
     Exit;
+  end;
 
   LTypeStr := AEnv^^.CallStaticObjectMethodA(AEnv, LKsClass, LGetDefType, nil);
   if (LTypeStr = nil) or (AEnv^^.ExceptionCheck(AEnv) <> 0) then
@@ -854,6 +1027,7 @@ var
   LKeyStore, LX509Tm, LLeaf, LAuthStr: TJObject;
   LAuthUtf8: UTF8String;
   LBuildAlert: TTlsAlertDescription;
+  LFailure: TPlatformChainFailure;
   LCheckArgs: array [0 .. 1] of TJValue;
 begin
   Result := False;
@@ -888,7 +1062,7 @@ begin
   try
     // one frame reclaims the peer chain, the anchor certs and the keystore/trust-manager refs
     if LEnv^^.PushLocalFrame(LEnv,
-      16 + (Length(AChain) + Length(AAnchors)) * 4) <> 0 then
+      32 + (Length(AChain) + Length(AAnchors)) * 4) <> 0 then
     begin
       ClearPending(LEnv);
       Exit;
@@ -925,13 +1099,16 @@ begin
       LCheck := LEnv^^.GetMethodID(LEnv, LTmClass, 'checkClientTrusted',
         '([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V');
       if LCheck = nil then
+      begin
+        ClearPending(LEnv);
         Exit;
+      end;
       LCheckArgs[0].l := LChainArr;
       LCheckArgs[1].l := LAuthStr;
       LEnv^^.CallVoidMethodA(LEnv, LX509Tm, LCheck, @LCheckArgs[0]);
 
       if LEnv^^.ExceptionCheck(LEnv) <> 0 then
-        AAlert := MapPendingException(LEnv)
+        AAlert := MapPendingException(LEnv, nil, nil, '', LFailure)
       else
         Result := True;
     finally
@@ -944,133 +1121,53 @@ begin
   end;
 end;
 
-{ TAndroidDelegateVerifier }
+{ TAndroidChainEngine }
 
-constructor TAndroidDelegateVerifier.Create(const AProvider: ICryptoProvider;
-  APosture: TRevocationPosture; const AClock: ITlsClock;
-  const AStrengthPolicy: TCertificateStrengthPolicy;
-  const AAdvertised: TArray<UInt16>);
+function TAndroidChainEngine.Capabilities: TPlatformChainCapabilities;
 begin
-  inherited Create;
-  FProvider := AProvider;
-  FPosture := APosture;
-  FClock := AClock;
-  FStrengthPolicy := AStrengthPolicy;
-  FAdvertised := AAdvertised;
+  // no revocation outcome and no host check (staple and SAN are the delegate's); exclusive roots work
+  Result := [TPlatformChainCapability.ExclusiveServerAnchors];
 end;
 
-function TAndroidDelegateVerifier.VerifyServerCertificate(const AChain: TArray<TBytes>;
-  const AServerName: TServerName; const AOcspStaple: TBytes;
-  out AValidatedChain: TArray<TBytes>;
-  out AAlert: TTlsAlertDescription): Boolean;
+function TAndroidChainEngine.EvaluateServer(const ARequest: TPlatformChainRequest;
+  out AResult: TPlatformChainResult; out AAlert: TTlsAlertDescription): Boolean;
 var
   LOsPath: TArray<TBytes>;
 begin
-  AValidatedChain := nil;
-  // the platform chain verdict first, yielding the path it built
-  Result := TAndroidTrustApi.Evaluate(AChain, AServerName.ToString, LOsPath, AAlert);
+  AResult := Default(TPlatformChainResult);
+  // the host is the network-security-config domain key, NOT a name check (Android's host-aware
+  // TrustManager requires a non-null host once per-domain configs exist), so it is passed as-is;
+  // the RFC 9525 identity is matched in-library by the delegate
+  Result := TAndroidTrustApi.Evaluate(
+    TArrayUtilities.Concat<TBytes>(ARequest.Chain, ARequest.Intermediates), ARequest.Anchors,
+    ARequest.ServerName.ToString, Length(ARequest.ExtraAnchors) > 0, LOsPath, AAlert,
+    AResult.Failure);
   if not Result then
     Exit;
+  // the OS-built path (leaf first, anchor last) is the validated chain, its anchor (last element)
+  // exempt from the strength policy; the platform renders no revocation outcome of its own
+  AResult.Path := LOsPath;
+  AResult.PolicyExempt := TArray<TBytes>.Create(LOsPath[High(LOsPath)]);
+  AResult.Outcome := TLiveRevocationOutcome.Indeterminate;
+end;
 
-  // strength/algorithm policy over the OS-built path, the OS anchor (last element) exempt
-  Result := TAndroidTrustApi.ApplyStrengthPolicy(LOsPath,
-    TArray<TBytes>.Create(LOsPath[High(LOsPath)]), FProvider, FStrengthPolicy,
-    FAdvertised, AAlert);
+function TAndroidChainEngine.EvaluateClient(const ARequest: TPlatformChainRequest;
+  out AResult: TPlatformChainResult; out AAlert: TTlsAlertDescription): Boolean;
+begin
+  AResult := Default(TPlatformChainResult);
+  // anchors-only over the configured client-CA anchors (never the system roots). checkClientTrusted
+  // reports no path and the presented chain is peer-ordered beyond index 0 (RFC 9846 4.5.1 only fixes
+  // the leaf), so only the leaf is a reliable validated path; issuer recovery for revocation comes from
+  // the configured candidates rather than a spoofable chain entry. Never stapled. The strength floor
+  // therefore covers the leaf only; the platform still validates the whole chain.
+  Result := TAndroidTrustApi.EvaluateClient(
+    TArrayUtilities.Concat<TBytes>(ARequest.Chain, ARequest.Intermediates),
+    ARequest.Anchors, AAlert);
   if not Result then
     Exit;
-
-  // revocation before identity, as the built-in pipeline orders it: the platform ignores a stapled
-  // OCSP response, so decide the staple here over the OS-built path (a leaf-only peer's staple can
-  // then authenticate against the OS-supplied issuer). Revoked always rejects; indeterminate only
-  // under Hard.
-  case TCertificateVerifier.StapleVerdict(FProvider, FClock, LOsPath, AOcspStaple) of
-    TStapleVerdict.Revoked:
-      begin
-        Result := False;
-        AAlert := TTlsAlertDescription.CertificateRevoked;
-        Exit;
-      end;
-    TStapleVerdict.Indeterminate:
-      if FPosture = TRevocationPosture.Hard then
-      begin
-        Result := False;
-        AAlert := TTlsAlertDescription.BadCertificateStatusResponse;
-        Exit;
-      end;
-  end;
-
-  // endpoint identity (RFC 6125): the platform validates the chain but NOT the host (Android
-  // separates X509TrustManager from HostnameVerifier). An empty name skips it; a nil provider
-  // cannot match, so it fails closed rather than trusting blindly.
-  if AServerName.ToString <> '' then
-    if (FProvider = nil) or
-      (not TEndpointIdentity.Matches(AServerName,
-      FProvider.Certificates.DnsNames(AChain[0]),
-      FProvider.Certificates.IpAddresses(AChain[0]))) then
-    begin
-      Result := False;
-      AAlert := TTlsAlertDescription.BadCertificate;
-    end;
-  // the OS-built path (leaf-first, ending at the anchor) is the validated chain a key-pin matches
-  if Result then
-    AValidatedChain := LOsPath;
-end;
-
-{ TAndroidServerVerifierSource }
-
-function TAndroidServerVerifierSource.CreateServerVerifier(
-  const AContext: TServerTrustContext): IServerCertificateVerifier;
-begin
-  Result := TAndroidDelegateVerifier.Create(AContext.Provider,
-    AContext.RevocationPosture, AContext.Clock, AContext.StrengthPolicy,
-    AContext.AdvertisedSignatureSchemes) as IServerCertificateVerifier;
-end;
-
-{ TAndroidClientDelegateVerifier }
-
-constructor TAndroidClientDelegateVerifier.Create(const AProvider: ICryptoProvider;
-  const AAnchors: TArray<TBytes>;
-  const AStrengthPolicy: TCertificateStrengthPolicy;
-  const AAdvertised: TArray<UInt16>);
-begin
-  inherited Create;
-  FProvider := AProvider;
-  FAnchors := AAnchors;
-  FStrengthPolicy := AStrengthPolicy;
-  FAdvertised := AAdvertised;
-end;
-
-function TAndroidClientDelegateVerifier.VerifyClientCertificate(
-  const AChain: TArray<TBytes>; out AValidatedChain: TArray<TBytes>;
-  out AAlert: TTlsAlertDescription): Boolean;
-begin
-  AValidatedChain := nil;
-  // checkClientTrusted returns void; the exclusive KeyStore + no AIA fetch make the presented
-  // chain plus the configured anchors (exempt) the validated path
-  Result := TAndroidTrustApi.EvaluateClient(AChain, FAnchors, AAlert);
-  if not Result then
-    Exit;
-  Result := TAndroidTrustApi.ApplyStrengthPolicy(AChain, FAnchors, FProvider,
-    FStrengthPolicy, FAdvertised, AAlert);
-  // the platform reports no path for a client certificate; the presented chain is the validated
-  // one (anchors are exempt and not appended - the contract permits omitting an unreportable anchor)
-  if Result then
-    AValidatedChain := AChain;
-end;
-
-{ TAndroidClientVerifierSource }
-
-function TAndroidClientVerifierSource.CreateClientVerifier(
-  const AContext: TClientTrustContext): IClientCertificateVerifier;
-var
-  LAnchors: TArray<TBytes>;
-begin
-  LAnchors := nil;
-  if AContext.TrustStore <> nil then
-    LAnchors := AContext.TrustStore.RootCertificates;
-  Result := TAndroidClientDelegateVerifier.Create(AContext.Provider, LAnchors,
-    AContext.StrengthPolicy, AContext.AdvertisedSignatureSchemes)
-    as IClientCertificateVerifier;
+  AResult.Path := TArray<TBytes>.Create(ARequest.Chain[0]);
+  AResult.PolicyExempt := nil;
+  AResult.Outcome := TLiveRevocationOutcome.Indeterminate;
 end;
 
 procedure TlsLibAndroidInitTrust(AJavaVM: Pointer);
@@ -1083,9 +1180,7 @@ initialization
   TAndroidTrustApi.ResolveDynamicImports;
 
 {$IFNDEF FPC}
-  // Delphi: the RTL sets System.JavaMachine (in ANativeActivity_onCreate) before this unit
-  // initializes, so capturing it here makes a NativeActivity app zero-config. FPC has no
-  // such global - its caller passes the JavaVM from JNI_OnLoad.
+  // Delphi captures the JavaVM automatically; FPC callers pass it from JNI_OnLoad.
   TlsLibAndroidInitTrust(System.JavaMachine);
 {$ENDIF}
 

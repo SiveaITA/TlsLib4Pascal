@@ -22,10 +22,11 @@ uses
 type
   /// <summary>How a server resolves the cipher suite when more than one is mutually supported:
   /// ServerOrder (the default) imposes the server's own preference order; ClientOrder honors the
-  /// client's offered order, selecting the client's most-preferred mutually supported suite.</summary>
+  /// client's offered order, selecting the client's most-preferred mutually supported suite.
+  /// Governs both TLS 1.3 and TLS 1.2 handshakes identically.</summary>
   TServerCipherPreference = (ServerOrder, ClientOrder);
 
-  /// <summary>TLS 1.3 cipher-suite wire codepoints (RFC 8446 B.4).</summary>
+  /// <summary>TLS 1.3 cipher-suite wire codepoints (RFC 9846 B.4).</summary>
   TCipherSuites13 = class sealed(TObject)
   public const
     Aes128GcmSha256 = UInt16($1301);
@@ -34,8 +35,8 @@ type
   end;
 
   /// <summary>
-  /// The hardened TLS 1.2 cipher-suite wire codepoints (RFC 5289 / RFC 7905):
-  /// ECDHE key exchange with ECDSA or RSA authentication over AEAD ciphers only.
+  /// The hardened TLS 1.2 cipher-suite wire codepoints (RFC 5289 / RFC 7905 / RFC 8442):
+  /// ECDHE key exchange with ECDSA, RSA or (opt-in) PSK authentication over AEAD ciphers only.
   /// </summary>
   TCipherSuites12 = class sealed(TObject)
   public const
@@ -45,9 +46,14 @@ type
     EcdheRsaAes256GcmSha384 = UInt16($C030);
     EcdheEcdsaChaCha20Poly1305Sha256 = UInt16($CCA9);
     EcdheRsaChaCha20Poly1305Sha256 = UInt16($CCA8);
+    // pre-shared-key authentication over an ephemeral ECDH exchange (RFC 5489 / RFC 7905 /
+    // RFC 8442); offered only when a TLS 1.2 PSK is configured
+    EcdhePskChaCha20Poly1305Sha256 = UInt16($CCAC);
+    EcdhePskAes128GcmSha256 = UInt16($D001);
+    EcdhePskAes256GcmSha384 = UInt16($D002);
   end;
 
-  /// <summary>Signature-scheme wire codepoints (RFC 8446 4.2.3). Wire vocabulary only;
+  /// <summary>Signature-scheme wire codepoints (RFC 9846 4.3.3). Wire vocabulary only;
   /// whether a scheme may sign a given version's handshake is decided by
   /// <see cref="TSignatureScheme.IsValidForHandshake" />.</summary>
   TSignatureSchemes = class sealed(TObject)
@@ -60,11 +66,19 @@ type
     RsaPssRsaeSha512 = UInt16($0806);
     Ed25519 = UInt16($0807);
     Ed448 = UInt16($0808);
-    // legacy (RFC 8446 4.2.3): in TLS 1.3 valid only in signature_algorithms_cert,
+    // the id-RSASSA-PSS (RFC 4055) counterparts: a certificate whose issuer key is a
+    // PSS-restricted key is signed with these, not the rsae schemes
+    RsaPssPssSha256 = UInt16($0809);
+    RsaPssPssSha384 = UInt16($080A);
+    RsaPssPssSha512 = UInt16($080B);
+    // legacy (RFC 9846 4.3.3): in TLS 1.3 valid only in signature_algorithms_cert,
     // never a CertificateVerify; still a TLS 1.2 handshake signature (RFC 5246 7.4.1.4.1)
     RsaPkcs1Sha256 = UInt16($0401);
     RsaPkcs1Sha384 = UInt16($0501);
     RsaPkcs1Sha512 = UInt16($0601);
+    // wire codes only: matched in a peer's advertisement, never registered or offered (RFC 9155)
+    RsaPkcs1Sha1 = UInt16($0201);
+    EcdsaSha1 = UInt16($0203);
   end;
 
   /// <summary>Which protocol version a cipher suite belongs to.</summary>
@@ -73,16 +87,18 @@ type
   /// <summary>
   /// A suite's key-exchange method. Decoupled means the suite does not tie the
   /// key exchange to the cipher (TLS 1.3, where key_share drives the exchange);
-  /// Ecdhe is the ephemeral ECDH exchange named by a TLS 1.2 suite.
+  /// Ecdhe is the ephemeral ECDH exchange named by a TLS 1.2 suite, and EcdhePsk the same
+  /// exchange authenticated by a pre-shared key instead of a certificate (RFC 5489).
   /// </summary>
-  TKeyExchangeMethod = (Ecdhe, Decoupled);
+  TKeyExchangeMethod = (Ecdhe, EcdhePsk, Decoupled);
 
   /// <summary>
   /// A suite's server-authentication method. Decoupled means the suite does not
   /// tie authentication to the cipher (TLS 1.3, where signature_algorithms drive
-  /// it); Ecdsa/Rsa are the authentication named by a TLS 1.2 suite.
+  /// it); Ecdsa/Rsa are the authentication named by a TLS 1.2 suite, and Psk a
+  /// TLS 1.2 suite authenticated by a pre-shared key (no certificates are sent).
   /// </summary>
-  TAuthMethod = (Ecdsa, Rsa, Decoupled);
+  TAuthMethod = (Ecdsa, Rsa, Psk, Decoupled);
 
   /// <summary>
   /// The version-neutral facts a cipher suite resolves to: its wire codepoint,
@@ -112,8 +128,8 @@ type
   end;
 
   /// <summary>
-  /// The named-group wire codepoints (RFC 8446, RFC 9370, RFC 10024) and the mapping
-  /// between a code and the provider group name it resolves to.
+  /// The named-group wire codepoints (RFC 9846, the IANA TLS Supported Groups registry,
+  /// RFC 10024) and the mapping between a code and the provider group name it resolves to.
   /// </summary>
   TNamedGroupCatalog = class sealed(TObject)
   public const
@@ -126,20 +142,24 @@ type
     X25519MlKem768 = UInt16($11EC);
   public
     class function TryCode(const AName: string; out ACode: UInt16): Boolean; static;
+    /// <summary>The canonical provider group name for a codepoint (the spelling TryCode maps
+    /// back), so a group's name is authoritative here rather than taken from a backend handle
+    /// (whose spelling can differ between providers). The bare hex codepoint for an unknown code.</summary>
+    class function Name(ACode: UInt16): string; static;
   end;
 
 const
   // last 8 bytes of ServerHello.random when a 1.3-capable server negotiates lower
-  // (RFC 8446 4.1.3): "DOWNGRD" then 0x01 for 1.2, 0x00 for 1.1 and below
+  // (RFC 9846 4.2.3): "DOWNGRD" then 0x01 for 1.2, 0x00 for 1.1 and below
   Tls12DowngradeSentinel: array [0 .. 7] of Byte =
     ($44, $4F, $57, $4E, $47, $52, $44, $01);
   Tls11DowngradeSentinel: array [0 .. 7] of Byte =
     ($44, $4F, $57, $4E, $47, $52, $44, $00);
-  // RFC 7507 signaling cipher suite: a client lists it when retrying at a lower version
-  // after a failed handshake; it is never negotiated as a real suite
+  // RFC 7507 (obsoleted by RFC 8996) signaling cipher suite: a client lists it when retrying
+  // at a lower version after a failed handshake; it is never negotiated as a real suite
   TlsFallbackScsv = UInt16($5600);
   // ServerHello.random of a HelloRetryRequest = SHA-256("HelloRetryRequest")
-  // (RFC 8446 4.1.3)
+  // (RFC 9846 4.2.3)
   HelloRetryRequestSentinel: array [0 .. 31] of Byte = (
     $CF, $21, $AD, $74, $E5, $9A, $61, $11, $BE, $1D, $8C, $02, $1E, $65, $B8, $91,
     $C2, $A2, $11, $16, $7A, $BB, $8C, $5E, $07, $9E, $09, $E2, $C8, $A8, $33, $9C);
@@ -170,6 +190,29 @@ begin
   begin
     ACode := 0;
     Result := False;
+  end;
+end;
+
+class function TNamedGroupCatalog.Name(ACode: UInt16): string;
+begin
+  // the canonical spelling for each code (the exact string TryCode maps back)
+  case ACode of
+    X25519:
+      Result := 'X25519';
+    Secp256r1:
+      Result := 'secp256r1';
+    Secp384r1:
+      Result := 'secp384r1';
+    Secp521r1:
+      Result := 'secp521r1';
+    MlKem768:
+      Result := 'ML-KEM-768';
+    SecP256r1MlKem768:
+      Result := 'SecP256r1MLKEM768';
+    X25519MlKem768:
+      Result := 'X25519MLKEM768';
+  else
+    Result := Format('0x%.4X', [ACode]);
   end;
 end;
 

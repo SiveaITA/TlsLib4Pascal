@@ -22,8 +22,9 @@ uses
   Classes,
   TlpCryptoDomainTypes,
   TlpICryptoProvider,
-  TlpICertificateTrust,
-  TlpCertificateVerifier,
+  TlpIPkixProvider,
+  TlpITrustAnchorStore,
+  TlpTrustAnchorStore,
   TlpTlsCredential,
   InteropUtils;
 
@@ -38,33 +39,36 @@ type
   /// </summary>
   TInteropCredentials = class sealed(TObject)
   public
-    /// <summary>A server credential from an in-memory leaf DER + private key DER.</summary>
-    class function ServerCredential(const AProvider: ICryptoProvider;
+    /// <summary>A server credential from an in-memory leaf DER + private key DER. The chain is
+    /// parsed through the PKIX provider, the key imported through the crypto provider.</summary>
+    class function ServerCredential(const ACryptoProvider: ICryptoProvider;
+      const APkix: IPkixProvider;
       const ALeafCertDer, AKeyDer: TBytes): TTlsCredential; static;
     /// <summary>A server credential from a KEY=hex field-file (leaf_cert + leaf_key).</summary>
-    class function ServerCredentialFromFieldFile(const AProvider: ICryptoProvider;
-      const AFile: string): TTlsCredential; static;
+    class function ServerCredentialFromFieldFile(const ACryptoProvider: ICryptoProvider;
+      const APkix: IPkixProvider; const AFile: string): TTlsCredential; static;
     /// <summary>A stapling server credential from a KEY=hex field-file: the chain carries
     /// leaf_cert then issuer_cert (so a peer can authenticate the stapled OCSP response
     /// against the issuer) and the key is leaf_key.</summary>
     class function ServerStaplingCredentialFromFieldFile(
-      const AProvider: ICryptoProvider; const AFile: string): TTlsCredential; static;
+      const ACryptoProvider: ICryptoProvider; const AFile: string): TTlsCredential; static;
     /// <summary>As ServerStaplingCredentialFromFieldFile, but with an explicit leaf-cert and
     /// key field name (chain = that leaf then issuer_cert), so a test can present the plain or
     /// the must-staple leaf against the same issuer.</summary>
-    class function ServerStaplingCredentialFields(const AProvider: ICryptoProvider;
+    class function ServerStaplingCredentialFields(const ACryptoProvider: ICryptoProvider;
       const AFile, ALeafField, AKeyField: string): TTlsCredential; static;
     /// <summary>A server credential from a PEM certificate file + PEM key file.</summary>
-    class function ServerCredentialFromPem(const AProvider: ICryptoProvider;
+    class function ServerCredentialFromPem(const ACryptoProvider: ICryptoProvider;
+      const APkix: IPkixProvider;
       const ACertFile, AKeyFile: string): TTlsCredential; static;
-    /// <summary>A trust store over one root DER certificate.</summary>
-    class function Trust(const AProvider: ICryptoProvider;
+    /// <summary>A trust store over one root DER certificate (parsed via the PKIX provider).</summary>
+    class function Trust(const APkix: IPkixProvider;
       const ARootDer: TBytes): ITrustAnchorStore; static;
     /// <summary>A trust store from a KEY=hex field-file (root_cert).</summary>
-    class function TrustFromFieldFile(const AProvider: ICryptoProvider;
+    class function TrustFromFieldFile(const APkix: IPkixProvider;
       const AFile: string): ITrustAnchorStore; static;
     /// <summary>A trust store from a PEM CA-certificate file.</summary>
-    class function TrustFromPem(const AProvider: ICryptoProvider;
+    class function TrustFromPem(const APkix: IPkixProvider;
       const ACaFile: string): ITrustAnchorStore; static;
     /// <summary>Maps BoGo -signing-prefs codepoints to the signature schemes we know,
     /// in order; unknown codepoints (e.g. rsa_pkcs1_*, ML-DSA) are dropped.</summary>
@@ -76,22 +80,24 @@ implementation
 
 { TInteropCredentials }
 
-class function TInteropCredentials.ServerCredential(const AProvider: ICryptoProvider;
+class function TInteropCredentials.ServerCredential(const ACryptoProvider: ICryptoProvider;
+  const APkix: IPkixProvider;
   const ALeafCertDer, AKeyDer: TBytes): TTlsCredential;
 begin
-  Result.CertificateChain := AProvider.Certificates.LoadChain(ALeafCertDer);
-  Result.PrivateKey := AProvider.Signing.ImportSigningKey(AKeyDer);
+  Result.CertificateChain := APkix.Certificates.LoadChain(ALeafCertDer);
+  Result.PrivateKey := ACryptoProvider.Signing.ImportSigningKey(AKeyDer, nil);
 end;
 
 class function TInteropCredentials.ServerCredentialFromFieldFile(
-  const AProvider: ICryptoProvider; const AFile: string): TTlsCredential;
+  const ACryptoProvider: ICryptoProvider; const APkix: IPkixProvider;
+  const AFile: string): TTlsCredential;
 var
   LFields: TStringList;
 begin
   LFields := TStringList.Create;
   try
     TInteropUtils.LoadFieldFile(AFile, LFields);
-    Result := ServerCredential(AProvider,
+    Result := ServerCredential(ACryptoProvider, APkix,
       TInteropUtils.DecodeHex(LFields.Values['leaf_cert']),
       TInteropUtils.DecodeHex(LFields.Values['leaf_key']));
   finally
@@ -100,13 +106,13 @@ begin
 end;
 
 class function TInteropCredentials.ServerStaplingCredentialFromFieldFile(
-  const AProvider: ICryptoProvider; const AFile: string): TTlsCredential;
+  const ACryptoProvider: ICryptoProvider; const AFile: string): TTlsCredential;
 begin
-  Result := ServerStaplingCredentialFields(AProvider, AFile, 'leaf_cert', 'leaf_key');
+  Result := ServerStaplingCredentialFields(ACryptoProvider, AFile, 'leaf_cert', 'leaf_key');
 end;
 
 class function TInteropCredentials.ServerStaplingCredentialFields(
-  const AProvider: ICryptoProvider;
+  const ACryptoProvider: ICryptoProvider;
   const AFile, ALeafField, AKeyField: string): TTlsCredential;
 var
   LFields: TStringList;
@@ -117,49 +123,49 @@ begin
     Result.CertificateChain := TArray<TBytes>.Create(
       TInteropUtils.DecodeHex(LFields.Values[ALeafField]),
       TInteropUtils.DecodeHex(LFields.Values['issuer_cert']));
-    Result.PrivateKey := AProvider.Signing.ImportSigningKey(
-      TInteropUtils.DecodeHex(LFields.Values[AKeyField]));
+    Result.PrivateKey := ACryptoProvider.Signing.ImportSigningKey(
+      TInteropUtils.DecodeHex(LFields.Values[AKeyField]), nil);
   finally
     LFields.Free;
   end;
 end;
 
 class function TInteropCredentials.ServerCredentialFromPem(
-  const AProvider: ICryptoProvider;
+  const ACryptoProvider: ICryptoProvider; const APkix: IPkixProvider;
   const ACertFile, AKeyFile: string): TTlsCredential;
 begin
   // the loaders accept PEM directly; a PEM cert file may carry the whole chain
-  Result.CertificateChain := AProvider.Certificates.LoadChain(
+  Result.CertificateChain := APkix.Certificates.LoadChain(
     TEncoding.ASCII.GetBytes(TInteropUtils.ReadAllText(ACertFile)));
-  Result.PrivateKey := AProvider.Signing.ImportSigningKey(
-    TEncoding.ASCII.GetBytes(TInteropUtils.ReadAllText(AKeyFile)));
+  Result.PrivateKey := ACryptoProvider.Signing.ImportSigningKey(
+    TEncoding.ASCII.GetBytes(TInteropUtils.ReadAllText(AKeyFile)), nil);
 end;
 
-class function TInteropCredentials.Trust(const AProvider: ICryptoProvider;
+class function TInteropCredentials.Trust(const APkix: IPkixProvider;
   const ARootDer: TBytes): ITrustAnchorStore;
 begin
-  Result := TTrustAnchorStore.Create(AProvider.Certificates.LoadChain(ARootDer))
+  Result := TTrustAnchorStore.Create(APkix.Certificates.LoadChain(ARootDer))
     as ITrustAnchorStore;
 end;
 
 class function TInteropCredentials.TrustFromFieldFile(
-  const AProvider: ICryptoProvider; const AFile: string): ITrustAnchorStore;
+  const APkix: IPkixProvider; const AFile: string): ITrustAnchorStore;
 var
   LFields: TStringList;
 begin
   LFields := TStringList.Create;
   try
     TInteropUtils.LoadFieldFile(AFile, LFields);
-    Result := Trust(AProvider, TInteropUtils.DecodeHex(LFields.Values['root_cert']));
+    Result := Trust(APkix, TInteropUtils.DecodeHex(LFields.Values['root_cert']));
   finally
     LFields.Free;
   end;
 end;
 
-class function TInteropCredentials.TrustFromPem(const AProvider: ICryptoProvider;
+class function TInteropCredentials.TrustFromPem(const APkix: IPkixProvider;
   const ACaFile: string): ITrustAnchorStore;
 begin
-  Result := Trust(AProvider, TEncoding.ASCII.GetBytes(TInteropUtils.ReadAllText(ACaFile)));
+  Result := Trust(APkix, TEncoding.ASCII.GetBytes(TInteropUtils.ReadAllText(ACaFile)));
 end;
 
 class function TInteropCredentials.SchemesFromCodes(

@@ -23,9 +23,13 @@ uses
   TlpTlsVersion,
   TlpTlsLibExceptions,
   TlpISecretBuffer,
+  TlpSecretBuffer,
+  TlpSecureMemory,
   TlpISigningKey,
   TlpICryptoProvider,
+  TlpIPkixProvider,
   TlpINamedGroup,
+  TlpIKeyExchangePrivateKey,
   TlpIKeySchedule,
   TlpTls12KeySchedule,
   TlpITranscriptHash,
@@ -38,31 +42,40 @@ uses
   TlpHandshakeMessage,
   TlpHandshakeMessages,
   TlpCertificateVerify,
+  TlpPeerAuthentication,
   TlpICertificateTrust,
+  TlpTrustTypes,
+  TlpTrustPolicy,
   TlpTlsCredential,
   TlpITlsCredentialResolver,
+  TlpServerOfferSelection,
+  TlpClientSessionPolicy,
   TlpISession,
   TlpIClock,
+  TlpIKeyLog,
   TlpSession,
   TlpSessionTicketStrategy,
   TlpHandshakeEffect,
+  TlpTlsConnectionInfo,
+  TlpHandshakeStage,
   TlpHandshakeMachineBase;
 
 type
   /// <summary>The inputs a TLS 1.2 server handshake needs to negotiate and drive its flight.</summary>
   TServer12HandshakeParams = record
-    Provider: ICryptoProvider;
+    Crypto: ICryptoProvider;
+    Inspector: ICertificateInspector;
     CipherSuites: ICipherSuiteRegistry;
+    /// <summary>The suite-selection authority, shared with the 1.3 server so the configured
+    /// cipher preference (server order, or client order) governs a 1.2 handshake identically.</summary>
+    Policy: INegotiationPolicy;
     ExtensionRegistry: IExtensionRegistry;
-    /// <summary>The server's ECDHE groups in preference order; the first that the client
-    /// listed in supported_groups (and resolves to an ECDHE group) is selected, tolerating
-    /// unknown/non-ECDHE codes. Empty falls back to the single Group below.</summary>
-    OfferedGroups: TArray<UInt16>;
-    /// <summary>Resolves a selected group code (from OfferedGroups) to its INamedGroup;
-    /// required whenever OfferedGroups is set.</summary>
+    /// <summary>Resolves the ECDHE group code the negotiation policy selects to its INamedGroup;
+    /// required when Group is nil (the normal factory path).</summary>
     GroupRegistry: INamedGroupRegistry;
-    /// <summary>A single fixed ECDHE group, used only when OfferedGroups is empty (the
-    /// low-level sans-IO entry point); the engine factory always sets OfferedGroups.</summary>
+    /// <summary>Pins a single fixed ECDHE group (the low-level sans-IO entry point; tests). When
+    /// nil the negotiation policy selects by server preference among the client's supported_groups,
+    /// resolved via GroupRegistry.</summary>
     Group: INamedGroup;
     ServerRandom: TBytes;
     /// <summary>Selects the credential (per handshake, from the client's SNI - virtual hosting)
@@ -71,12 +84,17 @@ type
     /// status_request in the ServerHello and sends a CertificateStatus message (RFC 6066 8)
     /// carrying the selected credential's OCSP staple. nil for a PSK-only server.</summary>
     CredentialResolver: ITlsServerCredentialResolver;
-    /// <summary>When a 1.3-capable server negotiates 1.2 it stamps the RFC 8446 4.1.3
+    /// <summary>When a 1.3-capable server negotiates 1.2 it stamps the RFC 9846 4.2.3
     /// downgrade sentinel into the last 8 bytes of the server random.</summary>
     EmitDowngradeSentinel: Boolean;
     /// <summary>When set, a client that did not offer extended_master_secret (RFC 7627)
     /// is refused rather than falling back to a plain master secret.</summary>
     RequireExtendedMasterSecret: Boolean;
+    /// <summary>How a resumption of a session established without extended_master_secret is
+    /// treated when the new hello does not offer it either (RFC 7627 5.3); Decline when
+    /// unassigned. Decline and Abort also stop issuing resumable sessions from a non-EMS
+    /// full handshake.</summary>
+    NonEmsResumption: TNonEmsResumption;
     /// <summary>Whether the server echoes the empty server_name acknowledgement (RFC 6066 3)
     /// when the client offered a host_name.</summary>
     ServerNameAck: Boolean;
@@ -85,7 +103,7 @@ type
     AlpnRejectAll: Boolean;
     /// <summary>The server's ALPN preferences (RFC 7301); the first that the client also
     /// offered is selected and echoed in the ServerHello. Empty declines ALPN.</summary>
-    AlpnProtocols: TArray<string>;
+    AlpnProtocols: TArray<TBytes>;
     /// <summary>Whether the server requests a client certificate (mutual TLS) and how
     /// strictly it is enforced.</summary>
     ClientAuth: TClientAuthMode;
@@ -98,10 +116,11 @@ type
     /// <summary>Trusts (or rejects) the client certificate chain; required whenever
     /// ClientAuth is not None.</summary>
     ClientCertificateVerifier: IClientCertificateVerifier;
-    /// <summary>When set, after the built-in pipeline accepts the client chain the machine
-    /// parks the handshake for an out-of-band verdict (the deferred-verdict seam) rather than
-    /// continuing inline. Augment-only and fail-closed. OFF by default.</summary>
-    AsyncVerdict: Boolean;
+    /// <summary>How a peer-certificate verdict is deferred out-of-band (see TVerdictDeferral):
+    /// augment-only and fail-closed, None by default.</summary>
+    Deferral: TVerdictDeferral;
+    /// <summary>The configured revocation posture a parked verdict is decided at.</summary>
+    RevocationPosture: TRevocationPosture;
     /// <summary>The stateful store backing TLS 1.2 session-id resumption (RFC 5246 7.3):
     /// on a full handshake the server echoes a fresh session id and stores the session
     /// under it, then resumes on a later ClientHello that offers it. nil disables the
@@ -111,16 +130,36 @@ type
     /// server seals the session under the current key and re-presents it in a
     /// NewSessionTicket. nil disables ticket issuance.</summary>
     SessionTicketKeys: ISessionTicketKeyManager;
+    /// <summary>An opaque scope sealed into issued tickets/sessions and required to match on
+    /// resumption, partitioning configurations that share a ticket key or store; empty does not
+    /// partition.</summary>
+    ResumptionScope: TBytes;
     /// <summary>The lifetime advertised for issued sessions and tickets, in seconds.</summary>
     TicketLifetimeSeconds: UInt32;
     /// <summary>The clock read for a cached session's issue time and freshness (RFC 5077). A
-    /// required input, like Provider: the engine factory supplies one from the config, and a
+    /// required input, like Crypto: the engine factory supplies one from the config, and a
     /// direct sans-IO caller must set it.</summary>
     Clock: ITlsClock;
+    /// <summary>The dangerous key-log sink; nil reports nothing.</summary>
+    KeyLog: IKeyLog;
+    /// <summary>The record_size_limit (RFC 8449) plaintext value the server advertises in its
+    /// ServerHello, in [64, 2^14], echoed only when the client offered one; 0 disables it.</summary>
+    RecordSizeLimit: Int32;
+    /// <summary>The pre-shared keys (RFC 4279 / RFC 5489) the server accepts, looked up by the
+    /// identity the client presents. Empty disables the PSK suites. A PSK-authenticated session
+    /// resumes only while its identity is still configured with the same secret.</summary>
+    Psks: TArray<TTls12Psk>;
+    /// <summary>The key a stand-in secret is derived from for an identity the server does not
+    /// know, so an unknown identity fails at the client's encrypted Finished exactly as a wrong
+    /// secret does (RFC 4279 2 leaves the choice to the server). Required whenever Psks is set.</summary>
+    PskDummyKey: ISecretBuffer;
+    /// <summary>The psk_identity_hint sent in the ServerKeyExchange (RFC 4279 5.2); empty sends
+    /// none, as the RFC advises absent an application profile.</summary>
+    PskIdentityHint: TBytes;
   end;
 
   /// <summary>
-  /// The hardened TLS 1.2 server machine (RFC 5246 + RFC 4492/8422 ECDHE + RFC 7627
+  /// The hardened TLS 1.2 server machine (RFC 5246 + RFC 8422 ECDHE + RFC 7627
   /// Extended Master Secret). It kicks on the ClientHello: it negotiates an AEAD ECDHE
   /// suite and a signature scheme its credential can produce, sends ServerHello,
   /// Certificate, a signed ServerKeyExchange and ServerHelloDone, then on the client's
@@ -140,8 +179,9 @@ type
     FClientRandom: TBytes;
     FServerRandom: TBytes;
     FGroupCode: UInt16;
+    FPeerSignatureScheme: UInt16;
     FSelectedGroup: INamedGroup;
-    FEcdhePrivate: ISecretBuffer;
+    FEcdhePrivate: IKeyExchangePrivateKey;
     FEcdhePublic: TBytes;
     FUseExtendedMasterSecret: Boolean;
     FEchoRenegotiationInfo: Boolean;
@@ -150,6 +190,15 @@ type
     FResolvedCredential: TTlsCredential;
     FRequestedServerName: string;
     FSelectedScheme: TSignatureScheme;
+    /// <summary>Whether this handshake authenticates by pre-shared key: no certificate flight and an
+    /// unsigned ServerKeyExchange.</summary>
+    FPskMode: Boolean;
+    /// <summary>The identity of the configured PSK the client presented; empty for an unknown
+    /// identity, which fails at the client's Finished.</summary>
+    FPskIdentity: TBytes;
+    /// <summary>The digest of that key's secret, sealed into the session so a rotated secret does
+    /// not resume it.</summary>
+    FPskBinding: TBytes;
     FSchedule: ITls12KeySchedule;
     /// <summary>The stateless ticket strategy (STEK) when configured; session-id
     /// resumption uses FParams.SessionStore directly.</summary>
@@ -161,6 +210,9 @@ type
     FClientOfferedSessionTicket: Boolean;
     /// <summary>Whether the client offered status_request (RFC 6066).</summary>
     FStatusRequestOffered: Boolean;
+    /// <summary>The client's offered record_size_limit (RFC 8449); 0 when unoffered. The server
+    /// echoes its own limit only when this is non-zero.</summary>
+    FPeerRecordSizeLimit: Int32;
     /// <summary>Whether the server will staple: the client offered status_request and a
     /// staple is configured. Drives the ServerHello echo and the CertificateStatus message.</summary>
     FWillStaple: Boolean;
@@ -168,15 +220,22 @@ type
     FIssueNewTicket: Boolean;
     /// <summary>The application protocol selected from the client's ALPN offer, or empty when
     /// none was offered/configured (RFC 7301); echoed in the ServerHello.</summary>
-    FSelectedAlpn: string;
-    /// <summary>Resumption state: the accepted session and whether it came via a ticket
-    /// (rather than a session id).</summary>
+    FSelectedAlpn: TBytes;
+    /// <summary>Resumption state: whether the handshake resumes, and the accepted session.</summary>
     FResuming: Boolean;
-    FResumedSession: IResumableSession;
-    FResumedViaTicket: Boolean;
+    FResumedSession: ITls12ResumableSession;
+    /// <summary>Whether the resumed session was looked up by session id in the store rather than
+    /// recovered from a ticket.</summary>
+    FResumedByStoreId: Boolean;
+    /// <summary>The store id this connection owns once the client Finished proved it (stored by a
+    /// full handshake, or resumed by id); a fatal alert removes it. Empty until then, so a failed
+    /// replay of someone else's id evicts nothing.</summary>
+    FOwnedStoreId: TBytes;
     /// <summary>The client's certificate chain (leaf first) and whether it sent one, for
     /// the client CertificateVerify and the required-auth policy.</summary>
     FClientCertChain: TArray<TBytes>;
+    // held until the client's CertificateVerify verifies, which is when the verdict parks
+    FPeerVerified: TVerifiedChain;
     // the client leaf parsed once for the well-formed gate, reused for the signing-policy
     // check and its SubjectPublicKeyInfo; released once the signature is verified
     FParsedClientLeaf: IInspectedCertificate;
@@ -195,9 +254,22 @@ type
     /// server-preferred group the client also advertised, tolerating unknown/non-ECDHE
     /// codes by skipping them. Aborts with handshake_failure when none is common.</summary>
     procedure SelectEcdheGroup(const AClientGroups: TArray<UInt16>);
+    /// <summary>Selects the first mutually supported pre-shared-key suite in the configured
+    /// preference order into FSelectedSuite; False when the server holds no PSK or the client
+    /// offered no PSK suite we run. The identity arrives only in the ClientKeyExchange, so the
+    /// choice cannot depend on it (RFC 4279 2).</summary>
+    function SelectPskSuite(const AClientSuites: TArray<UInt16>): Boolean;
+    /// <summary>The secret for the identity the client presented: the configured PSK, or a
+    /// stand-in derived from the dummy key when the identity is unknown.</summary>
+    function PskSecretFor(const AIdentity: TBytes): ISecretBuffer;
+    /// <summary>The configured PSK secret for this identity, or nil when there is none.</summary>
+    function FindPsk(const AIdentity: TBytes): ISecretBuffer;
+    function BuildServerKeyExchangePsk: TBytes;
+    function ProcessClientKeyExchangePsk(const AMessage: TTlsHandshakeMessage)
+      : TArray<THandshakeEffect>;
     /// <summary>Whether an ECDSA-authenticated suite may be selected: true unless the
     /// leaf credential is ECDSA and its curve is absent from the client's supported_groups
-    /// (RFC 8422 5.4 / RFC 4492 5.5). A non-ECDSA leaf is unconstrained here.</summary>
+    /// (RFC 8422 5.3 / 5.1). A non-ECDSA leaf is unconstrained here.</summary>
     function EcdsaCredentialCurveOffered(const AClientGroups: TArray<UInt16>): Boolean;
     /// <summary>Whether AScheme's signature algorithm matches the suite auth method.</summary>
     class function SchemeMatchesAuth(AScheme: TSignatureScheme;
@@ -219,8 +291,10 @@ type
       : TArray<THandshakeEffect>;
     /// <summary>Attempts to resume a TLS 1.2 session from the offered ticket (RFC 5077)
     /// or session id (RFC 5246). Validates version, freshness, suite and Extended Master
-    /// Secret consistency; any mismatch returns False so the caller falls through to a
-    /// full handshake. On success it fixes the suite, EMS use and the echoed session id.</summary>
+    /// Secret consistency; a mismatch returns False so the caller falls through to a full
+    /// handshake, except that an EMS session offered without EMS raises (RFC 7627 5.3), as does a
+    /// non-EMS session under the Abort policy; a non-EMS session under Decline falls through. On
+    /// success it fixes the suite, EMS use and the echoed session id.</summary>
     function TryAcceptResumption(const AHello: TTlsClientHello;
       const AContext: TExtensionContext): Boolean;
     /// <summary>Sends the abbreviated server flight (ServerHello, an optional
@@ -231,21 +305,19 @@ type
     function ProcessAbbreviatedClientFinished(const AMessage: TTlsHandshakeMessage)
       : TArray<THandshakeEffect>;
     /// <summary>Seals the current session under the STEK and frames a NewSessionTicket
-    /// (RFC 5077 3.3), with a freshly stamped issue time.</summary>
-    function BuildNewSessionTicketMessage: TBytes;
-    /// <summary>The configured ticket lifetime, capped at the RFC 8446 4.6.1 ceiling.</summary>
-    function EmittedTicketLifetime: UInt32;
-    /// <summary>The resumable session for the current connection, under ASessionId.</summary>
+    /// (RFC 5077 3.3), with a freshly stamped issue time; frames a zero-length ticket when the
+    /// strategy declines to seal; ASealed reports whether a real ticket was framed.</summary>
+    function BuildNewSessionTicketMessage(out ASealed: Boolean): TBytes;
+    /// <summary>The resumable session for the current connection, under ASessionId. Its lifetime
+    /// is the configured one capped at the RFC 9846 4.7.1 ceiling and at what remains of the seven
+    /// days since the original authentication, which a resumed session keeps.</summary>
     function BuildStoredSession(const ASessionId: TBytes): IResumableSession;
+    /// <summary>The negotiation facts reported at completion; a TLS 1.2 handshake has no
+    /// HelloRetryRequest and always reports ProtocolVersion as the early-data reason.</summary>
+    function Facts: TNegotiationFacts;
     function BuildServerHello: TBytes;
-    /// <summary>Selects the application protocol from the client's ALPN offer: the first server
-    /// preference the client also offered, empty when ALPN was not offered/configured, or an
-    /// abort with no_application_protocol on reject-mode or no overlap (RFC 7301).</summary>
-    function SelectAlpn(const AClientOffered: TArray<string>): string;
+    procedure StampServerRandom;
     function BuildCertificate: TBytes;
-    /// <summary>The configured stapled OCSP response (the callback takes precedence over
-    /// the static blob); empty when the server is not stapling.</summary>
-    function ResolveOcspStaple: TBytes;
     function BuildCertificateRequest: TBytes;
     function BuildServerKeyExchange: TBytes;
     function SignServerParams(const AParams: TBytes): TBytes;
@@ -258,30 +330,36 @@ type
     constructor Create(const AParams: TServer12HandshakeParams);
     destructor Destroy; override;
     function Start: TArray<THandshakeEffect>; override;
+    function ExportKeyingMaterial(const ALabel: string;
+      ALength: Int32): TBytes; overload; override;
     function ExportKeyingMaterial(const ALabel: string; const AContext: TBytes;
-      AUseContext: Boolean; ALength: Int32): TBytes; override;
+      ALength: Int32): TBytes; overload; override;
     function CanExportKeyingMaterial: Boolean; override;
+    procedure ForgetSessionsOnFatal; override;
   end;
 
 implementation
 
 resourcestring
+  SClockRequired = 'a clock is required (the handshake reads time for tickets and freshness)';
+  SNoTls12Offered = 'the client offered no protocol version this server supports';
   SNoCompatibleSuite =
     'no mutually supported TLS 1.2 ECDHE suite the credential can authenticate';
-  SNoServerCertificate = 'the server has no certificate for a full TLS 1.2 handshake';
-  SCredentialNoSigningKey = 'the selected server credential has no signing key';
-  SNoCredentialForServerName = 'no server certificate is configured for the requested SNI host';
   SNoSignatureAlgorithms = 'the client offered no signature_algorithms';
+  SBadRecordSizeLimit = 'the client record_size_limit is below the 64-byte minimum';
   SGroupNotOffered = 'the client did not offer the server''s ECDHE group';
   SGroupNotEcdhe = 'the configured 1.2 group is not an ECDHE group';
+  SGroupNotResolvable = 'the selected ECDHE group has no registered key agreement';
+  SPolicyRequired = 'a negotiation policy is required (it selects the suite and the group)';
   SNoExtendedMasterSecret =
     'the client did not offer extended_master_secret and it is required';
+  SNonEmsResumptionRefused =
+    'a session established without extended_master_secret is not resumed (RFC 7627 5.3)';
   SBadClientFinished = 'the client Finished did not verify';
   SClientCertificateRequired = 'client authentication is required but none was sent';
   SUntrustedClientCertificate = 'the client certificate chain was not trusted';
-  SNoClientCertificateVerifier = 'no client certificate verifier configured (fail-closed)';
-  SBadClientCertVerify = 'the client CertificateVerify did not verify';
-  SAlpnRejected = 'the server rejects the offered application protocols (RFC 7301)';
+  SResumedEmsDowngrade =
+    'a session established with extended_master_secret cannot resume without it (RFC 7627 5.3)';
 
 const
   SessionIdLength = Int32(32);
@@ -291,13 +369,17 @@ const
 constructor TTls12ServerStateMachine.Create(const AParams: TServer12HandshakeParams);
 begin
   inherited Create(AParams.ExtensionRegistry);
+  if AParams.Clock = nil then
+    raise EArgumentTlsLibException.CreateRes(@SClockRequired);
+  if AParams.Policy = nil then
+    raise EArgumentTlsLibException.CreateRes(@SPolicyRequired);
   FParams := AParams;
   FPhase := TPhase.Initial;
   FSelectedGroup := AParams.Group;
   if AParams.Group <> nil then
     FGroupCode := AParams.Group.Code;
   // TLS 1.2 tickets are stateless STEK only; the session-id path uses SessionStore
-  FTicketStrategy := TSessionTicketStrategies.ForServer(AParams.Provider,
+  FTicketStrategy := TSessionTicketStrategies.ForServer(AParams.Crypto,
     AParams.SessionTicketKeys, nil);
   FHandshakeLog := TBytesStream.Create;
 end;
@@ -319,14 +401,15 @@ class function TTls12ServerStateMachine.SchemeMatchesAuth(
 begin
   case AAuth of
     TAuthMethod.Ecdsa:
-      // an ECDHE_ECDSA suite accepts an ECDSA or an EdDSA (Ed25519) credential: RFC 8422
-      // 5.1 requires the certificate to hold an "ECDSA- or EdDSA-capable public key"
+      // an ECDHE_ECDSA suite accepts an ECDSA or an EdDSA (Ed25519/Ed448) credential: RFC 8422
+      // 2.1 requires the certificate to hold an "ECDSA- or EdDSA-capable public key"
       Result := AScheme in [TSignatureScheme.ECDSA_SECP256R1_SHA256,
         TSignatureScheme.ECDSA_SECP384R1_SHA384,
-        TSignatureScheme.ECDSA_SECP521R1_SHA512, TSignatureScheme.ED25519];
+        TSignatureScheme.ECDSA_SECP521R1_SHA512, TSignatureScheme.ED25519,
+        TSignatureScheme.ED448];
     TAuthMethod.Rsa:
       // an ECDHE_RSA suite signs the ServerKeyExchange with an rsaEncryption key: TLS 1.2
-      // accepts RSA-PSS and the legacy RSASSA-PKCS1-v1_5 schemes (RFC 5246 / RFC 8446 4.2.3)
+      // accepts RSA-PSS and the legacy RSASSA-PKCS1-v1_5 schemes (RFC 5246 / RFC 9846 4.3.3)
       Result := AScheme in [TSignatureScheme.RSA_PSS_RSAE_SHA256,
         TSignatureScheme.RSA_PSS_RSAE_SHA384, TSignatureScheme.RSA_PSS_RSAE_SHA512,
         TSignatureScheme.RSA_PKCS1_SHA256, TSignatureScheme.RSA_PKCS1_SHA384,
@@ -343,13 +426,15 @@ var
   LCode: UInt16;
   LSuite: TTlsCipherSuite;
   LScheme: TSignatureScheme;
+  LCandidates: TArray<UInt16>;
 begin
   Result := False;
-  // server preference is the shared hardware-AES-aware order; a 1.2 suite is eligible only
-  // if the client offered it and the credential can sign the suite's auth with a scheme the
-  // client also offered
-  for LCode in TNegotiationPolicy.SuitePreferenceOrder(FParams.Provider,
-    FParams.CipherSuites, TSuiteProtocol.Tls12) do
+  // the mutually supported 1.2 suites in the configured preference order, so
+  // WithCipherSuitePreference - server or client order - governs 1.2 exactly as 1.3
+  LCandidates := FParams.Policy.CandidateSuites(AClientSuites, TlsWireVersionTls12);
+  // a candidate is eligible only if the client offered it and the credential can sign its auth
+  // with a scheme the client also offered
+  for LCode in LCandidates do
   begin
     if not FParams.CipherSuites.TryGet(LCode, LSuite) then
       Continue;
@@ -373,53 +458,97 @@ end;
 
 procedure TTls12ServerStateMachine.SelectEcdheGroup(
   const AClientGroups: TArray<UInt16>);
-var
-  LGroupCode: UInt16;
-  LGroup: INamedGroup;
 begin
-  // multi-group path: walk the server's preference order and choose the first group
-  // the client also advertised that resolves to an ECDHE group (1.2 excludes KEM/
-  // hybrid). Unknown or non-ECDHE offered codes are simply skipped.
-  if System.Length(FParams.OfferedGroups) > 0 then
+  if FParams.Group <> nil then
   begin
-    for LGroupCode in FParams.OfferedGroups do
-      if (TArrayUtilities.Contains<UInt16>(AClientGroups, LGroupCode)) and
-        (FParams.GroupRegistry.TryGet(LGroupCode, LGroup)) and
-        (LGroup.Kind = TNamedGroupKind.Ecdhe) then
-      begin
-        FSelectedGroup := LGroup;
-        FGroupCode := LGroupCode;
-        Exit;
-      end;
-    raise EFatalAlertTlsLibException.CreateRes(
-      TTlsAlertDescription.HandshakeFailure, @SGroupNotOffered);
+    // low-level sans-IO fallback: the single fixed group must be ECDHE and offered
+    if FParams.Group.Kind <> TNamedGroupKind.Ecdhe then
+      raise EFatalAlertTlsLibException.CreateRes(
+        TTlsAlertDescription.InternalError, @SGroupNotEcdhe);
+    if not (TArrayUtilities.Contains<UInt16>(AClientGroups, FGroupCode)) then
+      raise EFatalAlertTlsLibException.CreateRes(
+        TTlsAlertDescription.HandshakeFailure, @SGroupNotOffered);
+    Exit;
   end;
+  // the negotiation policy selects the ECDHE group by server preference among the client's groups
+  // (1.2 excludes KEM/hybrid); it raises handshake_failure when none is common
+  FGroupCode := FParams.Policy.SelectGroup(AClientGroups, TlsWireVersionTls12);
+  if not FParams.GroupRegistry.TryGet(FGroupCode, FSelectedGroup) then
+    raise EFatalAlertTlsLibException.CreateRes(
+      TTlsAlertDescription.InternalError, @SGroupNotResolvable);
+end;
 
-  // low-level sans-IO fallback: the single fixed group must be ECDHE and offered
-  if FParams.Group.Kind <> TNamedGroupKind.Ecdhe then
-    raise EFatalAlertTlsLibException.CreateRes(
-      TTlsAlertDescription.InternalError, @SGroupNotEcdhe);
-  if not (TArrayUtilities.Contains<UInt16>(AClientGroups, FGroupCode)) then
-    raise EFatalAlertTlsLibException.CreateRes(
-      TTlsAlertDescription.HandshakeFailure, @SGroupNotOffered);
+function TTls12ServerStateMachine.SelectPskSuite(
+  const AClientSuites: TArray<UInt16>): Boolean;
+var
+  LCode: UInt16;
+  LSuite: TTlsCipherSuite;
+begin
+  Result := False;
+  if System.Length(FParams.Psks) = 0 then
+    Exit;
+  for LCode in FParams.Policy.CandidateSuites(AClientSuites, TlsWireVersionTls12) do
+    if FParams.CipherSuites.TryGet(LCode, LSuite) and (LSuite.Protocol = TSuiteProtocol.Tls12) and
+      (LSuite.Auth = TAuthMethod.Psk) then
+    begin
+      FSelectedSuite := LSuite;
+      Exit(True);
+    end;
+end;
+
+function TTls12ServerStateMachine.FindPsk(const AIdentity: TBytes): ISecretBuffer;
+var
+  LI: Int32;
+begin
+  Result := nil;
+  // the identity is public, so the lookup need not be constant-time
+  for LI := 0 to System.High(FParams.Psks) do
+    if TArrayUtilities.AreEqual(FParams.Psks[LI].Identity, AIdentity) then
+      Exit(FParams.Psks[LI].Secret);
+end;
+
+function TTls12ServerStateMachine.PskSecretFor(const AIdentity: TBytes): ISecretBuffer;
+var
+  LMac: IHmac;
+  LDerived: TBytes;
+  LStandIn: ISecretBuffer;
+begin
+  // an identity the server does not know proceeds on a stable stand-in, so the handshake ends at
+  // the client's encrypted Finished exactly as a wrong secret does (bad_record_mac) and nothing tells
+  // the two apart (RFC 4279 2 permits this or an unknown_psk_identity alert; local policy). The
+  // stand-in is derived whether or not the identity is known, so the work does not differ either
+  LMac := FParams.Crypto.Primitives.CreateHmac(THashAlgorithm.SHA_256);
+  LMac.Init(FParams.PskDummyKey);
+  LMac.Update(AIdentity, 0, System.Length(AIdentity));
+  LDerived := LMac.DoFinal;
+  try
+    LStandIn := TSecretBuffer.From(LDerived);
+  finally
+    TSecureMemory.WipeBytes(LDerived);
+  end;
+  Result := FindPsk(AIdentity);
+  if Result <> nil then
+    FPskIdentity := System.Copy(AIdentity)
+  else
+    Result := LStandIn;
 end;
 
 function TTls12ServerStateMachine.EcdsaCredentialCurveOffered(
   const AClientGroups: TArray<UInt16>): Boolean;
 var
-  LKind: TCertKeyKind;
+  LKind: TSignatureKeyKind;
   LCurve: UInt16;
 begin
-  // RFC 8422 5.4 / RFC 4492 5.5: an ECDSA server certificate is usable only when its
+  // RFC 8422 5.3 / 5.1: an ECDSA server certificate is usable only when its
   // curve appears in the client's supported_groups. A non-ECDSA leaf (or a leaf whose
   // key we cannot classify) is not constrained here.
   Result := True;
   if System.Length(FResolvedCredential.CertificateChain) = 0 then
     Exit;
-  if not FParams.Provider.Certificates.KeyKind(
+  if not FParams.Inspector.KeyKind(
     FResolvedCredential.CertificateChain[0], LKind, LCurve) then
     Exit;
-  if LKind <> TCertKeyKind.Ecdsa then
+  if LKind <> TSignatureKeyKind.Ecdsa then
     Exit;
   Result := TArrayUtilities.Contains<UInt16>(AClientGroups, LCurve);
 end;
@@ -429,9 +558,9 @@ function TTls12ServerStateMachine.ProcessClientHello(
 var
   LHello: TTlsClientHello;
   LContext: TExtensionContext;
-  LClientHelloInfo: TTlsClientHelloInfo;
   LServerHello, LCertificate, LCertificateStatus, LServerKeyExchange, LCertRequest,
     LServerHelloDone, LStaple: TBytes;
+  LIssueSession: Boolean;
 begin
   LHello := THandshakeMessages.DecodeClientHello(AMessage.Body);
   FClientRandom := LHello.Random;
@@ -440,8 +569,28 @@ begin
     FCodec.ConsumeBlock(LContext, TTlsExtensionContextKind.ClientHello,
       LHello.Extensions);
 
+    // before the version floor, so a spurious fallback is not masked as protocol_version
+    TServerOfferSelection.RejectSpuriousFallback(LHello.CipherSuites,
+      LContext.SupportedVersions, LHello.LegacyVersion, TlsWireVersionTls12);
+
+    // this machine only speaks TLS 1.2, so a client that offered supported_versions without 1.2,
+    // or (absent the extension) a legacy_version below 1.2, shares no version with it: the client
+    // selected nothing this server supports (RFC 9846 4.3.1 / E.2)
+    if System.Length(LContext.SupportedVersions) > 0 then
+    begin
+      TServerOfferSelection.RejectUnexpectedLegacyVersion(LHello.LegacyVersion);
+      if not (TArrayUtilities.Contains<UInt16>(LContext.SupportedVersions,
+        TlsWireVersionTls12)) then
+        raise EFatalAlertTlsLibException.CreateRes(
+          TTlsAlertDescription.ProtocolVersion, @SNoTls12Offered);
+    end
+    else if LHello.LegacyVersion < TlsWireVersionTls12 then
+      raise EFatalAlertTlsLibException.CreateRes(
+        TTlsAlertDescription.ProtocolVersion, @SNoTls12Offered);
+
     // select (or reject) the application protocol from the client's ALPN offer (RFC 7301)
-    FSelectedAlpn := SelectAlpn(LContext.AlpnProtocols);
+    FSelectedAlpn := TServerOfferSelection.SelectAlpn(FParams.AlpnProtocols,
+      LContext.AlpnProtocols, FParams.AlpnRejectAll);
 
     // echo renegotiation_info if the client signalled secure renegotiation by either the
     // extension or the TLS_EMPTY_RENEGOTIATION_INFO_SCSV cipher suite (RFC 5746 3.4/3.6)
@@ -449,53 +598,55 @@ begin
       (TArrayUtilities.Contains<UInt16>(LHello.CipherSuites, $00FF));
     FClientOfferedSessionTicket := LContext.SessionTicketOffered;
     FStatusRequestOffered := LContext.StatusRequestOffered;
+    // record_size_limit (RFC 8449): remember the client's offer so the ServerHello echoes ours; a
+    // value below 64 is fatal
+    if LContext.RecordSizeLimit > 0 then
+    begin
+      if LContext.RecordSizeLimit < 64 then
+        raise EFatalAlertTlsLibException.CreateRes(
+          TTlsAlertDescription.IllegalParameter, @SBadRecordSizeLimit);
+      FPeerRecordSizeLimit := LContext.RecordSizeLimit;
+    end;
     // a client host_name is acknowledged with an empty server_name in the ServerHello
     // (RFC 6066 3)
     FClientSentServerName := LContext.ServerName <> '';
     FRequestedServerName := LContext.ServerName;
 
-    // resumption is attempted before any full-handshake negotiation; any mismatch
-    // (bad/expired ticket or session id, suite/EMS conflict) falls through to a full
-    // handshake rather than failing (RFC 5077 3.4 / RFC 5246 7.3)
+    // resumption is attempted before any full-handshake negotiation; a mismatch (bad/expired
+    // ticket or session id, suite conflict, EMS now offered for a non-EMS session, or a non-EMS
+    // session under the Decline policy) falls through to a full handshake rather than failing
+    // (RFC 5077 3.1 / 3.2, RFC 5246 7.3); the exceptions that abort are an EMS session offered without
+    // EMS (RFC 7627 5.3) and a non-EMS session under the Abort policy
     FResuming := TryAcceptResumption(LHello, LContext);
     if not FResuming then
     begin
-      // select the server certificate for this handshake from the client's SNI (virtual hosting),
-      // before suite/scheme negotiation which depends on the selected leaf's key
-      if FParams.CredentialResolver = nil then
-        raise EFatalAlertTlsLibException.CreateRes(
-          TTlsAlertDescription.HandshakeFailure, @SNoServerCertificate);
-      LClientHelloInfo.ServerName := FRequestedServerName;
-      LClientHelloInfo.SignatureSchemes := LContext.SignatureSchemes;
-      LClientHelloInfo.AlpnProtocols := LContext.AlpnProtocols;
-      LClientHelloInfo.CipherSuites := LHello.CipherSuites;
-      LClientHelloInfo.SupportedGroups := LContext.SupportedGroups;
-      LClientHelloInfo.ProtocolVersion := TTlsVersion.Tls12;
-      if not FParams.CredentialResolver.TryResolve(LClientHelloInfo, FResolvedCredential) then
+      // a configured PSK is preferred over the certificate suites, as in TLS 1.3
+      FPskMode := SelectPskSuite(LHello.CipherSuites);
+      if FPskMode then
+        SelectEcdheGroup(LContext.SupportedGroups)
+      else
       begin
-        if FRequestedServerName <> '' then
+        // select the server certificate for this handshake from the client's SNI (virtual hosting),
+        // before suite/scheme negotiation which depends on the selected leaf's key
+        FResolvedCredential := TServerOfferSelection.ResolveCredential(
+          FParams.CredentialResolver, FParams.Inspector, LContext, LHello.CipherSuites,
+          TTlsVersion.Tls12);
+        // select the ECDHE group: the first server-preferred group the client also
+        // advertised in supported_groups (RFC 8422 5.1). Unknown/non-ECDHE offered
+        // codes are simply not chosen, so a client mixing bogus curves still succeeds.
+        SelectEcdheGroup(LContext.SupportedGroups);
+        // RFC 5246 7.4.1.4.1 makes omitting signature_algorithms legal in TLS 1.2 (it implies
+        // SHA-1); refusing it is a hardened-posture policy choice, so handshake_failure, not the
+        // TLS 1.3 missing_extension (which is mandatory there)
+        if System.Length(LContext.SignatureSchemes) = 0 then
           raise EFatalAlertTlsLibException.CreateRes(
-            TTlsAlertDescription.UnrecognizedName, @SNoCredentialForServerName);
-        raise EFatalAlertTlsLibException.CreateRes(
-          TTlsAlertDescription.HandshakeFailure, @SNoServerCertificate);
+            TTlsAlertDescription.HandshakeFailure, @SNoSignatureAlgorithms);
+        if not SelectSuiteAndScheme(LHello.CipherSuites, LContext.SignatureSchemes,
+          EcdsaCredentialCurveOffered(LContext.SupportedGroups),
+          FSelectedSuite, FSelectedScheme) then
+          raise EFatalAlertTlsLibException.CreateRes(
+            TTlsAlertDescription.HandshakeFailure, @SNoCompatibleSuite);
       end;
-      // a resolved credential with no signing key cannot complete certificate auth; reject it
-      // as a handshake_failure rather than dereferencing a nil key during scheme selection
-      if not Assigned(FResolvedCredential.PrivateKey) then
-        raise EFatalAlertTlsLibException.CreateRes(
-          TTlsAlertDescription.HandshakeFailure, @SCredentialNoSigningKey);
-      // select the ECDHE group: the first server-preferred group the client also
-      // advertised in supported_groups (RFC 8422 5.1). Unknown/non-ECDHE offered
-      // codes are simply not chosen, so a client mixing bogus curves still succeeds.
-      SelectEcdheGroup(LContext.SupportedGroups);
-      if System.Length(LContext.SignatureSchemes) = 0 then
-        raise EFatalAlertTlsLibException.CreateRes(
-          TTlsAlertDescription.MissingExtension, @SNoSignatureAlgorithms);
-      if not SelectSuiteAndScheme(LHello.CipherSuites, LContext.SignatureSchemes,
-        EcdsaCredentialCurveOffered(LContext.SupportedGroups),
-        FSelectedSuite, FSelectedScheme) then
-        raise EFatalAlertTlsLibException.CreateRes(
-          TTlsAlertDescription.HandshakeFailure, @SNoCompatibleSuite);
 
       // extended_master_secret is used when the client offered it (RFC 7627), and may
       // be required by policy
@@ -511,17 +662,17 @@ begin
   if FResuming then
     Exit(EmitAbbreviatedFlight(AMessage.Raw));
 
-  // a full handshake issues a fresh session id (when a store is configured) and, when
-  // the client supports tickets, a NewSessionTicket sealed under the STEK
-  if FParams.SessionStore <> nil then
-    FSessionId := FParams.Provider.Primitives.GetRandom.GenerateBytes(SessionIdLength)
+  // a non-EMS session is issued only when this server resumes such sessions (RFC 7627 5.3)
+  LIssueSession := FUseExtendedMasterSecret or
+    (FParams.NonEmsResumption = TNonEmsResumption.Resume);
+  FIssueNewTicket := (FTicketStrategy <> nil) and FClientOfferedSessionTicket and LIssueSession;
+  // the id is in the hello before the ticket seals, so it is stored only if the seal declines
+  if (FParams.SessionStore <> nil) and LIssueSession then
+    FSessionId := FParams.Crypto.Primitives.GetRandom.GenerateBytes(SessionIdLength)
   else
     FSessionId := nil;
-  FIssueNewTicket := (FTicketStrategy <> nil) and FClientOfferedSessionTicket;
 
-  FServerRandom := System.Copy(FParams.ServerRandom);
-  if FParams.EmitDowngradeSentinel then
-    Move(Tls12DowngradeSentinel[0], FServerRandom[24], 8);
+  StampServerRandom;
 
   // the server's ECDHE ephemeral: its public value is signed into the ServerKeyExchange
   FSelectedGroup.GenerateKeyPair(FEcdhePrivate, FEcdhePublic);
@@ -532,27 +683,37 @@ begin
   if System.Length(AMessage.Raw) > 0 then
     FHandshakeLog.Write(AMessage.Raw[0], System.Length(AMessage.Raw));
   FTranscript.Update(AMessage.Raw);
-  FTranscript.Activate(FParams.Provider.Primitives.CreateHash(FSelectedSuite.Common.Hash));
+  FTranscript.Activate(FParams.Crypto.Primitives.CreateHash(FSelectedSuite.Common.Hash));
   // staple when the client offered status_request and a staple is configured; the
   // ServerHello echoes an empty status_request and a CertificateStatus follows the
   // Certificate (RFC 6066 8)
-  LStaple := ResolveOcspStaple;
+  LStaple := nil;
+  if not FPskMode then
+    LStaple := FResolvedCredential.CurrentOcspStaple;
   FWillStaple := FStatusRequestOffered and (System.Length(LStaple) > 0);
 
   LServerHello := BuildServerHello;
   Absorb(LServerHello);
-  LCertificate := BuildCertificate;
-  Absorb(LCertificate);
-  if FWillStaple then
+  // a PSK suite sends no Certificate, CertificateStatus or CertificateRequest (RFC 4279 2), and
+  // its ServerKeyExchange is unsigned (RFC 5489 2); a known PSK identity stands in for the
+  // client authentication a certificate handshake would require
+  if not FPskMode then
   begin
-    LCertificateStatus := THandshakeFraming.Frame(TTlsHandshakeType.CertificateStatus,
-      THandshakeMessages.EncodeCertificateStatus(LStaple));
-    Absorb(LCertificateStatus);
-  end;
-  LServerKeyExchange := BuildServerKeyExchange;
+    LCertificate := BuildCertificate;
+    Absorb(LCertificate);
+    if FWillStaple then
+    begin
+      LCertificateStatus := THandshakeFraming.Frame(TTlsHandshakeType.CertificateStatus,
+        THandshakeMessages.EncodeCertificateStatus(LStaple));
+      Absorb(LCertificateStatus);
+    end;
+    LServerKeyExchange := BuildServerKeyExchange;
+  end
+  else
+    LServerKeyExchange := BuildServerKeyExchangePsk;
   Absorb(LServerKeyExchange);
   // CertificateRequest (mutual TLS) follows ServerKeyExchange (RFC 5246 7.4.4)
-  if FParams.ClientAuth <> TClientAuthMode.None then
+  if (not FPskMode) and (FParams.ClientAuth <> TClientAuthMode.None) then
   begin
     LCertRequest := BuildCertificateRequest;
     Absorb(LCertRequest);
@@ -560,13 +721,23 @@ begin
   LServerHelloDone := THandshakeFraming.Frame(TTlsHandshakeType.ServerHelloDone, nil);
   Absorb(LServerHelloDone);
 
-  if FParams.ClientAuth <> TClientAuthMode.None then
+  if (not FPskMode) and (FParams.ClientAuth <> TClientAuthMode.None) then
     FPhase := TPhase.WaitClientCertificate
   else
     FPhase := TPhase.WaitClientKeyExchange;
   Result := TArray<THandshakeEffect>.Create(
-    THandshakeEffects.SendHandshake(LServerHello),
-    THandshakeEffects.SendHandshake(LCertificate));
+    THandshakeEffects.SendHandshake(LServerHello));
+  // surface the protocol the ServerHello selected on the connection info
+  if System.Length(FSelectedAlpn) > 0 then
+    TArrayUtilities.Append<THandshakeEffect>(Result,
+      THandshakeEffects.SelectAlpn(FSelectedAlpn));
+  // limits bind protected records only (RFC 8449 4)
+  if FPeerRecordSizeLimit > 0 then
+    TArrayUtilities.Append<THandshakeEffect>(Result,
+      THandshakeEffects.SetRecordSizeLimit(FPeerRecordSizeLimit, FParams.RecordSizeLimit));
+  if not FPskMode then
+    TArrayUtilities.Append<THandshakeEffect>(Result,
+      THandshakeEffects.SendHandshake(LCertificate));
   if FWillStaple then
     TArrayUtilities.Append<THandshakeEffect>(Result,
       THandshakeEffects.SendHandshake(LCertificateStatus));
@@ -579,26 +750,13 @@ begin
     THandshakeEffects.SendHandshake(LServerHelloDone));
 end;
 
-function TTls12ServerStateMachine.SelectAlpn(
-  const AClientOffered: TArray<string>): string;
-var
-  LPref, LOffered: string;
+procedure TTls12ServerStateMachine.StampServerRandom;
 begin
-  Result := '';
-  // reject mode: any client ALPN offer is refused with no_application_protocol (RFC 7301 3.2)
-  if FParams.AlpnRejectAll and (System.Length(AClientOffered) > 0) then
-    raise EFatalAlertTlsLibException.CreateRes(
-      TTlsAlertDescription.NoApplicationProtocol, @SAlpnRejected);
-  // no selection when the server is not configured for ALPN or the client did not offer it
-  if (System.Length(FParams.AlpnProtocols) = 0) or (System.Length(AClientOffered) = 0) then
-    Exit;
-  for LPref in FParams.AlpnProtocols do
-    for LOffered in AClientOffered do
-      if LPref = LOffered then
-        Exit(LPref);
-  // configured, offered, but nothing overlaps (RFC 7301 3.2)
-  raise EFatalAlertTlsLibException.CreateRes(
-    TTlsAlertDescription.NoApplicationProtocol, @SAlpnRejected);
+  // a server that can speak TLS 1.3 stamps the downgrade sentinel into ServerHello.random on
+  // every TLS 1.2 negotiation, full or abbreviated (RFC 9846 4.2.3)
+  FServerRandom := System.Copy(FParams.ServerRandom);
+  if FParams.EmitDowngradeSentinel then
+    Move(Tls12DowngradeSentinel[0], FServerRandom[24], 8);
 end;
 
 function TTls12ServerStateMachine.BuildServerHello: TBytes;
@@ -611,7 +769,7 @@ begin
     LContext.ExtendedMasterSecret := FUseExtendedMasterSecret;
     LContext.SelectedAlpn := FSelectedAlpn;
     LContext.RenegotiationInfo := FEchoRenegotiationInfo;
-    // no acknowledgement in a resumed session (RFC 6066 3): the server SHALL NOT include
+    // no acknowledgement in a resumed session (RFC 6066 3): the server MUST NOT include
     // server_name in the ServerHello of an abbreviated handshake
     LContext.ServerNameAck := FClientSentServerName and
       FParams.ServerNameAck and not FResuming;
@@ -619,6 +777,9 @@ begin
     LContext.SessionTicketOffered := FIssueNewTicket;
     // an empty status_request echo announces a forthcoming CertificateStatus (RFC 6066 8)
     LContext.StatusRequestResponsePending := FWillStaple;
+    // record_size_limit is answered only when the client offered one (RFC 8449 4)
+    if FPeerRecordSizeLimit > 0 then
+      LContext.RecordSizeLimit := FParams.RecordSizeLimit;
     LHello.Random := FServerRandom;
     LHello.LegacySessionIdEcho := FSessionId;
     LHello.CipherSuite := FSelectedSuite.Common.Code;
@@ -644,14 +805,6 @@ begin
     THandshakeMessages.EncodeCertificate12(FResolvedCredential.CertificateChain));
 end;
 
-function TTls12ServerStateMachine.ResolveOcspStaple: TBytes;
-begin
-  if Assigned(FResolvedCredential.OcspStapleCallback) then
-    Result := FResolvedCredential.OcspStapleCallback
-  else
-    Result := FResolvedCredential.OcspStaple;
-end;
-
 function TTls12ServerStateMachine.BuildCertificateRequest: TBytes;
 var
   LRequest: TTlsCertificateRequest12;
@@ -672,7 +825,7 @@ begin
   // the SKE signature covers client_random + server_random + the ECDHE params (RFC 8422 5.4)
   LContent := TArrayUtilities.Concat(
     TArrayUtilities.Concat(FClientRandom, FServerRandom), AParams);
-  LSigner := FParams.Provider.Signing.CreateSignatureSigner(FSelectedScheme,
+  LSigner := FParams.Crypto.Signing.CreateSignatureSigner(FSelectedScheme,
     FResolvedCredential.PrivateKey);
   LSigner.Update(LContent, 0, System.Length(LContent));
   Result := LSigner.Sign;
@@ -691,12 +844,43 @@ begin
     THandshakeMessages.EncodeServerKeyExchangeEcdhe(LMsg));
 end;
 
+function TTls12ServerStateMachine.BuildServerKeyExchangePsk: TBytes;
+var
+  LMsg: TTlsServerKeyExchangeEcdhePsk;
+begin
+  // absent an application profile a server SHOULD NOT send a hint (RFC 4279 5.2), so it is empty
+  // unless the operator configured one
+  LMsg.IdentityHint := FParams.PskIdentityHint;
+  LMsg.NamedCurve := FGroupCode;
+  LMsg.PublicKey := FEcdhePublic;
+  Result := THandshakeFraming.Frame(TTlsHandshakeType.ServerKeyExchange,
+    THandshakeMessages.EncodeServerKeyExchangeEcdhePsk(LMsg));
+end;
+
+function TTls12ServerStateMachine.ProcessClientKeyExchangePsk(
+  const AMessage: TTlsHandshakeMessage): TArray<THandshakeEffect>;
+var
+  LCke: TTlsClientKeyExchangeEcdhePsk;
+  LShared, LPsk, LPreMaster: ISecretBuffer;
+begin
+  LCke := THandshakeMessages.DecodeClientKeyExchangeEcdhePsk(AMessage.Body);
+  FSelectedGroup.Decapsulate(FEcdhePrivate, LCke.PublicKey, LShared);
+  LPsk := PskSecretFor(LCke.Identity);
+  LPreMaster := TTls12PskPremaster.Build(LShared, LPsk);
+  Absorb(AMessage.Raw);
+  DeriveSecrets(LPreMaster, FTranscript.CurrentHash);
+  // no certificate was requested, so the client Finished follows directly
+  FPhase := TPhase.WaitClientFinished;
+  Result := TArray<THandshakeEffect>.Create(InstallReadKeys);
+end;
+
 procedure TTls12ServerStateMachine.DeriveSecrets(const APreMaster: ISecretBuffer;
   const ASessionHash: TBytes);
 begin
-  FSchedule := TTls12KeySchedule.Create(FParams.Provider,
+  FSchedule := TTls12KeySchedule.Create(FParams.Crypto,
     FSelectedSuite.Common.Hash, FSelectedSuite.Common.KeyLength, FSelectedSuite.Common.Aead);
   FSchedule.SetRandoms(FClientRandom, FServerRandom);
+  FSchedule.SetKeyLog(FParams.KeyLog, FClientRandom);
   FSchedule.SetPreMasterSecret(APreMaster);
   if FUseExtendedMasterSecret then
     FSchedule.DeriveExtendedMasterSecret(ASessionHash)
@@ -711,14 +895,14 @@ begin
   // flight (ClientKeyExchange, plus CertificateVerify under mutual TLS) is complete
   Result := THandshakeEffects.InstallKeys(FSchedule.TrafficKeys(TTlsEpoch.Application,
     TTlsDirection.ClientWrite), TRecordSide.ReadSide, FSelectedSuite.Common.Aead,
-    TTlsVersion.Tls12);
+    TTlsVersion.Tls12, TTlsEpoch.Application);
 end;
 
 function TTls12ServerStateMachine.ProcessClientCertificate(
   const AMessage: TTlsHandshakeMessage): TArray<THandshakeEffect>;
 var
   LAlert: TTlsAlertDescription;
-  LValidated: TArray<TBytes>;
+  LVerified: TVerifiedChain;
 begin
   Result := nil;
   FClientCertChain := THandshakeMessages.DecodeCertificate12(AMessage.Body);
@@ -736,24 +920,15 @@ begin
   begin
     // a client leaf that is not a well-formed certificate is a decode error, caught before
     // the verifier (which, for -require-any-client-certificate, does not parse the chain)
-    FParsedClientLeaf := TCertificateVerify.ParseWellFormedLeaf(FParams.Provider,
+    FParsedClientLeaf := TCertificateVerify.ParseWellFormedLeaf(FParams.Inspector,
       FClientCertChain[0]);
-    // fail-closed: without a verifier there is no basis to trust the chain (LAlert would
-    // otherwise be read unassigned when the nil check short-circuits the Verify call)
-    if FParams.ClientCertificateVerifier = nil then
-      raise EFatalAlertTlsLibException.CreateRes(
-        TTlsAlertDescription.InternalError, @SNoClientCertificateVerifier);
-    if not FParams.ClientCertificateVerifier.VerifyClientCertificate(FClientCertChain,
-      LValidated, LAlert) then
+    if not TCertificateVerify.VerifyClientChain(FParams.ClientCertificateVerifier,
+      FClientCertChain, LVerified, LAlert) then
       raise EFatalAlertTlsLibException.CreateRes(LAlert, @SUntrustedClientCertificate);
-    // surface the validated client chain for connection info (read-only)
+    FPeerVerified := LVerified;
+    // surface the presented client chain and the validated path for connection info (read-only)
     Result := TArray<THandshakeEffect>.Create(
-      THandshakeEffects.PeerCertificateChain(FClientCertChain));
-    // async verdict: the pipeline accepted the client chain; park for the host's out-of-band
-    // decision (the buffered ClientKeyExchange/CertificateVerify/Finished resume on accept)
-    if FParams.AsyncVerdict then
-      TArrayUtilities.Append<THandshakeEffect>(Result,
-        THandshakeEffects.AwaitCertificateVerdict(FClientCertChain, '', nil));
+      THandshakeEffects.PeerCertificateChain(FClientCertChain, LVerified.ValidatedPath));
   end;
 
   FPhase := TPhase.WaitClientKeyExchange;
@@ -765,6 +940,8 @@ var
   LCke: TTlsClientKeyExchangeEcdhe;
   LShared: ISecretBuffer;
 begin
+  if FPskMode then
+    Exit(ProcessClientKeyExchangePsk(AMessage));
   LCke := THandshakeMessages.DecodeClientKeyExchangeEcdhe(AMessage.Body);
   // the ECDHE shared secret is the TLS 1.2 premaster secret (RFC 8422 5.10)
   FSelectedGroup.Decapsulate(FEcdhePrivate, LCke.PublicKey, LShared);
@@ -790,39 +967,40 @@ function TTls12ServerStateMachine.ProcessClientCertVerify(
 var
   LCertVerify: TTlsCertificateVerify;
   LScheme: TSignatureScheme;
-  LPublicKeyInfo: TBytes;
-  LVerifier: ISignatureVerifier;
+  LHandshakeLog: TBytes;
 begin
   LCertVerify := THandshakeMessages.DecodeCertificateVerify(AMessage.Body);
-  if not TSignatureScheme.TryFromCode(LCertVerify.Algorithm, LScheme) then
-    raise EFatalAlertTlsLibException.CreateRes(
-      TTlsAlertDescription.IllegalParameter, @SBadClientCertVerify);
-  // the client leaf must permit digitalSignature and, for an rsa_pss_rsae_* scheme, not
-  // be an id-RSASSA-PSS key (symmetric with the client verifying the server leaf)
-  TCertificateVerify.EnforceSigningLeafPolicy(FParsedClientLeaf, LScheme, False);
-  // the 1.2 CertificateVerify signs the raw handshake log through ClientKeyExchange;
-  // the scheme applies its own hash, so the suite PRF hash does not matter here
-  LPublicKeyInfo := FParsedClientLeaf.PublicKeyInfo;
-  LVerifier := FParams.Provider.Signing.CreateSignatureVerifier(LScheme, LPublicKeyInfo);
-  LVerifier.Update(FHandshakeLog.Bytes, 0, FHandshakeLog.Size);
-  // the parsed leaf is no longer needed; release it rather than pin the ASN.1 graph
-  FParsedClientLeaf := nil;
-  if not LVerifier.Verify(LCertVerify.Signature) then
-    raise EFatalAlertTlsLibException.CreateRes(
-      TTlsAlertDescription.DecryptError, @SBadClientCertVerify);
+  // the client may sign only with a scheme the CertificateRequest advertised (RFC 5246 7.4.8) whose
+  // key family the client leaf can produce; one outside that set is a wrong signature type
+  LScheme := TPeerAuthentication.RequirePeerScheme(FParams.ClientAuthSignatureSchemes,
+    LCertVerify.Algorithm, TTlsVersion.Tls12, FParsedClientLeaf);
+  FPeerSignatureScheme := LCertVerify.Algorithm;
+  // the 1.2 CertificateVerify signs the raw handshake log through ClientKeyExchange; the scheme
+  // applies its own hash, so the suite PRF hash does not matter here (the stream buffer is capacity-
+  // sized, so verify over exactly the logged bytes)
+  LHandshakeLog := System.Copy(FHandshakeLog.Bytes, 0, FHandshakeLog.Size);
+  TPeerAuthentication.VerifyPeerSignature(FParams.Crypto, FParsedClientLeaf, LScheme,
+    LHandshakeLog, LCertVerify.Signature);
   Absorb(AMessage.Raw);
 
   FPhase := TPhase.WaitClientFinished;
   Result := TArray<THandshakeEffect>.Create(InstallReadKeys);
+  // park only after the key proof so an unproven certificate never costs a fetch or a host decision
+  if TPeerAuthentication.ShouldPark(FParams.Deferral, FPeerVerified.Outcome) then
+    TArrayUtilities.Append<THandshakeEffect>(Result, ParkForVerdict(FClientCertChain,
+      FPeerVerified.ValidatedPath, '', nil, FParams.RevocationPosture));
+  FPeerVerified := Default(TVerifiedChain);
 end;
 
 function TTls12ServerStateMachine.TryAcceptResumption(
   const AHello: TTlsClientHello; const AContext: TExtensionContext): Boolean;
 var
   LSession: IResumableSession;
+  L12: ITls12ResumableSession;
   LViaTicket: Boolean;
   LNowMs: UInt64;
   LSuite: TTlsCipherSuite;
+  LPsk: ISecretBuffer;
 begin
   Result := False;
   LSession := nil;
@@ -834,7 +1012,9 @@ begin
   if (LSession = nil) and (FParams.SessionStore <> nil) and
     (System.Length(AHello.LegacySessionId) > 0) then
   begin
-    if FParams.SessionStore.Take(AHello.LegacySessionId, LSession) then
+    // a session id is reusable (RFC 5246 7.4.1.2) and travels in the clear, so it is looked up
+    // without being removed: a replayed id cannot evict the victim's stored session
+    if FParams.SessionStore.Peek(AHello.LegacySessionId, LSession) then
       LViaTicket := False;
   end;
   if LSession = nil then
@@ -844,11 +1024,21 @@ begin
   // guard): a host mismatch falls through to a full handshake under the requested name
   if not SameText(LSession.ServerName, FRequestedServerName) then
     Exit;
+  // resumption-scope guard: a ticket/session minted under a different scope belongs to a
+  // configuration that may not share this one's client-auth trust, so decline it to a full
+  // handshake rather than reuse its stored identity
+  if not TArrayUtilities.AreEqual(LSession.ResumptionScope, FParams.ResumptionScope) then
+    Exit;
   // the recovered session must be a live 1.2 session whose suite the client still offers
   if LSession.Version.WireValue <> TlsWireVersionTls12 then
     Exit;
+  if not Supports(LSession, ITls12ResumableSession, L12) then
+    Exit;
   LNowMs := FParams.Clock.NowUnixMillis;
   if LNowMs >= LSession.IssuedAtMillis + UInt64(LSession.TicketLifetime) * 1000 then
+    Exit;
+  // renewals do not extend the chain: a session is resumable for seven days from its authentication
+  if TClientSessionPolicy.AuthenticationLapsed(LSession.AuthenticatedAtMillis, LNowMs) then
     Exit;
   if not FParams.CipherSuites.TryGet(LSession.CipherSuite, LSuite) then
     Exit;
@@ -857,59 +1047,125 @@ begin
   if not (TArrayUtilities.Contains<UInt16>(AHello.CipherSuites,
     LSession.CipherSuite)) then
     Exit;
-  // Extended Master Secret must be consistent across the resumption (RFC 7627 5.3):
-  // resume only when the ClientHello's EMS offer matches the original session
-  if LSession.ExtendedMasterSecret <> AContext.ExtendedMasterSecret then
+  // RFC 7627 5.3: an EMS session offered again without EMS MUST abort (a handshake_failure, 5.2 / 5.3) -
+  // the omission signals a downgrade (or an attacker stripping the extension) - while a non-EMS
+  // session now offered with EMS simply declines to a full handshake
+  if L12.ExtendedMasterSecret and not AContext.ExtendedMasterSecret then
+    raise EFatalAlertTlsLibException.CreateRes(
+      TTlsAlertDescription.HandshakeFailure, @SResumedEmsDowngrade);
+  if AContext.ExtendedMasterSecret and not L12.ExtendedMasterSecret then
+    Exit;
+  // a server that requires EMS must not resume a session established without it; decline to a full
+  // handshake, which then enforces the requirement (RFC 7627 5.3)
+  if FParams.RequireExtendedMasterSecret and not L12.ExtendedMasterSecret then
     Exit;
   // mutual-TLS resumption gate (an abbreviated handshake re-runs no client auth): a Required
   // server offered a ticket/session with no stored client identity falls through to a full
   // handshake that requests the certificate. Verification is otherwise not repeated on resume
   if (FParams.ClientAuth = TClientAuthMode.Required) and
-    (System.Length(LSession.PeerCertificates) = 0) then
+    (System.Length(LSession.PeerCertificates) = 0) and (System.Length(L12.PskIdentity) = 0) then
+    Exit;
+  // a PSK session resumes only while its key is still configured with the same secret, so removing
+  // or rotating a key ends the sessions it authenticated
+  if System.Length(L12.PskIdentity) > 0 then
+  begin
+    LPsk := FindPsk(L12.PskIdentity);
+    if LPsk = nil then
+      Exit;
+    if not TSecureMemory.ConstantTimeAreEqual(
+      TPskSessionBinding.Derive(FParams.Crypto, LPsk), L12.PskBinding) then
+      Exit;
+  end;
+  // neither the session nor this hello used EMS (the checks above settled that): RFC 7627 5.3 says a
+  // server SHOULD abort, or continue only for legacy insecure resumption (5.4). Placed after the
+  // gates so an abort replaces only a resumption that would otherwise happen, and before the ticket
+  // is consumed so an abort does not use up a single-use ticket
+  if not L12.ExtendedMasterSecret then
+    case FParams.NonEmsResumption of
+      TNonEmsResumption.Decline:
+        Exit;
+      TNonEmsResumption.Abort:
+        raise EFatalAlertTlsLibException.CreateRes(
+          TTlsAlertDescription.HandshakeFailure, @SNonEmsResumptionRefused);
+    end;
+
+  // commit the ticket only now that every check passed; a single-use strategy declines one that
+  // another connection already used up
+  if LViaTicket and not FTicketStrategy.Consume(AContext.SessionTicket) then
     Exit;
 
-  FResumedSession := LSession;
-  FResumedViaTicket := LViaTicket;
+  FResumedSession := L12;
+  FResumedByStoreId := not LViaTicket;
+  // an abbreviated handshake has no key exchange: it reports the original session's group and signer
+  FGroupCode := L12.NamedGroup;
+  FPeerSignatureScheme := L12.PeerSignatureScheme;
+  FPskIdentity := L12.PskIdentity;
+  FPskBinding := L12.PskBinding;
   FSelectedSuite := LSuite;
-  FUseExtendedMasterSecret := LSession.ExtendedMasterSecret;
+  FUseExtendedMasterSecret := L12.ExtendedMasterSecret;
   FSessionId := System.Copy(AHello.LegacySessionId);
   // renew the ticket on an abbreviated handshake so single-use tickets stay resumable
   FIssueNewTicket := (FTicketStrategy <> nil) and AContext.SessionTicketOffered;
   Result := True;
 end;
 
-function TTls12ServerStateMachine.EmittedTicketLifetime: UInt32;
+function TTls12ServerStateMachine.Facts: TNegotiationFacts;
 begin
-  // a server MUST NOT advertise or honour a lifetime above the RFC 8446 4.6.1 ceiling
-  Result := FParams.TicketLifetimeSeconds;
-  if Result > MaxTicketLifetimeSeconds then
-    Result := MaxTicketLifetimeSeconds;
+  Result := Default(TNegotiationFacts);
+  Result.PeerSignatureScheme := FPeerSignatureScheme;
+  // 0-RTT is TLS 1.3 only, so a TLS 1.2 server never takes it, configured or not
+  Result.EarlyDataReason := TEarlyDataReason.ProtocolVersion;
 end;
 
 function TTls12ServerStateMachine.BuildStoredSession(
   const ASessionId: TBytes): IResumableSession;
+var
+  LChainForTicket: TArray<TBytes>;
+  LNowMs, LAuthenticatedAtMs: UInt64;
 begin
-  // carry the verified client chain so a resumed mutual-TLS connection surfaces it (empty on a
-  // non-mTLS handshake)
-  Result := TResumableSession.CreateTls12(FSelectedSuite.Common.Code,
+  // carry the client chain forward so a re-issued ticket does not drop the client identity and
+  // force the next connection to a full handshake; a resumed chain is only ever one accepted under
+  // this configuration's own scope, so re-sealing it launders no foreign identity. Empty on a
+  // non-mTLS handshake.
+  if System.Length(FClientCertChain) > 0 then
+    LChainForTicket := FClientCertChain
+  else if FResumedSession <> nil then
+    LChainForTicket := FResumedSession.PeerCertificates
+  else
+    LChainForTicket := nil;
+  // derived at store time so a known identity does no extra work before the Finished
+  if (System.Length(FPskBinding) = 0) and (System.Length(FPskIdentity) > 0) then
+    FPskBinding := TPskSessionBinding.Derive(FParams.Crypto, FindPsk(FPskIdentity));
+  LNowMs := FParams.Clock.NowUnixMillis;
+  // a renewal keeps the original authentication time and advertises only the days left of the seven
+  LAuthenticatedAtMs := LNowMs;
+  if FResumedSession <> nil then
+    LAuthenticatedAtMs := FResumedSession.AuthenticatedAtMillis;
+  Result := TTls12ResumableSession.Create(FSelectedSuite.Common.Code,
     FSelectedSuite.Common.Hash, FSchedule.MasterSecret, ASessionId, nil,
-    FUseExtendedMasterSecret, '', FRequestedServerName, EmittedTicketLifetime, 0,
-    FParams.Clock.NowUnixMillis, FClientCertChain);
+    FUseExtendedMasterSecret, nil, FRequestedServerName,
+    TClientSessionPolicy.RenewedTicketLifetime(FParams.TicketLifetimeSeconds,
+    LAuthenticatedAtMs, LNowMs), LNowMs, LChainForTicket, FParams.ResumptionScope, FPskIdentity,
+    FPskBinding, FGroupCode, FPeerSignatureScheme, LAuthenticatedAtMs);
 end;
 
-function TTls12ServerStateMachine.BuildNewSessionTicketMessage: TBytes;
+function TTls12ServerStateMachine.BuildNewSessionTicketMessage(out ASealed: Boolean): TBytes;
 var
   LMsg: TTls12NewSessionTicket;
   LTicket: TBytes;
+  LStored: IResumableSession;
 begin
-  Result := nil;
-  // the ticket seals the session (no session id) under the current STEK
-  LTicket := FTicketStrategy.Seal(BuildStoredSession(nil));
-  // an empty seal means the strategy declined (e.g. an oversized chain over the cap): issue no
-  // ticket rather than an unusable one
-  if System.Length(LTicket) = 0 then
-    Exit;
-  LMsg.TicketLifetimeHint := EmittedTicketLifetime;
+  // a declined seal still sends a zero-length NewSessionTicket, as session_ticket was echoed (RFC 5077 3.3)
+  LStored := BuildStoredSession(nil);
+  // a zero from the chain's last millisecond would read as "unspecified" (RFC 5077 3.3): seal nothing
+  LTicket := nil;
+  if (LStored.TicketLifetime > 0) or (FParams.TicketLifetimeSeconds = 0) then
+    LTicket := FTicketStrategy.Seal(LStored);
+  ASealed := System.Length(LTicket) > 0;
+  if not ASealed then
+    LMsg.TicketLifetimeHint := 0
+  else
+    LMsg.TicketLifetimeHint := LStored.TicketLifetime;
   LMsg.Ticket := LTicket;
   Result := THandshakeFraming.Frame(TTlsHandshakeType.NewSessionTicket,
     THandshakeMessages.EncodeTls12NewSessionTicket(LMsg));
@@ -919,40 +1175,46 @@ function TTls12ServerStateMachine.EmitAbbreviatedFlight(
   const AClientHelloRaw: TBytes): TArray<THandshakeEffect>;
 var
   LServerHello, LNst, LServerFinished, LVerifyData: TBytes;
+  LSealed: Boolean;
 begin
-  // resuming a 1.2 session is the client's explicit choice, so no downgrade sentinel
-  FServerRandom := System.Copy(FParams.ServerRandom);
+  StampServerRandom;
 
   // the abbreviated transcript is ClientHello, ServerHello, [NewSessionTicket]; the raw
   // handshake log is unused (no CertificateVerify on an abbreviated handshake)
   FTranscript.Update(AClientHelloRaw);
-  FTranscript.Activate(FParams.Provider.Primitives.CreateHash(FSelectedSuite.Common.Hash));
+  FTranscript.Activate(FParams.Crypto.Primitives.CreateHash(FSelectedSuite.Common.Hash));
   LServerHello := BuildServerHello;
   FTranscript.Update(LServerHello);
 
   // reuse the stored master secret; the key block re-expands under the new randoms
-  FSchedule := TTls12KeySchedule.Create(FParams.Provider,
+  FSchedule := TTls12KeySchedule.Create(FParams.Crypto,
     FSelectedSuite.Common.Hash, FSelectedSuite.Common.KeyLength, FSelectedSuite.Common.Aead);
   FSchedule.SetRandoms(FClientRandom, FServerRandom);
+  FSchedule.SetKeyLog(FParams.KeyLog, FClientRandom);
   FSchedule.SetMasterSecret(FResumedSession.MasterSecret);
   FSchedule.DeriveKeyBlock;
 
   Result := TArray<THandshakeEffect>.Create(
     THandshakeEffects.SendHandshake(LServerHello));
+  // surface the protocol the ServerHello selected on the connection info
+  if System.Length(FSelectedAlpn) > 0 then
+    TArrayUtilities.Append<THandshakeEffect>(Result,
+      THandshakeEffects.SelectAlpn(FSelectedAlpn));
+  // limits bind protected records only (RFC 8449 4)
+  if FPeerRecordSizeLimit > 0 then
+    TArrayUtilities.Append<THandshakeEffect>(Result,
+      THandshakeEffects.SetRecordSizeLimit(FPeerRecordSizeLimit, FParams.RecordSizeLimit));
   // a resumed handshake sends no Certificate, so surface the client chain the session carried
   // (mutual-TLS resumption); empty on a non-mTLS session
   if System.Length(FResumedSession.PeerCertificates) > 0 then
     TArrayUtilities.Append<THandshakeEffect>(Result,
-      THandshakeEffects.PeerCertificateChain(FResumedSession.PeerCertificates));
+      THandshakeEffects.PeerCertificateChain(FResumedSession.PeerCertificates, nil));
   if FIssueNewTicket then
   begin
-    LNst := BuildNewSessionTicketMessage;
-    if System.Length(LNst) > 0 then
-    begin
-      FTranscript.Update(LNst);
-      TArrayUtilities.Append<THandshakeEffect>(Result,
-        THandshakeEffects.SendHandshake(LNst));
-    end;
+    LNst := BuildNewSessionTicketMessage(LSealed);
+    FTranscript.Update(LNst);
+    TArrayUtilities.Append<THandshakeEffect>(Result,
+      THandshakeEffects.SendHandshake(LNst));
   end;
 
   // the server Finished is over ClientHello, ServerHello, [NewSessionTicket]
@@ -967,7 +1229,7 @@ begin
   TArrayUtilities.Append<THandshakeEffect>(Result,
     THandshakeEffects.InstallKeys(FSchedule.TrafficKeys(TTlsEpoch.Application,
     TTlsDirection.ServerWrite), TRecordSide.WriteSide, FSelectedSuite.Common.Aead,
-    TTlsVersion.Tls12));
+    TTlsVersion.Tls12, TTlsEpoch.Application));
   TArrayUtilities.Append<THandshakeEffect>(Result,
     THandshakeEffects.SendHandshake(LServerFinished));
   // the read side (client write keys) awaits the client's encrypted Finished
@@ -983,23 +1245,26 @@ begin
     FTranscript.CurrentHash, AMessage.Body) then
     raise EFatalAlertTlsLibException.CreateRes(TTlsAlertDescription.DecryptError,
       @SBadClientFinished);
-  // a session-id resumption consumed the stored session (single-use Take); re-store it so
-  // the session stays resumable until it expires
-  if (not FResumedViaTicket) and (FParams.SessionStore <> nil) and
-    (System.Length(FSessionId) > 0) then
-    FParams.SessionStore.PutWithId(FSessionId, FResumedSession);
+  if FResumedByStoreId then
+    FOwnedStoreId := FSessionId;
   FPhase := TPhase.Connected;
-  // an abbreviated resumption performs no fresh key exchange, so there is no negotiated group
+  MarkConnected;
   Result := TArray<THandshakeEffect>.Create(
-    THandshakeEffects.ConnectionParams(FSelectedSuite.Common.Code, 0, True,
-    FRequestedServerName),
+    THandshakeEffects.ConnectionParams(FSelectedSuite.Common.Code, FGroupCode, True,
+    FUseExtendedMasterSecret, FRequestedServerName, Facts),
     THandshakeEffects.HandshakeEstablished);
+  if System.Length(FPskIdentity) > 0 then
+    TArrayUtilities.Append<THandshakeEffect>(Result,
+      THandshakeEffects.PskIdentity(FPskIdentity));
+  // the read keys are installed; release the handshake-stage material
+  FSchedule.ForgetHandshakeSecrets;
 end;
 
 function TTls12ServerStateMachine.ProcessClientFinished(
   const AMessage: TTlsHandshakeMessage): TArray<THandshakeEffect>;
 var
   LVerifyData, LServerFinished, LNst: TBytes;
+  LSealed: Boolean;
 begin
   // the client Finished is over the transcript through ClientKeyExchange
   if not FSchedule.VerifyFinished(TTlsDirection.ClientWrite,
@@ -1009,21 +1274,22 @@ begin
   FTranscript.Update(AMessage.Raw);
 
   Result := nil;
+  LSealed := False;
   // a NewSessionTicket (RFC 5077) is sent plaintext before the server ChangeCipherSpec
   // and is folded into the transcript the server Finished covers
   if FIssueNewTicket then
   begin
-    LNst := BuildNewSessionTicketMessage;
-    if System.Length(LNst) > 0 then
-    begin
-      FTranscript.Update(LNst);
-      TArrayUtilities.Append<THandshakeEffect>(Result,
-        THandshakeEffects.SendHandshake(LNst));
-    end;
+    LNst := BuildNewSessionTicketMessage(LSealed);
+    FTranscript.Update(LNst);
+    TArrayUtilities.Append<THandshakeEffect>(Result,
+      THandshakeEffects.SendHandshake(LNst));
   end;
-  // session-id resumption stores the session under the id echoed in the ServerHello
-  if (FParams.SessionStore <> nil) and (System.Length(FSessionId) > 0) then
+  // the id echoed in the ServerHello is stored unless a sealed ticket already carries the session
+  if (FParams.SessionStore <> nil) and (System.Length(FSessionId) > 0) and (not LSealed) then
+  begin
     FParams.SessionStore.PutWithId(FSessionId, BuildStoredSession(FSessionId));
+    FOwnedStoreId := FSessionId;
+  end;
 
   // the server Finished is over the transcript INCLUDING the client Finished and any ticket
   LVerifyData := FSchedule.ComputeVerifyData(TTlsDirection.ServerWrite,
@@ -1033,6 +1299,7 @@ begin
   FTranscript.Update(LServerFinished);
 
   FPhase := TPhase.Connected;
+  MarkConnected;
   // change_cipher_spec, then the write side moves to the application keys, then the
   // encrypted server Finished is sent
   TArrayUtilities.Append<THandshakeEffect>(Result,
@@ -1040,15 +1307,21 @@ begin
   TArrayUtilities.Append<THandshakeEffect>(Result,
     THandshakeEffects.InstallKeys(FSchedule.TrafficKeys(TTlsEpoch.Application,
     TTlsDirection.ServerWrite), TRecordSide.WriteSide, FSelectedSuite.Common.Aead,
-    TTlsVersion.Tls12));
+    TTlsVersion.Tls12, TTlsEpoch.Application));
   TArrayUtilities.Append<THandshakeEffect>(Result,
     THandshakeEffects.SendHandshake(LServerFinished));
+  if FPskMode then
+    TArrayUtilities.Append<THandshakeEffect>(Result,
+      THandshakeEffects.PskIdentity(FPskIdentity));
   // a full TLS 1.2 handshake is always ECDHE (the only 1.2 key exchange): report FGroupCode
   TArrayUtilities.Append<THandshakeEffect>(Result,
     THandshakeEffects.ConnectionParams(FSelectedSuite.Common.Code, FGroupCode, False,
-    FRequestedServerName));
+    FUseExtendedMasterSecret, FRequestedServerName, Facts));
   TArrayUtilities.Append<THandshakeEffect>(Result,
     THandshakeEffects.HandshakeEstablished);
+  // the stored session captured the master secret and the write keys are installed; release the
+  // handshake-stage material (the master secret stays for the RFC 5705 exporter)
+  FSchedule.ForgetHandshakeSecrets;
 end;
 
 function TTls12ServerStateMachine.Route(
@@ -1089,25 +1362,52 @@ begin
         Result := ProcessAbbreviatedClientFinished(AMessage)
       else
         Result := Unexpected;
+    TPhase.Connected:
+      // this server does not renegotiate: a renegotiation ClientHello is answered with a warning
+      // no_renegotiation and the connection continues (RFC 5246 7.2.2)
+      if LKnown and (LType = TTlsHandshakeType.ClientHello) then
+        Result := RefuseRenegotiation
+      else
+        Result := Unexpected;
   else
     Result := Unexpected;
   end;
 end;
 
 function TTls12ServerStateMachine.ExportKeyingMaterial(const ALabel: string;
-  const AContext: TBytes; AUseContext: Boolean; ALength: Int32): TBytes;
+  ALength: Int32): TBytes;
 begin
   // TLS 1.2 stays gated on completion (no False Start), so query and operation agree: the master
   // exists from ClientKeyExchange, but the exporter is not offered before the handshake completes
   Result := nil;
-  if (FSchedule = nil) or (FPhase <> TPhase.Connected) then
+  if not CanExportKeyingMaterial then
     Exit;
-  Result := FSchedule.ExportKeyingMaterial(ALabel, AContext, AUseContext, ALength);
+  Result := FSchedule.ExportKeyingMaterial(ALabel, ALength);
+end;
+
+function TTls12ServerStateMachine.ExportKeyingMaterial(const ALabel: string;
+  const AContext: TBytes; ALength: Int32): TBytes;
+begin
+  Result := nil;
+  if not CanExportKeyingMaterial then
+    Exit;
+  Result := FSchedule.ExportKeyingMaterial(ALabel, AContext, ALength);
 end;
 
 function TTls12ServerStateMachine.CanExportKeyingMaterial: Boolean;
 begin
-  Result := FPhase = TPhase.Connected;
+  // without Extended Master Secret the master secret can be synchronised across connections, so an
+  // exporter would not be unique to this session (RFC 7627 5.4)
+  Result := (Stage = THandshakeStage.Connected) and (FSchedule <> nil) and FSchedule.CanExport and
+    FUseExtendedMasterSecret;
+end;
+
+procedure TTls12ServerStateMachine.ForgetSessionsOnFatal;
+begin
+  // RFC 5246 7.2.2: a fatal alert ends resumption; 1.2 tickets are stateless, so only the proven id goes
+  if (FParams.SessionStore <> nil) and (System.Length(FOwnedStoreId) > 0) then
+    FParams.SessionStore.Remove(FOwnedStoreId);
+  FOwnedStoreId := nil;
 end;
 
 end.

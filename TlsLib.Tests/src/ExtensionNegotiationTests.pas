@@ -40,7 +40,10 @@ uses
   TlpHandshakeEffect,
   TlpHandshakeMessage,
   TlpHandshakeMessages,
+  TlpAlpnProtocols,
   TlpExtensionContext,
+  TlpExtensionVector,
+  TlpEchExtension,
   TlpITlsExtension,
   TlpExtensionBlockCodec,
   TlpTlsLibExceptions,
@@ -50,73 +53,120 @@ uses
   TlpZlibCertificateCompression,
   TlpICertificateTrust,
   TlpServerName,
+  TlpCertificateLimits,
   TlpCertificateVerifier,
+  TlpEchServer,
+  TlpEchKeyGen,
+  TlpIEch,
+  TlpInMemoryEchKeyStore,
+  TlpCryptoDomainTypes,
   TlpTlsCredential,
+  TlpITlsCredentialResolver,
   TlpCredentialResolvers,
   TlpTls13ClientStateMachine,
   TlpTls13ServerStateMachine,
-  TlsLibTestBase;
+  TlpTls12ClientStateMachine,
+  TlpTls12ServerStateMachine,
+  TlpTlsVersion,
+  MockCertificateCompression,
+  TlsLibHandshakeTestBase,
+  TlsLibTestCertificates,
+  TlsLibTestHandshakeDecoder;
 
 type
-  TTestExtensionNegotiation = class(TTlsLibAlgorithmTestCase)
+  TTestExtensionNegotiation = class(TTlsLibHandshakeTestCase)
   private
-    function TestRootCertificate: TBytes;
-    function ServerCredential: TTlsCredential;
-    function NewClient(const AAlpn: TArray<string>; ARecordSizeLimit: Int32): ITlsEngine;
-    function NewServer(const AAlpn: TArray<string>; ARecordSizeLimit: Int32): ITlsEngine;
-    function Drain(const AEngine: ITlsEngine): TBytes;
-    procedure Feed(const AEngine: ITlsEngine; const AWire: TBytes);
-    procedure Pump(const ASrc, ADst: ITlsEngine);
-    function ReadAllApp(const AEngine: ITlsEngine): TBytes;
+    function NewClient(const AAlpn: TArray<TBytes>; ARecordSizeLimit: Int32): ITlsEngine;
+    function NewServer(const AAlpn: TArray<TBytes>; ARecordSizeLimit: Int32): ITlsEngine;
+    function NewClient12(ARecordSizeLimit: Int32): ITlsEngine;
+    function NewServer12(ARecordSizeLimit: Int32): ITlsEngine;
     procedure Handshake(const AClient, AServer: ITlsEngine);
     function MaxAppRecordLength(const AWire: TBytes): Int32;
     function AppRecordCount(const AWire: TBytes): Int32;
-    function NewClientMachine(const AAlpn: TArray<string>): IHandshakeMachine;
-    function NewClientMachineWith(const AAlpn: TArray<string>;
-      const ADecompressors: TArray<ICertificateDecompressor>): IHandshakeMachine;
-    function NewServerMachine(const AAlpn: TArray<string>): IHandshakeMachine;
+    function NewClientMachine(const AAlpn: TArray<TBytes>): IHandshakeMachine;
+    function NewClientMachineWith(const AAlpn: TArray<TBytes>;
+      const ADecompressors: TArray<ICertificateDecompressor>;
+      const ALimits: TCertificateChainLimits): IHandshakeMachine;
+    function NewServerMachine(const AAlpn: TArray<TBytes>): IHandshakeMachine;
+    function NewServerMachineLimited(const AAlpn: TArray<TBytes>;
+      ARecordSizeLimit: Int32): IHandshakeMachine;
+    // a server machine deployed as a split-mode ECH backend (accepts an inner-type ech)
+    function NewEchServerMachine(const AEchPolicy: IEchServerPolicy): IHandshakeMachine;
+    // a real ClientHello with an inner-type encrypted_client_hello spliced in (a decrypted inner)
+    function EchClientHello(const AEchBody: TBytes): TBytes;
+    function InnerEchClientHello: TBytes;
+    function OuterEchClientHello: TBytes;
     function NewServerMachineWith(const AChain: TArray<TBytes>;
       const ACompressors: TArray<ICertificateCompressor>): IHandshakeMachine;
-    function CredentialWithChain(const AChain: TArray<TBytes>): TTlsCredential;
+    // an ECDSA leaf under an issuer signed with SHA-1, which no stock client advertises
+    function Sha1Chain: TArray<TBytes>;
+    function RsaSha1Chain: TArray<TBytes>;
+    function NewServer12WithChain(const AChain: TArray<TBytes>): ITlsEngine;
+    function NewServerMachineForResolver(
+      const AResolver: ITlsServerCredentialResolver): IHandshakeMachine;
+    // a real ClientHello with a signature_algorithms_cert extension appended
+    function ClientHelloWithCertSchemes(const ACertSchemes: TArray<UInt16>): TBytes;
     function DriveServerCertMessage(const AClient,
       AServer: IHandshakeMachine): TTlsHandshakeMessage;
     function PlaintextCertBody(const AChain: TArray<TBytes>): TBytes;
     function CompressibleChain: TArray<TBytes>;
     function IncompressibleChain: TArray<TBytes>;
     function ZlibCompress(const AData: TBytes): TBytes;
-    function MsgFrom(const AFramed: TBytes): TTlsHandshakeMessage;
-    function FirstSendHandshake(const AEffects: TArray<THandshakeEffect>): TBytes;
-    function AllSendHandshake(const AEffects: TArray<THandshakeEffect>): TArray<TBytes>;
-    function FailAlertOf(const AEffects: TArray<THandshakeEffect>;
-      out AAlert: TTlsAlertDescription): Boolean;
-    function BuildEncryptedExtensionsWithAlpn(const AProtocol: string): TBytes;
+    function BuildEncryptedExtensionsWithAlpn(const AProtocol: TBytes): TBytes;
+    function BuildEncryptedExtensionsWithExtension(AType: UInt16): TBytes;
+    function GreaseExtensionTypeOf(const AClientHelloFramed: TBytes): UInt16;
     function NewGreasingClient: ITlsEngine;
-    function ServerHelloFrom(const AWire: TBytes): TTlsServerHello;
-    function DriveClientToWaitCertificate(
+    function NewGreasingClientMachine: IHandshakeMachine;
+    function DriveClientToWaitCertificate(const ALimits: TCertificateChainLimits;
       out AServerFlight: TArray<TBytes>): IHandshakeMachine;
     function CompressedCertificateOf(AAlgorithm: UInt16;
       AUncompressedLength: Int32; const ACompressed: TBytes): TBytes;
   published
     procedure TestAlpnNegotiatesAndSurfaces;
     procedure TestAlpnNoOverlapAborts;
+    procedure TestAlpnBinaryNameNegotiates;
+    procedure TestAlpnLookalikeOfferDoesNotMatch;
     procedure TestNoAlpnConfiguredSurfacesEmpty;
     procedure TestClientRejectsUnofferedAlpnEcho;
     procedure TestRecordSizeLimitCapsOutboundRecords;
     procedure TestServerRejectsRecordSizeLimitBelowMinimum;
+    procedure TestServerLimitWithoutClientOfferStillCompletes;
+    procedure TestClientAppliesNoInboundLimitWhenServerOmitsIt;
+    procedure TestServerOmitsUnofferedRecordSizeLimit;
+    procedure TestTls12RecordSizeLimitCapsOutboundRecords;
+    procedure TestServerRejectsNonNullCompressionOnTls13;
+    procedure TestTls13ServerRefusesAChainSignedWithAnUnadvertisedHash;
+    procedure TestTls13ServerRefusesAnRsaSha1ChainTheClientDidNotAdvertise;
+    procedure TestTls13ServerSendsTheChainWhenCertSchemesAdvertiseItsHash;
+    procedure TestTls12ServerRefusesAChainSignedWithAnUnadvertisedHash;
+    procedure TestResolverSeesSignatureAlgorithmsWhenNoCertVariantIsSent;
+    procedure TestResolverSeesSignatureAlgorithmsCertWhenPresent;
     procedure TestGreaseValueClassification;
     procedure TestClientGreaseToleratedAndNeverSelected;
     procedure TestUnknownHandshakeTypeUnexpected;
     procedure TestCertificateVerifyBeforeCertificateUnexpected;
     procedure TestClientAcceptsCompressedCertificate;
     procedure TestClientRejectsCompressedCertificateBomb;
+    procedure TestClientRejectsCompressedCertificateOverTheChainBudget;
+    procedure TestClientAcceptsCompressedCertificateAtTheChainBudget;
     procedure TestClientRejectsUnadvertisedCompressionAlgorithm;
+    procedure TestClientRejectsNonEmptyCertificateRequestContext;
     procedure TestServerEmitsCompressedCertificate;
-    procedure TestServerSkipsCompressionWhenNotSmaller;
+    procedure TestServerCompressesEvenWhenLarger;
+    procedure TestServerSendsUncompressedWhenCompressorDeclines;
     procedure TestCertificateCompressionIsInjectable;
     procedure TestEcPointFormatsRoundTrip;
     procedure TestEcPointFormatsWithoutUncompressedRejected;
+    procedure TestStatusRequestInCertificateRequestIsPermittedAndIgnored;
     procedure TestAlpnServerHelloSelectionRoundTrip;
     procedure TestAlpnServerHelloEmptyProtocolRejected;
+    procedure TestClientRejectsGreaseExtensionInEncryptedExtensions;
+    procedure TestGreaseInjectsBeforeEchThenPskThenEnd;
+    procedure TestGreaseExtensionIsLastInPlainClientHello;
+    procedure TestServerRejectsInnerEchWithoutBackend;
+    procedure TestServerAcceptsInnerEchWhenBackend;
+    procedure TestBackendServerRejectsOuterEch;
+    procedure TestKeyedServerRejectsInnerEch;
   end;
 
 implementation
@@ -126,45 +176,30 @@ const
   CustomCertCompressionAlgo = UInt16($FF01);
 
 type
-  // a stand-in compression backend under a private codepoint: it reuses zlib bytes,
-  // so a green test proves the seam dispatches by injected algorithm, not a fixed path
-  TCustomCertCompressor = class(TInterfacedObject, ICertificateCompressor)
+  // hands out one credential and keeps the ClientHello facts it was asked about
+  TRecordingCredentialResolver = class(TInterfacedObject, ITlsServerCredentialResolver)
+  strict private
+    FCredential: TTlsCredential;
+    FHello: TTlsClientHelloInfo;
   public
-    function Algorithm: UInt16;
-    function Compress(const AData: TBytes): TBytes;
+    constructor Create(const ACredential: TTlsCredential);
+    function TryResolve(const AClientHello: TTlsClientHelloInfo;
+      out ACredential: TTlsCredential): Boolean;
+    property Hello: TTlsClientHelloInfo read FHello;
   end;
 
-  TCustomCertDecompressor = class(TInterfacedObject, ICertificateDecompressor)
-  public
-    function Algorithm: UInt16;
-    function Decompress(const ACompressed: TBytes; AMaxLength: Int32): TBytes;
-  end;
-
-function TCustomCertCompressor.Algorithm: UInt16;
+constructor TRecordingCredentialResolver.Create(const ACredential: TTlsCredential);
 begin
-  Result := CustomCertCompressionAlgo;
+  inherited Create;
+  FCredential := ACredential;
 end;
 
-function TCustomCertCompressor.Compress(const AData: TBytes): TBytes;
-var
-  LZlib: TArray<ICertificateCompressor>;
+function TRecordingCredentialResolver.TryResolve(const AClientHello: TTlsClientHelloInfo;
+  out ACredential: TTlsCredential): Boolean;
 begin
-  LZlib := TZlibCertificateCompression.DefaultCompressors;
-  Result := LZlib[0].Compress(AData);
-end;
-
-function TCustomCertDecompressor.Algorithm: UInt16;
-begin
-  Result := CustomCertCompressionAlgo;
-end;
-
-function TCustomCertDecompressor.Decompress(const ACompressed: TBytes;
-  AMaxLength: Int32): TBytes;
-var
-  LZlib: TArray<ICertificateDecompressor>;
-begin
-  LZlib := TZlibCertificateCompression.DefaultDecompressors;
-  Result := LZlib[0].Decompress(ACompressed, AMaxLength);
+  FHello := AClientHello;
+  ACredential := FCredential;
+  Result := True;
 end;
 
 { TTestExtensionNegotiation }
@@ -175,46 +210,21 @@ var
 begin
   // compress a Certificate body with the built-in zlib compressor
   LCompressors := TZlibCertificateCompression.DefaultCompressors;
-  Result := LCompressors[0].Compress(AData);
+  CheckTrue(LCompressors[0].TryCompress(AData, Result), 'zlib compressed the body');
 end;
 
-function TTestExtensionNegotiation.TestRootCertificate: TBytes;
-var
-  LCerts: TStringList;
-begin
-  LCerts := LoadVectorFields('Certs/EcP256Chain.txt');
-  try
-    Result := DecodeHex(LCerts.Values['root_cert']);
-  finally
-    LCerts.Free;
-  end;
-end;
-
-function TTestExtensionNegotiation.ServerCredential: TTlsCredential;
-var
-  LCerts: TStringList;
-begin
-  LCerts := LoadVectorFields('Certs/EcP256Chain.txt');
-  try
-    Result.CertificateChain := TArray<TBytes>.Create(
-      DecodeHex(LCerts.Values['leaf_cert']));
-    Result.PrivateKey := Provider.Signing.ImportSigningKey(DecodeHex(LCerts.Values['leaf_key']));
-  finally
-    LCerts.Free;
-  end;
-end;
-
-function TTestExtensionNegotiation.NewClient(const AAlpn: TArray<string>;
+function TTestExtensionNegotiation.NewClient(const AAlpn: TArray<TBytes>;
   ARecordSizeLimit: Int32): ITlsEngine;
 var
   LParams: TClientHandshakeParams;
 begin
   LParams := Default(TClientHandshakeParams);
   LParams.Clock := TSystemClock.Create;
-  LParams.Provider := Provider;
-  LParams.Group := TNamedGroups.CreateX25519(Provider);
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.Group := TNamedGroups.CreateX25519(Crypto);
   LParams.GroupCode := TNamedGroupCatalog.X25519;
-  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Provider);
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Crypto);
   LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
   LParams.OfferedSuites := TArray<UInt16>.Create(TCipherSuites13.Aes128GcmSha256);
   LParams.OfferedSchemes := TArray<UInt16>.Create(TSignatureSchemes.EcdsaSecp256r1Sha256);
@@ -222,72 +232,77 @@ begin
   LParams.RecordSizeLimit := ARecordSizeLimit;
   LParams.ClientRandom := DecodeHex(StringOfChar('1', 64));
   LParams.LegacySessionId := DecodeHex(StringOfChar('3', 64));
-  LParams.CertificateVerifier := TCertificateVerifier.Create(Provider, TSystemClock.Create as ITlsClock,
-    TTrustAnchorStore.Create(TArray<TBytes>.Create(TestRootCertificate)) as ITrustAnchorStore,
-    True) as IServerCertificateVerifier;
+  LParams.CertificateVerifier := TCertificateVerifier.Create(Pkix, TSystemClock.Create as ITlsClock,
+    TTlsLibTestCertificates.EcP256RootStore, True) as IServerCertificateVerifier;
   LParams.ExpectedServerName := TServerName.DnsName('localhost');
   Result := TTlsEngine.CreateConfigured(
-    TTls13ClientStateMachine.Create(LParams) as IHandshakeMachine, Provider);
+    TTls13ClientStateMachine.Create(LParams) as IHandshakeMachine, Crypto);
 end;
 
-function TTestExtensionNegotiation.NewServer(const AAlpn: TArray<string>;
+function TTestExtensionNegotiation.NewServer(const AAlpn: TArray<TBytes>;
   ARecordSizeLimit: Int32): ITlsEngine;
 var
   LParams: TServerHandshakeParams;
 begin
   LParams := Default(TServerHandshakeParams);
   LParams.Clock := TSystemClock.Create;
-  LParams.Provider := Provider;
-  LParams.Policy := TNegotiationPolicy.CreateDefault(Provider);
-  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Provider);
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.Policy := TNegotiationPolicy.CreateDefault(Crypto);
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Crypto);
   LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
-  LParams.Group := TNamedGroups.CreateX25519(Provider);
+  LParams.Group := TNamedGroups.CreateX25519(Crypto);
   LParams.ServerRandom := DecodeHex(StringOfChar('2', 64));
   LParams.AlpnProtocols := AAlpn;
   LParams.RecordSizeLimit := ARecordSizeLimit;
   LParams.CredentialResolver := TSniCredentialResolver.ForCredential(ServerCredential);
   Result := TTlsEngine.CreateConfigured(
-    TTls13ServerStateMachine.Create(LParams) as IHandshakeMachine, Provider);
+    TTls13ServerStateMachine.Create(LParams) as IHandshakeMachine, Crypto);
 end;
 
-function TTestExtensionNegotiation.Drain(const AEngine: ITlsEngine): TBytes;
+function TTestExtensionNegotiation.NewClient12(ARecordSizeLimit: Int32): ITlsEngine;
 var
-  LChunk: TBytes;
-  LGot: Int32;
+  LParams: TClient12HandshakeParams;
 begin
-  Result := nil;
-  SetLength(LChunk, 65536);
-  repeat
-    LGot := AEngine.TakeOutgoing(LChunk, 0);
-    if LGot > 0 then
-      Result := ConcatBytes(Result, System.Copy(LChunk, 0, LGot));
-  until LGot = 0;
+  LParams := Default(TClient12HandshakeParams);
+  LParams.Clock := TSystemClock.Create;
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.GroupRegistry := TNamedGroups.CreateDefaultRegistry(Crypto);
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDualVersion(Crypto);
+  LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
+  LParams.OfferedSuites := TArray<UInt16>.Create(TCipherSuites12.EcdheEcdsaAes128GcmSha256);
+  LParams.OfferedGroups := TArray<UInt16>.Create(TNamedGroupCatalog.X25519,
+    TNamedGroupCatalog.Secp256r1);
+  LParams.OfferedSchemes := TArray<UInt16>.Create(TSignatureSchemes.EcdsaSecp256r1Sha256);
+  LParams.OfferedVersions := TArray<UInt16>.Create(TlsWireVersionTls12);
+  LParams.ClientRandom := DecodeHex(StringOfChar('1', 64));
+  LParams.LegacySessionId := nil;
+  LParams.RecordSizeLimit := ARecordSizeLimit;
+  LParams.CertificateVerifier := TCertificateVerifier.Create(Pkix, TSystemClock.Create as ITlsClock,
+    TTlsLibTestCertificates.EcP256RootStore, True) as IServerCertificateVerifier;
+  LParams.ExpectedServerName := TServerName.DnsName('localhost');
+  Result := TTlsEngine.CreateConfigured(
+    TTls12ClientStateMachine.Create(LParams) as IHandshakeMachine, Crypto);
 end;
 
-procedure TTestExtensionNegotiation.Feed(const AEngine: ITlsEngine;
-  const AWire: TBytes);
-begin
-  if System.Length(AWire) > 0 then
-    AEngine.ProcessInput(AWire, 0, System.Length(AWire));
-end;
-
-procedure TTestExtensionNegotiation.Pump(const ASrc, ADst: ITlsEngine);
-begin
-  Feed(ADst, Drain(ASrc));
-end;
-
-function TTestExtensionNegotiation.ReadAllApp(const AEngine: ITlsEngine): TBytes;
+function TTestExtensionNegotiation.NewServer12(ARecordSizeLimit: Int32): ITlsEngine;
 var
-  LChunk: TBytes;
-  LGot: Int32;
+  LParams: TServer12HandshakeParams;
 begin
-  Result := nil;
-  SetLength(LChunk, 65536);
-  repeat
-    LGot := AEngine.ReadAppData(LChunk, 0, System.Length(LChunk));
-    if LGot > 0 then
-      Result := ConcatBytes(Result, System.Copy(LChunk, 0, LGot));
-  until LGot = 0;
+  LParams := Default(TServer12HandshakeParams);
+  LParams.Policy := TNegotiationPolicy.CreateDefault(Crypto);
+  LParams.Clock := TSystemClock.Create;
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDualVersion(Crypto);
+  LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
+  LParams.Group := TNamedGroups.CreateX25519(Crypto);
+  LParams.ServerRandom := DecodeHex(StringOfChar('2', 64));
+  LParams.RecordSizeLimit := ARecordSizeLimit;
+  LParams.CredentialResolver := TSniCredentialResolver.ForCredential(ServerCredential);
+  Result := TTlsEngine.CreateConfigured(
+    TTls12ServerStateMachine.Create(LParams) as IHandshakeMachine, Crypto);
 end;
 
 procedure TTestExtensionNegotiation.Handshake(const AClient, AServer: ITlsEngine);
@@ -298,8 +313,8 @@ begin
   LIterations := 0;
   while (AClient.IsHandshaking or AServer.IsHandshaking) and (LIterations < 16) do
   begin
-    Pump(AClient, AServer);
-    Pump(AServer, AClient);
+    PumpCoalesced(AClient, AServer);
+    PumpCoalesced(AServer, AClient);
     Inc(LIterations);
   end;
 end;
@@ -335,53 +350,120 @@ begin
 end;
 
 function TTestExtensionNegotiation.NewClientMachine(
-  const AAlpn: TArray<string>): IHandshakeMachine;
+  const AAlpn: TArray<TBytes>): IHandshakeMachine;
 begin
-  Result := NewClientMachineWith(AAlpn, TZlibCertificateCompression.DefaultDecompressors);
+  Result := NewClientMachineWith(AAlpn, TZlibCertificateCompression.DefaultDecompressors,
+    TCertificateChainLimits.Defaults);
 end;
 
 function TTestExtensionNegotiation.NewClientMachineWith(
-  const AAlpn: TArray<string>;
-  const ADecompressors: TArray<ICertificateDecompressor>): IHandshakeMachine;
+  const AAlpn: TArray<TBytes>;
+  const ADecompressors: TArray<ICertificateDecompressor>;
+  const ALimits: TCertificateChainLimits): IHandshakeMachine;
 var
   LParams: TClientHandshakeParams;
 begin
   LParams := Default(TClientHandshakeParams);
   LParams.Clock := TSystemClock.Create;
-  LParams.Provider := Provider;
-  LParams.Group := TNamedGroups.CreateX25519(Provider);
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.Group := TNamedGroups.CreateX25519(Crypto);
   LParams.GroupCode := TNamedGroupCatalog.X25519;
-  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Provider);
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Crypto);
   LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
   LParams.OfferedSuites := TArray<UInt16>.Create(TCipherSuites13.Aes128GcmSha256);
   LParams.OfferedSchemes := TArray<UInt16>.Create(TSignatureSchemes.EcdsaSecp256r1Sha256);
   LParams.AlpnProtocols := AAlpn;
   LParams.ClientRandom := DecodeHex(StringOfChar('1', 64));
   LParams.LegacySessionId := DecodeHex(StringOfChar('3', 64));
-  LParams.CertificateVerifier := TCertificateVerifier.Create(Provider, TSystemClock.Create as ITlsClock,
-    TTrustAnchorStore.Create(TArray<TBytes>.Create(TestRootCertificate)) as ITrustAnchorStore,
-    True) as IServerCertificateVerifier;
+  LParams.CertificateVerifier := TCertificateVerifier.Create(Pkix, TSystemClock.Create as ITlsClock,
+    TTlsLibTestCertificates.EcP256RootStore, True) as IServerCertificateVerifier;
   LParams.CertificateDecompressors := ADecompressors;
+  LParams.CertificateChainLimits := ALimits;
   LParams.ExpectedServerName := TServerName.DnsName('localhost');
   Result := TTls13ClientStateMachine.Create(LParams) as IHandshakeMachine;
 end;
 
 function TTestExtensionNegotiation.NewServerMachine(
-  const AAlpn: TArray<string>): IHandshakeMachine;
+  const AAlpn: TArray<TBytes>): IHandshakeMachine;
+begin
+  Result := NewServerMachineLimited(AAlpn, 0);
+end;
+
+function TTestExtensionNegotiation.NewServerMachineLimited(
+  const AAlpn: TArray<TBytes>; ARecordSizeLimit: Int32): IHandshakeMachine;
+var
+  LParams: TServerHandshakeParams;
+begin
+  LParams := Default(TServerHandshakeParams);
+  LParams.RecordSizeLimit := ARecordSizeLimit;
+  LParams.Clock := TSystemClock.Create;
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.Policy := TNegotiationPolicy.CreateDefault(Crypto);
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Crypto);
+  LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
+  LParams.Group := TNamedGroups.CreateX25519(Crypto);
+  LParams.ServerRandom := DecodeHex(StringOfChar('2', 64));
+  LParams.AlpnProtocols := AAlpn;
+  LParams.CredentialResolver := TSniCredentialResolver.ForCredential(ServerCredential);
+  Result := TTls13ServerStateMachine.Create(LParams) as IHandshakeMachine;
+end;
+
+function TTestExtensionNegotiation.NewEchServerMachine(
+  const AEchPolicy: IEchServerPolicy): IHandshakeMachine;
 var
   LParams: TServerHandshakeParams;
 begin
   LParams := Default(TServerHandshakeParams);
   LParams.Clock := TSystemClock.Create;
-  LParams.Provider := Provider;
-  LParams.Policy := TNegotiationPolicy.CreateDefault(Provider);
-  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Provider);
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.Policy := TNegotiationPolicy.CreateDefault(Crypto);
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Crypto);
   LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
-  LParams.Group := TNamedGroups.CreateX25519(Provider);
+  LParams.Group := TNamedGroups.CreateX25519(Crypto);
   LParams.ServerRandom := DecodeHex(StringOfChar('2', 64));
-  LParams.AlpnProtocols := AAlpn;
   LParams.CredentialResolver := TSniCredentialResolver.ForCredential(ServerCredential);
+  LParams.EchPolicy := AEchPolicy;
   Result := TTls13ServerStateMachine.Create(LParams) as IHandshakeMachine;
+end;
+
+function TTestExtensionNegotiation.EchClientHello(const AEchBody: TBytes): TBytes;
+var
+  LClientHello, LBody: TBytes;
+  LHello: TTlsClientHello;
+  LEntries: TExtensionVector;
+begin
+  // a real ClientHello with an ech extension spliced in front
+  LClientHello := FirstSendHandshake(NewClientMachine(nil).Start);
+  LBody := System.Copy(LClientHello, 4, System.Length(LClientHello) - 4);
+  LHello := THandshakeMessages.DecodeClientHello(LBody);
+  LEntries := TExtensionVector.Parse(LHello.Extensions);
+  LEntries.InsertAt(0, TExtensionEntry.Create(
+    TExtensionTypes.EncryptedClientHello, AEchBody));
+  LHello.Extensions := LEntries.Encode;
+  Result := THandshakeFraming.Frame(TTlsHandshakeType.ClientHello,
+    THandshakeMessages.EncodeClientHello(LHello));
+end;
+
+function TTestExtensionNegotiation.InnerEchClientHello: TBytes;
+begin
+  // as a client-facing server would forward the decrypted inner to a backend
+  Result := EchClientHello(TEchExtension.EncodeInner);
+end;
+
+function TTestExtensionNegotiation.OuterEchClientHello: TBytes;
+var
+  LOuter: TEchOuterClientHello;
+begin
+  LOuter := Default(TEchOuterClientHello);
+  LOuter.CipherSuite.KdfId := THpkeKdf.HKDF_SHA256;
+  LOuter.CipherSuite.AeadId := THpkeAead.AES_128_GCM;
+  LOuter.ConfigId := $07;
+  LOuter.Enc := DecodeHex(StringOfChar('1', 64));
+  LOuter.Payload := DecodeHex(StringOfChar('2', 128));
+  Result := EchClientHello(TEchExtension.EncodeOuter(LOuter));
 end;
 
 function TTestExtensionNegotiation.NewServerMachineWith(
@@ -392,23 +474,103 @@ var
 begin
   LParams := Default(TServerHandshakeParams);
   LParams.Clock := TSystemClock.Create;
-  LParams.Provider := Provider;
-  LParams.Policy := TNegotiationPolicy.CreateDefault(Provider);
-  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Provider);
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.Policy := TNegotiationPolicy.CreateDefault(Crypto);
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Crypto);
   LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
-  LParams.Group := TNamedGroups.CreateX25519(Provider);
+  LParams.Group := TNamedGroups.CreateX25519(Crypto);
   LParams.ServerRandom := DecodeHex(StringOfChar('2', 64));
   LParams.CertificateCompressors := ACompressors;
   LParams.CredentialResolver := TSniCredentialResolver.ForCredential(CredentialWithChain(AChain));
   Result := TTls13ServerStateMachine.Create(LParams) as IHandshakeMachine;
 end;
 
-function TTestExtensionNegotiation.CredentialWithChain(
-  const AChain: TArray<TBytes>): TTlsCredential;
+function TTestExtensionNegotiation.RsaSha1Chain: TArray<TBytes>;
+var
+  LCerts: TStringList;
 begin
-  // keep the real signing key, swap the certificate chain the Certificate carries
-  Result := ServerCredential;
-  Result.CertificateChain := AChain;
+  LCerts := LoadVectorFields('Certs/LegacyHashChain.txt');
+  try
+    Result := TArray<TBytes>.Create(DecodeHex(LCerts.Values['leaf_cert']),
+      DecodeHex(LCerts.Values['issuer_sha1_cert']));
+  finally
+    LCerts.Free;
+  end;
+end;
+
+function TTestExtensionNegotiation.Sha1Chain: TArray<TBytes>;
+var
+  LCerts: TStringList;
+begin
+  LCerts := LoadVectorFields('Certs/ReissuedRoot.txt');
+  try
+    Result := TArray<TBytes>.Create(DecodeHex(LCerts.Values['leaf_cert']),
+      DecodeHex(LCerts.Values['issuer_sha1_cert']));
+  finally
+    LCerts.Free;
+  end;
+end;
+
+function TTestExtensionNegotiation.NewServer12WithChain(
+  const AChain: TArray<TBytes>): ITlsEngine;
+var
+  LParams: TServer12HandshakeParams;
+begin
+  LParams := Default(TServer12HandshakeParams);
+  LParams.Policy := TNegotiationPolicy.CreateDefault(Crypto);
+  LParams.Clock := TSystemClock.Create;
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDualVersion(Crypto);
+  LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
+  LParams.Group := TNamedGroups.CreateX25519(Crypto);
+  LParams.ServerRandom := DecodeHex(StringOfChar('2', 64));
+  LParams.CredentialResolver := TSniCredentialResolver.ForCredential(CredentialWithChain(AChain));
+  Result := TTlsEngine.CreateConfigured(
+    TTls12ServerStateMachine.Create(LParams) as IHandshakeMachine, Crypto);
+end;
+
+function TTestExtensionNegotiation.NewServerMachineForResolver(
+  const AResolver: ITlsServerCredentialResolver): IHandshakeMachine;
+var
+  LParams: TServerHandshakeParams;
+begin
+  LParams := Default(TServerHandshakeParams);
+  LParams.Clock := TSystemClock.Create;
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.Policy := TNegotiationPolicy.CreateDefault(Crypto);
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Crypto);
+  LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
+  LParams.Group := TNamedGroups.CreateX25519(Crypto);
+  LParams.ServerRandom := DecodeHex(StringOfChar('2', 64));
+  LParams.CredentialResolver := AResolver;
+  Result := TTls13ServerStateMachine.Create(LParams) as IHandshakeMachine;
+end;
+
+function TTestExtensionNegotiation.ClientHelloWithCertSchemes(
+  const ACertSchemes: TArray<UInt16>): TBytes;
+var
+  LClientHello, LBody, LList: TBytes;
+  LHello: TTlsClientHello;
+  LEntries: TExtensionVector;
+  LI: Int32;
+begin
+  LClientHello := FirstSendHandshake(NewClientMachine(nil).Start);
+  LBody := System.Copy(LClientHello, 4, System.Length(LClientHello) - 4);
+  LHello := THandshakeMessages.DecodeClientHello(LBody);
+  LEntries := TExtensionVector.Parse(LHello.Extensions);
+  // a uint16-length-prefixed list of big-endian scheme codes
+  LList := TBytes.Create(Byte((System.Length(ACertSchemes) * 2) shr 8),
+    Byte((System.Length(ACertSchemes) * 2) and $FF));
+  for LI := 0 to System.High(ACertSchemes) do
+    LList := ConcatBytes(LList, TBytes.Create(Byte(ACertSchemes[LI] shr 8),
+      Byte(ACertSchemes[LI] and $FF)));
+  LEntries.Append(TExtensionEntry.Create(TExtensionTypes.SignatureAlgorithmsCert, LList));
+  LHello.Extensions := LEntries.Encode;
+  Result := THandshakeFraming.Frame(TTlsHandshakeType.ClientHello,
+    THandshakeMessages.EncodeClientHello(LHello));
 end;
 
 function TTestExtensionNegotiation.DriveServerCertMessage(const AClient,
@@ -417,9 +579,9 @@ var
   LFlight: TArray<TBytes>;
 begin
   // the encrypted flight is [ServerHello, EncryptedExtensions, Certificate, ...]
-  LFlight := AllSendHandshake(AServer.ProcessMessage(MsgFrom(
+  LFlight := AllSendHandshake(AServer.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(
     FirstSendHandshake(AClient.Start))));
-  Result := MsgFrom(LFlight[2]);
+  Result := TTlsLibTestHandshakeDecoder.HandshakeMessage(LFlight[2]);
 end;
 
 function TTestExtensionNegotiation.PlaintextCertBody(
@@ -451,66 +613,8 @@ begin
     DecodeHex('9f1c7a4e0b62d3851fae09c7b24d6f80e5a31c9d7042bf68ac15e3902d7c4b6a'));
 end;
 
-function TTestExtensionNegotiation.MsgFrom(
-  const AFramed: TBytes): TTlsHandshakeMessage;
-var
-  LReader: THandshakeMessageReader;
-begin
-  LReader := THandshakeMessageReader.Create;
-  try
-    LReader.Append(AFramed, 0, System.Length(AFramed));
-    LReader.NextMessage(Result);
-  finally
-    LReader.Free;
-  end;
-end;
-
-function TTestExtensionNegotiation.FirstSendHandshake(
-  const AEffects: TArray<THandshakeEffect>): TBytes;
-var
-  LEffect: THandshakeEffect;
-begin
-  Result := nil;
-  for LEffect in AEffects do
-    if LEffect.Kind = THandshakeEffectKind.SendHandshake then
-      Exit(LEffect.Bytes);
-end;
-
-function TTestExtensionNegotiation.AllSendHandshake(
-  const AEffects: TArray<THandshakeEffect>): TArray<TBytes>;
-var
-  LEffect: THandshakeEffect;
-  LCount: Int32;
-begin
-  Result := nil;
-  LCount := 0;
-  for LEffect in AEffects do
-    if LEffect.Kind = THandshakeEffectKind.SendHandshake then
-    begin
-      SetLength(Result, LCount + 1);
-      Result[LCount] := LEffect.Bytes;
-      Inc(LCount);
-    end;
-end;
-
-function TTestExtensionNegotiation.FailAlertOf(
-  const AEffects: TArray<THandshakeEffect>;
-  out AAlert: TTlsAlertDescription): Boolean;
-var
-  LEffect: THandshakeEffect;
-begin
-  Result := False;
-  AAlert := TTlsAlertDescription.CloseNotify;
-  for LEffect in AEffects do
-    if LEffect.Kind = THandshakeEffectKind.Fail then
-    begin
-      AAlert := LEffect.Alert;
-      Exit(True);
-    end;
-end;
-
 function TTestExtensionNegotiation.BuildEncryptedExtensionsWithAlpn(
-  const AProtocol: string): TBytes;
+  const AProtocol: TBytes): TBytes;
 var
   LCodec: IExtensionBlockCodec;
   LContext: TExtensionContext;
@@ -528,6 +632,57 @@ begin
   end;
 end;
 
+function TTestExtensionNegotiation.BuildEncryptedExtensionsWithExtension(
+  AType: UInt16): TBytes;
+var
+  LVector: TExtensionVector;
+begin
+  // an EncryptedExtensions whose extensions vector carries a single extension of AType (empty
+  // data), used to plant an extension type the codec would otherwise skip
+  LVector := TExtensionVector.Empty;
+  LVector.Append(TExtensionEntry.Create(AType, nil));
+  Result := THandshakeFraming.Frame(TTlsHandshakeType.EncryptedExtensions,
+    THandshakeMessages.EncodeEncryptedExtensions(LVector.Encode));
+end;
+
+function TTestExtensionNegotiation.GreaseExtensionTypeOf(
+  const AClientHelloFramed: TBytes): UInt16;
+var
+  LHello: TTlsClientHello;
+  LVector: TExtensionVector;
+  LType: UInt16;
+begin
+  Result := 0;
+  LHello := THandshakeMessages.DecodeClientHello(TTlsLibTestHandshakeDecoder.HandshakeMessage(AClientHelloFramed).Body);
+  LVector := TExtensionVector.Parse(LHello.Extensions);
+  for LType in LVector.Types do
+    if TGrease.IsGrease(LType) then
+      Exit(LType);
+end;
+
+function TTestExtensionNegotiation.NewGreasingClientMachine: IHandshakeMachine;
+var
+  LParams: TClientHandshakeParams;
+begin
+  LParams := Default(TClientHandshakeParams);
+  LParams.Clock := TSystemClock.Create;
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.Group := TNamedGroups.CreateX25519(Crypto);
+  LParams.GroupCode := TNamedGroupCatalog.X25519;
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Crypto);
+  LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
+  LParams.OfferedSuites := TArray<UInt16>.Create(TCipherSuites13.Aes128GcmSha256);
+  LParams.OfferedSchemes := TArray<UInt16>.Create(TSignatureSchemes.EcdsaSecp256r1Sha256);
+  LParams.Grease := True;
+  LParams.ClientRandom := DecodeHex(StringOfChar('1', 64));
+  LParams.LegacySessionId := DecodeHex(StringOfChar('3', 64));
+  LParams.CertificateVerifier := TCertificateVerifier.Create(Pkix, TSystemClock.Create as ITlsClock,
+    TTlsLibTestCertificates.EcP256RootStore, True) as IServerCertificateVerifier;
+  LParams.ExpectedServerName := TServerName.DnsName('localhost');
+  Result := TTls13ClientStateMachine.Create(LParams) as IHandshakeMachine;
+end;
+
 procedure TTestExtensionNegotiation.TestClientRejectsUnofferedAlpnEcho;
 var
   LClient, LServer: IHandshakeMachine;
@@ -537,14 +692,14 @@ begin
   // drive a real ClientHello/ServerHello exchange so the client reaches
   // EncryptedExtensions with handshake keys, then feed it a crafted EE whose ALPN
   // selection (http/1.1) the client never offered (it offered only h2)
-  LClient := NewClientMachine(TArray<string>.Create('h2'));
-  LServer := NewServerMachine(TArray<string>.Create('h2'));
+  LClient := NewClientMachine(TArray<TBytes>.Create(TAlpnProtocols.H2));
+  LServer := NewServerMachine(TArray<TBytes>.Create(TAlpnProtocols.H2));
   LClientHello := FirstSendHandshake(LClient.Start);
-  LServerHello := FirstSendHandshake(LServer.ProcessMessage(MsgFrom(LClientHello)));
-  LClient.ProcessMessage(MsgFrom(LServerHello));
+  LServerHello := FirstSendHandshake(LServer.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LClientHello)));
+  LClient.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LServerHello));
 
   CheckTrue(FailAlertOf(LClient.ProcessMessage(
-    MsgFrom(BuildEncryptedExtensionsWithAlpn('http/1.1'))), LAlert),
+    TTlsLibTestHandshakeDecoder.HandshakeMessage(BuildEncryptedExtensionsWithAlpn(TAlpnProtocols.Http11))), LAlert),
     'a server ALPN selection the client did not offer aborts');
   CheckTrue(LAlert = TTlsAlertDescription.IllegalParameter,
     'an unoffered ALPN echo is illegal_parameter');
@@ -558,7 +713,7 @@ begin
   // a client awaiting ServerHello receives an unknown handshake type (0x63, len 0)
   LClient := NewClientMachine(nil);
   LClient.Start;
-  CheckTrue(FailAlertOf(LClient.ProcessMessage(MsgFrom(DecodeHex('63000000'))), LAlert),
+  CheckTrue(FailAlertOf(LClient.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(DecodeHex('63000000'))), LAlert),
     'an unknown handshake type aborts');
   CheckTrue(LAlert = TTlsAlertDescription.UnexpectedMessage,
     'an unknown handshake type is unexpected_message');
@@ -574,29 +729,30 @@ begin
   // then deliver CertificateVerify out of order (before Certificate)
   LClient := NewClientMachine(nil);
   LServer := NewServerMachine(nil);
-  LFlight := AllSendHandshake(LServer.ProcessMessage(MsgFrom(
+  LFlight := AllSendHandshake(LServer.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(
     FirstSendHandshake(LClient.Start))));
   // LFlight = [ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished]
-  LClient.ProcessMessage(MsgFrom(LFlight[0])); // ServerHello
-  LClient.ProcessMessage(MsgFrom(LFlight[1])); // EncryptedExtensions
-  CheckTrue(FailAlertOf(LClient.ProcessMessage(MsgFrom(LFlight[3])), LAlert),
+  LClient.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LFlight[0])); // ServerHello
+  LClient.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LFlight[1])); // EncryptedExtensions
+  CheckTrue(FailAlertOf(LClient.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LFlight[3])), LAlert),
     'CertificateVerify before Certificate aborts');
   CheckTrue(LAlert = TTlsAlertDescription.UnexpectedMessage,
     'an out-of-order CertificateVerify is unexpected_message');
 end;
 
 function TTestExtensionNegotiation.DriveClientToWaitCertificate(
+  const ALimits: TCertificateChainLimits;
   out AServerFlight: TArray<TBytes>): IHandshakeMachine;
 var
   LServer: IHandshakeMachine;
 begin
   // real ClientHello/ServerHello exchange, then feed ServerHello + EncryptedExtensions
-  Result := NewClientMachine(nil);
+  Result := NewClientMachineWith(nil, TZlibCertificateCompression.DefaultDecompressors, ALimits);
   LServer := NewServerMachine(nil);
-  AServerFlight := AllSendHandshake(LServer.ProcessMessage(MsgFrom(
+  AServerFlight := AllSendHandshake(LServer.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(
     FirstSendHandshake(Result.Start))));
-  Result.ProcessMessage(MsgFrom(AServerFlight[0])); // ServerHello
-  Result.ProcessMessage(MsgFrom(AServerFlight[1])); // EncryptedExtensions
+  Result.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(AServerFlight[0])); // ServerHello
+  Result.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(AServerFlight[1])); // EncryptedExtensions
 end;
 
 function TTestExtensionNegotiation.CompressedCertificateOf(AAlgorithm: UInt16;
@@ -618,14 +774,14 @@ var
   LCertBody, LCompressed, LCompMsg: TBytes;
   LAlert: TTlsAlertDescription;
 begin
-  LClient := DriveClientToWaitCertificate(LFlight);
+  LClient := DriveClientToWaitCertificate(TCertificateChainLimits.Defaults, LFlight);
   // compress the server's real Certificate message and deliver it compressed
-  LCertBody := MsgFrom(LFlight[2]).Body;
+  LCertBody := TTlsLibTestHandshakeDecoder.HandshakeMessage(LFlight[2]).Body;
   LCompressed := ZlibCompress(LCertBody);
   LCompMsg := CompressedCertificateOf(TCertificateCompressionAlgorithms.Zlib,
     System.Length(LCertBody), LCompressed);
   // the client decompresses and trust-verifies the recovered chain (no failure)
-  CheckFalse(FailAlertOf(LClient.ProcessMessage(MsgFrom(LCompMsg)), LAlert),
+  CheckFalse(FailAlertOf(LClient.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LCompMsg)), LAlert),
     'a valid compressed certificate is accepted');
 end;
 
@@ -636,17 +792,59 @@ var
   LZeros, LCompressed, LCompMsg: TBytes;
   LAlert: TTlsAlertDescription;
 begin
-  LClient := DriveClientToWaitCertificate(LFlight);
+  LClient := DriveClientToWaitCertificate(TCertificateChainLimits.Defaults, LFlight);
   // a tiny compressed body declaring a huge expansion is a bomb
   LZeros := nil;
   SetLength(LZeros, 60000);
   FillChar(LZeros[0], 60000, 0);
   LCompressed := ZlibCompress(LZeros);
   LCompMsg := CompressedCertificateOf(TCertificateCompressionAlgorithms.Zlib, 60000, LCompressed);
-  CheckTrue(FailAlertOf(LClient.ProcessMessage(MsgFrom(LCompMsg)), LAlert),
+  CheckTrue(FailAlertOf(LClient.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LCompMsg)), LAlert),
     'a compressed-certificate bomb aborts');
-  CheckTrue(LAlert = TTlsAlertDescription.BadCertificate,
-    'a compressed-certificate bomb is bad_certificate');
+  CheckTrue(LAlert = TTlsAlertDescription.IllegalParameter,
+    'a compressed-certificate bomb is illegal_parameter');
+end;
+
+procedure TTestExtensionNegotiation.TestClientRejectsCompressedCertificateOverTheChainBudget;
+var
+  LLimits: TCertificateChainLimits;
+  LClient: IHandshakeMachine;
+  LFlight: TArray<TBytes>;
+  LCertBody, LCompMsg: TBytes;
+  LAlert: TTlsAlertDescription;
+begin
+  // the body compresses far less than 100x, so only the budget passed in can refuse it
+  LLimits := TCertificateChainLimits.Defaults;
+  LClient := DriveClientToWaitCertificate(LLimits, LFlight);
+  LCertBody := TTlsLibTestHandshakeDecoder.HandshakeMessage(LFlight[2]).Body;
+  LLimits.MaxTotalChainLength := System.Length(LCertBody) - 1;
+  LClient := DriveClientToWaitCertificate(LLimits, LFlight);
+  LCompMsg := CompressedCertificateOf(TCertificateCompressionAlgorithms.Zlib,
+    System.Length(LCertBody), ZlibCompress(LCertBody));
+  CheckTrue(FailAlertOf(LClient.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LCompMsg)), LAlert),
+    'a declared length over the chain budget aborts');
+  CheckTrue(LAlert = TTlsAlertDescription.IllegalParameter,
+    'an over-budget declared length is illegal_parameter');
+end;
+
+procedure TTestExtensionNegotiation.TestClientAcceptsCompressedCertificateAtTheChainBudget;
+var
+  LLimits: TCertificateChainLimits;
+  LClient: IHandshakeMachine;
+  LFlight: TArray<TBytes>;
+  LCertBody, LCompMsg: TBytes;
+  LAlert: TTlsAlertDescription;
+begin
+  // the control for the over-budget test: a budget of exactly the body length passes the check
+  LLimits := TCertificateChainLimits.Defaults;
+  LClient := DriveClientToWaitCertificate(LLimits, LFlight);
+  LCertBody := TTlsLibTestHandshakeDecoder.HandshakeMessage(LFlight[2]).Body;
+  LLimits.MaxTotalChainLength := System.Length(LCertBody);
+  LClient := DriveClientToWaitCertificate(LLimits, LFlight);
+  LCompMsg := CompressedCertificateOf(TCertificateCompressionAlgorithms.Zlib,
+    System.Length(LCertBody), ZlibCompress(LCertBody));
+  CheckFalse(FailAlertOf(LClient.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LCompMsg)), LAlert),
+    'a declared length at the chain budget is accepted');
 end;
 
 procedure TTestExtensionNegotiation.TestClientRejectsUnadvertisedCompressionAlgorithm;
@@ -656,13 +854,34 @@ var
   LCompMsg: TBytes;
   LAlert: TTlsAlertDescription;
 begin
-  LClient := DriveClientToWaitCertificate(LFlight);
+  LClient := DriveClientToWaitCertificate(TCertificateChainLimits.Defaults, LFlight);
   // brotli (2) was never advertised by the client
   LCompMsg := CompressedCertificateOf(2, 100, DecodeHex('00010203'));
-  CheckTrue(FailAlertOf(LClient.ProcessMessage(MsgFrom(LCompMsg)), LAlert),
+  CheckTrue(FailAlertOf(LClient.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LCompMsg)), LAlert),
     'an unadvertised compression algorithm aborts');
-  CheckTrue(LAlert = TTlsAlertDescription.BadCertificate,
-    'an unadvertised compression algorithm is bad_certificate');
+  CheckTrue(LAlert = TTlsAlertDescription.IllegalParameter,
+    'an unadvertised compression algorithm is illegal_parameter');
+end;
+
+procedure TTestExtensionNegotiation.TestClientRejectsNonEmptyCertificateRequestContext;
+var
+  LClient: IHandshakeMachine;
+  LFlight: TArray<TBytes>;
+  LCert: TTlsCertificate;
+  LCertMsg: TBytes;
+  LAlert: TTlsAlertDescription;
+begin
+  // the server's real Certificate re-encoded with a one-byte certificate_request_context;
+  // the context SHALL be empty in the main handshake (RFC 9846 4.5.1)
+  LClient := DriveClientToWaitCertificate(TCertificateChainLimits.Defaults, LFlight);
+  LCert := THandshakeMessages.DecodeCertificate(TTlsLibTestHandshakeDecoder.HandshakeMessage(LFlight[2]).Body);
+  LCert.RequestContext := TBytes.Create($01);
+  LCertMsg := THandshakeFraming.Frame(TTlsHandshakeType.Certificate,
+    THandshakeMessages.EncodeCertificate(LCert));
+  CheckTrue(FailAlertOf(LClient.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LCertMsg)), LAlert),
+    'a non-empty certificate_request_context aborts');
+  CheckTrue(LAlert = TTlsAlertDescription.DecodeError,
+    'a non-empty certificate_request_context is decode_error');
 end;
 
 procedure TTestExtensionNegotiation.TestServerEmitsCompressedCertificate;
@@ -682,21 +901,39 @@ begin
     'the emitted algorithm is zlib');
   LRecovered := TCertificateCompression.Decompress(
     TZlibCertificateCompression.DefaultDecompressors, LDecoded.Algorithm,
-    LDecoded.Compressed, LDecoded.UncompressedLength);
+    LDecoded.Compressed, LDecoded.UncompressedLength,
+    TCertificateChainLimits.Defaults.MaxTotalChainLength);
   CheckEqualBytes('the compressed body decompresses to the plaintext Certificate',
     PlaintextCertBody(CompressibleChain), LRecovered);
 end;
 
-procedure TTestExtensionNegotiation.TestServerSkipsCompressionWhenNotSmaller;
+procedure TTestExtensionNegotiation.TestServerCompressesEvenWhenLarger;
+var
+  LCertMsg: TTlsHandshakeMessage;
+  LDecoded: TTlsCompressedCertificate;
+begin
+  // a tiny high-entropy chain does not shrink, but RFC 8879 sets no size rule: once a common
+  // algorithm is negotiated the Certificate is sent compressed
+  LCertMsg := DriveServerCertMessage(NewClientMachine(nil),
+    NewServerMachineWith(IncompressibleChain, TZlibCertificateCompression.DefaultCompressors));
+  CheckTrue(LCertMsg.TypeByte = Byte(Ord(TTlsHandshakeType.CompressedCertificate)),
+    'an incompressible certificate is still sent compressed');
+  LDecoded := THandshakeMessages.DecodeCompressedCertificate(LCertMsg.Body);
+  CheckTrue(System.Length(LDecoded.Compressed) >= LDecoded.UncompressedLength,
+    'the compressed form is not smaller, which is allowed');
+end;
+
+procedure TTestExtensionNegotiation.TestServerSendsUncompressedWhenCompressorDeclines;
 var
   LCertMsg: TTlsHandshakeMessage;
 begin
-  // a tiny high-entropy chain does not shrink, so the only-if-smaller guard keeps the
-  // plaintext Certificate even though both ends support compression
+  // a compressor that declines (False) sends the Certificate uncompressed: compression is a MAY
   LCertMsg := DriveServerCertMessage(NewClientMachine(nil),
-    NewServerMachineWith(IncompressibleChain, TZlibCertificateCompression.DefaultCompressors));
+    NewServerMachineWith(CompressibleChain, TArray<ICertificateCompressor>.Create(
+      TMockCertificateCompressor.Create(TCertificateCompressionAlgorithms.Zlib,
+      TMockCompressorMode.Decline) as ICertificateCompressor)));
   CheckTrue(LCertMsg.TypeByte = Byte(Ord(TTlsHandshakeType.Certificate)),
-    'an incompressible certificate is sent uncompressed');
+    'a declined compression falls back to a plain Certificate');
 end;
 
 procedure TTestExtensionNegotiation.TestCertificateCompressionIsInjectable;
@@ -708,9 +945,12 @@ begin
   // a custom (non-zlib codepoint) backend injected on both ends is honored end to end
   LCertMsg := DriveServerCertMessage(
     NewClientMachineWith(nil, TArray<ICertificateDecompressor>.Create(
-      TCustomCertDecompressor.Create as ICertificateDecompressor)),
+      TMockCertificateDecompressor.Create(CustomCertCompressionAlgo,
+      TMockDecompressorMode.Works) as ICertificateDecompressor),
+      TCertificateChainLimits.Defaults),
     NewServerMachineWith(CompressibleChain, TArray<ICertificateCompressor>.Create(
-      TCustomCertCompressor.Create as ICertificateCompressor)));
+      TMockCertificateCompressor.Create(CustomCertCompressionAlgo,
+      TMockCompressorMode.Normal) as ICertificateCompressor)));
   CheckTrue(LCertMsg.TypeByte = Byte(Ord(TTlsHandshakeType.CompressedCertificate)),
     'the server compresses with the injected backend');
   LDecoded := THandshakeMessages.DecodeCompressedCertificate(LCertMsg.Body);
@@ -718,8 +958,10 @@ begin
     'the emitted algorithm is the injected codepoint');
   LRecovered := TCertificateCompression.Decompress(
     TArray<ICertificateDecompressor>.Create(
-    TCustomCertDecompressor.Create as ICertificateDecompressor),
-    LDecoded.Algorithm, LDecoded.Compressed, LDecoded.UncompressedLength);
+    TMockCertificateDecompressor.Create(CustomCertCompressionAlgo,
+    TMockDecompressorMode.Works) as ICertificateDecompressor),
+    LDecoded.Algorithm, LDecoded.Compressed, LDecoded.UncompressedLength,
+    TCertificateChainLimits.Defaults.MaxTotalChainLength);
   CheckEqualBytes('the injected backend round-trips the plaintext Certificate',
     PlaintextCertBody(CompressibleChain), LRecovered);
 end;
@@ -730,13 +972,44 @@ var
 begin
   // client offers h2 then http/1.1; the server prefers http/1.1, so its first match
   // is http/1.1 and both sides surface it
-  LClient := NewClient(TArray<string>.Create('h2', 'http/1.1'), 0);
-  LServer := NewServer(TArray<string>.Create('http/1.1', 'h2'), 0);
+  LClient := NewClient(TArray<TBytes>.Create(TAlpnProtocols.H2, TAlpnProtocols.Http11), 0);
+  LServer := NewServer(TArray<TBytes>.Create(TAlpnProtocols.Http11, TAlpnProtocols.H2), 0);
   Handshake(LClient, LServer);
   CheckFalse(LClient.IsTerminal, 'the client completed');
   CheckFalse(LServer.IsTerminal, 'the server completed');
-  CheckEquals('http/1.1', LServer.NegotiatedAlpnProtocol, 'server surfaces the selection');
-  CheckEquals('http/1.1', LClient.NegotiatedAlpnProtocol, 'client surfaces the selection');
+  CheckEqualBytes('server surfaces the selection', TAlpnProtocols.Http11,
+    LServer.ConnectionInfo.AlpnProtocol);
+  CheckEqualBytes('client surfaces the selection', TAlpnProtocols.Http11,
+    LClient.ConnectionInfo.AlpnProtocol);
+end;
+
+procedure TTestExtensionNegotiation.TestAlpnBinaryNameNegotiates;
+var
+  LClient, LServer: ITlsEngine;
+  LName: TBytes;
+begin
+  // a name is opaque octets: one with a NUL and a high byte negotiates and surfaces exactly
+  LName := TBytes.Create($00, $FF, $68);
+  LClient := NewClient(TArray<TBytes>.Create(LName), 0);
+  LServer := NewServer(TArray<TBytes>.Create(LName), 0);
+  Handshake(LClient, LServer);
+  CheckFalse(LClient.IsTerminal, 'the client completed');
+  CheckFalse(LServer.IsTerminal, 'the server completed');
+  CheckEqualBytes('server surfaces the binary selection', LName, LServer.ConnectionInfo.AlpnProtocol);
+  CheckEqualBytes('client surfaces the binary selection', LName, LClient.ConnectionInfo.AlpnProtocol);
+end;
+
+procedure TTestExtensionNegotiation.TestAlpnLookalikeOfferDoesNotMatch;
+var
+  LClient, LServer: ITlsEngine;
+begin
+  // 'h' + 0xB2 is not "h2", so the server finds no overlap rather than selecting h2
+  LClient := NewClient(TArray<TBytes>.Create(TBytes.Create($68, $B2)), 0);
+  LServer := NewServer(TArray<TBytes>.Create(TAlpnProtocols.H2), 0);
+  Handshake(LClient, LServer);
+  CheckTrue(LServer.IsTerminal, 'the server aborts: no overlap');
+  CheckEquals(Ord(TTlsAlertDescription.NoApplicationProtocol),
+    Ord(LServer.LastError.Alert.Description), 'it is no_application_protocol');
 end;
 
 procedure TTestExtensionNegotiation.TestAlpnNoOverlapAborts;
@@ -744,8 +1017,8 @@ var
   LClient, LServer: ITlsEngine;
 begin
   // the server is configured with a list, the client offers only a disjoint one
-  LClient := NewClient(TArray<string>.Create('h2'), 0);
-  LServer := NewServer(TArray<string>.Create('http/1.1'), 0);
+  LClient := NewClient(TArray<TBytes>.Create(TAlpnProtocols.H2), 0);
+  LServer := NewServer(TArray<TBytes>.Create(TAlpnProtocols.Http11), 0);
   Handshake(LClient, LServer);
   CheckTrue(LServer.IsTerminal, 'the server aborts on no ALPN overlap');
   CheckEquals(Ord(TTlsAlertDescription.NoApplicationProtocol),
@@ -761,8 +1034,10 @@ begin
   Handshake(LClient, LServer);
   CheckFalse(LClient.IsTerminal, 'the handshake is unaffected by absent ALPN');
   CheckFalse(LServer.IsTerminal, 'the handshake is unaffected by absent ALPN');
-  CheckEquals('', LClient.NegotiatedAlpnProtocol, 'no ALPN negotiated');
-  CheckEquals('', LServer.NegotiatedAlpnProtocol, 'no ALPN negotiated');
+  CheckFalse(LClient.IsHandshaking, 'the client completed');
+  CheckFalse(LServer.IsHandshaking, 'the server completed');
+  CheckEquals(0, System.Length(LClient.ConnectionInfo.AlpnProtocol), 'no ALPN negotiated');
+  CheckEquals(0, System.Length(LServer.ConnectionInfo.AlpnProtocol), 'no ALPN negotiated');
 end;
 
 procedure TTestExtensionNegotiation.TestRecordSizeLimitCapsOutboundRecords;
@@ -788,9 +1063,190 @@ begin
   CheckTrue(MaxAppRecordLength(LWire) <= 528, 'no record exceeds the negotiated cap');
   CheckTrue(AppRecordCount(LWire) > 1, 'the oversize write fragmented into several records');
 
-  Feed(LServer, LWire);
+  FeedCoalesced(LServer, LWire);
   LReceived := ReadAllApp(LServer);
   CheckEqualBytes('the server reassembles the fragmented payload', LPayload, LReceived);
+end;
+
+procedure TTestExtensionNegotiation.TestTls12RecordSizeLimitCapsOutboundRecords;
+var
+  LClient, LServer: ITlsEngine;
+  LPayload, LWire: TBytes;
+  LI: Int32;
+begin
+  // TLS 1.2 counts the plaintext directly (no inner content-type byte), so a 512-byte
+  // record_size_limit caps each fragment at 512; a 2000-byte write fragments on both sides
+  LClient := NewClient12(512);
+  LServer := NewServer12(512);
+  Handshake(LClient, LServer);
+  CheckFalse(LClient.IsTerminal or LServer.IsTerminal, 'the handshake completed');
+
+  LPayload := nil;
+  SetLength(LPayload, 2000);
+  for LI := 0 to System.Length(LPayload) - 1 do
+    LPayload[LI] := Byte(LI and $FF);
+
+  LClient.Write(LPayload, 0, System.Length(LPayload));
+  LWire := Drain(LClient);
+  // 512-byte plaintext cap => ciphertext <= 512 + 8-byte explicit nonce + 16-byte tag = 536
+  CheckTrue(MaxAppRecordLength(LWire) <= 536, 'no client record exceeds the negotiated cap');
+  CheckTrue(AppRecordCount(LWire) > 1, 'the oversize client write fragmented into several records');
+  FeedCoalesced(LServer, LWire);
+  CheckEqualBytes('the server reassembles the client payload', LPayload, ReadAllApp(LServer));
+
+  // the server's outbound side is capped by the same negotiated limit
+  LServer.Write(LPayload, 0, System.Length(LPayload));
+  LWire := Drain(LServer);
+  CheckTrue(MaxAppRecordLength(LWire) <= 536, 'no server record exceeds the negotiated cap');
+  CheckTrue(AppRecordCount(LWire) > 1, 'the oversize server write fragmented into several records');
+  FeedCoalesced(LClient, LWire);
+  CheckEqualBytes('the client reassembles the server payload', LPayload, ReadAllApp(LClient));
+end;
+
+procedure TTestExtensionNegotiation.TestServerRejectsNonNullCompressionOnTls13;
+
+  // the conformant encoder always writes a single null method, so grow legacy_compression_methods on
+  // the wire from {null} to {null, 1}: still offers null (decode accepts) but is no longer null-only
+  function WithExtraCompression(const AFramedClientHello: TBytes): TBytes;
+  var
+    LP, LSidLen, LCsLen, LLen: Int32;
+  begin
+    LP := 4 + 2 + 32; // 4-byte handshake header + legacy_version + random
+    LSidLen := AFramedClientHello[LP];
+    LP := LP + 1 + LSidLen; // past legacy_session_id
+    LCsLen := (AFramedClientHello[LP] shl 8) or AFramedClientHello[LP + 1];
+    LP := LP + 2 + LCsLen; // now at the legacy_compression_methods length byte
+    Result := ConcatBytes(ConcatBytes(System.Copy(AFramedClientHello, 0, LP),
+      TBytes.Create(2, 0, 1)),
+      System.Copy(AFramedClientHello, LP + 2, System.Length(AFramedClientHello) - LP - 2));
+    // the message grew by one byte: bump the 3-byte handshake length (framed offsets 1..3)
+    LLen := ((Result[1] shl 16) or (Result[2] shl 8) or Result[3]) + 1;
+    Result[1] := Byte(LLen shr 16);
+    Result[2] := Byte(LLen shr 8);
+    Result[3] := Byte(LLen);
+  end;
+
+var
+  LClientHello: TBytes;
+  LAlert: TTlsAlertDescription;
+begin
+  // a single-version 1.3 server (built directly, not via the version dispatcher) must reject a
+  // ClientHello whose legacy_compression_methods is not exactly null (RFC 9846 4.2.2)
+  LClientHello := FirstSendHandshake(NewClientMachine(nil).Start);
+  CheckTrue(FailAlertOf(NewServerMachine(nil).ProcessMessage(
+    TTlsLibTestHandshakeDecoder.HandshakeMessage(WithExtraCompression(LClientHello))), LAlert),
+    'non-null legacy_compression_methods aborts');
+  CheckTrue(LAlert = TTlsAlertDescription.IllegalParameter,
+    'the alert is illegal_parameter');
+  // control: the untampered null-only ClientHello is accepted (the server responds, no abort)
+  CheckFalse(FailAlertOf(NewServerMachine(nil).ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LClientHello)), LAlert),
+    'null-only legacy_compression_methods is accepted');
+end;
+
+procedure TTestExtensionNegotiation.TestTls13ServerRefusesAChainSignedWithAnUnadvertisedHash;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  CheckTrue(FailAlertOf(NewServerMachineWith(Sha1Chain, nil).ProcessMessage(
+    TTlsLibTestHandshakeDecoder.HandshakeMessage(
+    FirstSendHandshake(NewClientMachine(nil).Start))), LAlert),
+    'a SHA-1-signed chain the client did not advertise aborts (RFC 9846 4.5.1.2)');
+  CheckTrue(LAlert = TTlsAlertDescription.HandshakeFailure, 'the alert is handshake_failure');
+end;
+
+procedure TTestExtensionNegotiation.TestTls13ServerRefusesAnRsaSha1ChainTheClientDidNotAdvertise;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  CheckTrue(FailAlertOf(NewServerMachineWith(RsaSha1Chain, nil).ProcessMessage(
+    TTlsLibTestHandshakeDecoder.HandshakeMessage(
+    FirstSendHandshake(NewClientMachine(nil).Start))), LAlert),
+    'an RSA SHA-1 chain the client did not advertise aborts (RFC 9846 4.5.1.2)');
+  CheckTrue(LAlert = TTlsAlertDescription.HandshakeFailure, 'the alert is handshake_failure');
+end;
+
+procedure TTestExtensionNegotiation.TestTls13ServerSendsTheChainWhenCertSchemesAdvertiseItsHash;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  // signature_algorithms_cert governs certificate signatures: it admits the SHA-1 issuer even
+  // though signature_algorithms does not
+  CheckFalse(FailAlertOf(NewServerMachineWith(Sha1Chain, nil).ProcessMessage(
+    TTlsLibTestHandshakeDecoder.HandshakeMessage(ClientHelloWithCertSchemes(
+    TArray<UInt16>.Create(TSignatureSchemes.EcdsaSha1)))), LAlert),
+    'an advertised SHA-1 certificate signature lets the server send its chain');
+end;
+
+procedure TTestExtensionNegotiation.TestTls12ServerRefusesAChainSignedWithAnUnadvertisedHash;
+var
+  LClient, LServer: ITlsEngine;
+begin
+  LClient := NewClient12(0);
+  LServer := NewServer12WithChain(Sha1Chain);
+  Handshake(LClient, LServer);
+  CheckTrue(LServer.IsTerminal, 'the 1.2 server aborts');
+  CheckEquals(Ord(TTlsAlertDescription.HandshakeFailure),
+    Ord(LServer.LastError.Alert.Description), 'the alert is handshake_failure');
+end;
+
+procedure TTestExtensionNegotiation.TestResolverSeesSignatureAlgorithmsWhenNoCertVariantIsSent;
+var
+  LResolver: TRecordingCredentialResolver;
+  LResolverRef: ITlsServerCredentialResolver;
+begin
+  LResolver := TRecordingCredentialResolver.Create(ServerCredential);
+  LResolverRef := LResolver;
+  NewServerMachineForResolver(LResolverRef).ProcessMessage(
+    TTlsLibTestHandshakeDecoder.HandshakeMessage(
+    FirstSendHandshake(NewClientMachine(nil).Start)));
+  CheckEquals(1, System.Length(LResolver.Hello.CertificateSignatureSchemes),
+    'one certificate scheme');
+  CheckEquals(TSignatureSchemes.EcdsaSecp256r1Sha256,
+    LResolver.Hello.CertificateSignatureSchemes[0], 'it is the signature_algorithms entry');
+end;
+
+procedure TTestExtensionNegotiation.TestResolverSeesSignatureAlgorithmsCertWhenPresent;
+var
+  LResolver: TRecordingCredentialResolver;
+  LResolverRef: ITlsServerCredentialResolver;
+begin
+  LResolver := TRecordingCredentialResolver.Create(ServerCredential);
+  LResolverRef := LResolver;
+  NewServerMachineForResolver(LResolverRef).ProcessMessage(
+    TTlsLibTestHandshakeDecoder.HandshakeMessage(ClientHelloWithCertSchemes(
+    TArray<UInt16>.Create(TSignatureSchemes.EcdsaSha1))));
+  CheckEquals(1, System.Length(LResolver.Hello.CertificateSignatureSchemes),
+    'one certificate scheme');
+  CheckEquals(TSignatureSchemes.EcdsaSha1, LResolver.Hello.CertificateSignatureSchemes[0],
+    'it is the signature_algorithms_cert entry');
+  CheckEquals(TSignatureSchemes.EcdsaSecp256r1Sha256, LResolver.Hello.SignatureSchemes[0],
+    'SignatureSchemes still holds signature_algorithms');
+end;
+
+procedure TTestExtensionNegotiation.TestClientAppliesNoInboundLimitWhenServerOmitsIt;
+var
+  LClient, LServer: ITlsEngine;
+  LPayload, LWire, LReceived: TBytes;
+  LI: Int32;
+begin
+  // the client offered a record_size_limit but the server did not agree to it; when the extension
+  // is not negotiated it binds neither side (RFC 8449 4), so the client must accept a server
+  // record larger than its own advertised limit rather than aborting record_overflow
+  LClient := NewClient(nil, 512);
+  LServer := NewServer(nil, 0);
+  Handshake(LClient, LServer);
+  CheckFalse(LClient.IsTerminal or LServer.IsTerminal, 'the handshake completed');
+
+  LPayload := nil;
+  SetLength(LPayload, 2000); // well over the client's un-negotiated 512-byte limit
+  for LI := 0 to System.Length(LPayload) - 1 do
+    LPayload[LI] := Byte(LI and $FF);
+  LServer.Write(LPayload, 0, System.Length(LPayload));
+  LWire := Drain(LServer);
+  FeedCoalesced(LClient, LWire);
+  LReceived := ReadAllApp(LClient);
+  CheckFalse(LClient.IsTerminal, 'the client accepted the oversize server record');
+  CheckEqualBytes('the client received the full payload', LPayload, LReceived);
 end;
 
 procedure TTestExtensionNegotiation.TestServerRejectsRecordSizeLimitBelowMinimum;
@@ -806,49 +1262,67 @@ begin
     Ord(LServer.LastError.Alert.Description), 'it is illegal_parameter');
 end;
 
+procedure TTestExtensionNegotiation.TestServerLimitWithoutClientOfferStillCompletes;
+var
+  LClient, LServer: ITlsEngine;
+begin
+  // a server configured with a record_size_limit against a client that never offered one:
+  // the server may not respond to an extension the client did not send (RFC 9846 4.3 /
+  // RFC 8449 4), so the handshake completes without it
+  LClient := NewClient(nil, 0);
+  LServer := NewServer(nil, 512);
+  Handshake(LClient, LServer);
+  CheckFalse(LClient.IsTerminal, 'the client did not abort on an unsolicited extension');
+  CheckFalse(LServer.IsTerminal, 'the server completed');
+  CheckFalse(LClient.IsHandshaking or LServer.IsHandshaking,
+    'the handshake completed without a record_size_limit');
+end;
+
+procedure TTestExtensionNegotiation.TestServerOmitsUnofferedRecordSizeLimit;
+var
+  LClient, LServer: IHandshakeMachine;
+  LEffects: TArray<THandshakeEffect>;
+  LEffect: THandshakeEffect;
+  LFlight: TArray<TBytes>;
+  LVector: TExtensionVector;
+begin
+  // machine level: with no client offer the EncryptedExtensions carries no record_size_limit
+  // and the server applies no limit to its record layer
+  LClient := NewClientMachine(nil);
+  LServer := NewServerMachineLimited(nil, 512);
+  LEffects := LServer.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(FirstSendHandshake(LClient.Start)));
+  LFlight := AllSendHandshake(LEffects);
+  LVector := TExtensionVector.Parse(
+    THandshakeMessages.DecodeEncryptedExtensions(TTlsLibTestHandshakeDecoder.HandshakeMessage(LFlight[1]).Body));
+  CheckFalse(LVector.Contains(TExtensionTypes.RecordSizeLimit),
+    'EncryptedExtensions omits an unoffered record_size_limit');
+  for LEffect in LEffects do
+    CheckFalse(LEffect.Kind = THandshakeEffectKind.SetRecordSizeLimit,
+      'no SetRecordSizeLimit effect without a client offer');
+end;
+
 function TTestExtensionNegotiation.NewGreasingClient: ITlsEngine;
 var
   LParams: TClientHandshakeParams;
 begin
   LParams := Default(TClientHandshakeParams);
   LParams.Clock := TSystemClock.Create;
-  LParams.Provider := Provider;
-  LParams.Group := TNamedGroups.CreateX25519(Provider);
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.Group := TNamedGroups.CreateX25519(Crypto);
   LParams.GroupCode := TNamedGroupCatalog.X25519;
-  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Provider);
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Crypto);
   LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
   LParams.OfferedSuites := TArray<UInt16>.Create(TCipherSuites13.Aes128GcmSha256);
   LParams.OfferedSchemes := TArray<UInt16>.Create(TSignatureSchemes.EcdsaSecp256r1Sha256);
   LParams.Grease := True;
   LParams.ClientRandom := DecodeHex(StringOfChar('1', 64));
   LParams.LegacySessionId := DecodeHex(StringOfChar('3', 64));
-  LParams.CertificateVerifier := TCertificateVerifier.Create(Provider, TSystemClock.Create as ITlsClock,
-    TTrustAnchorStore.Create(TArray<TBytes>.Create(TestRootCertificate)) as ITrustAnchorStore,
-    True) as IServerCertificateVerifier;
+  LParams.CertificateVerifier := TCertificateVerifier.Create(Pkix, TSystemClock.Create as ITlsClock,
+    TTlsLibTestCertificates.EcP256RootStore, True) as IServerCertificateVerifier;
   LParams.ExpectedServerName := TServerName.DnsName('localhost');
   Result := TTlsEngine.CreateConfigured(
-    TTls13ClientStateMachine.Create(LParams) as IHandshakeMachine, Provider);
-end;
-
-function TTestExtensionNegotiation.ServerHelloFrom(
-  const AWire: TBytes): TTlsServerHello;
-var
-  LPos, LLen: Int32;
-begin
-  Result := Default(TTlsServerHello);
-  LPos := 0;
-  // the first handshake record (type 22) carries the plaintext ServerHello
-  while LPos + 5 <= System.Length(AWire) do
-  begin
-    LLen := (AWire[LPos + 3] shl 8) or AWire[LPos + 4];
-    if AWire[LPos] = 22 then
-    begin
-      Result := THandshakeMessages.DecodeServerHello(
-        MsgFrom(System.Copy(AWire, LPos + 5, LLen)).Body);
-      Exit;
-    end;
-    Inc(LPos, 5 + LLen);
-  end;
+    TTls13ClientStateMachine.Create(LParams) as IHandshakeMachine, Crypto);
 end;
 
 procedure TTestExtensionNegotiation.TestGreaseValueClassification;
@@ -869,15 +1343,14 @@ var
   LServerHello: TTlsServerHello;
   LContext: TExtensionContext;
   LCodec: IExtensionBlockCodec;
-  LIterations: Int32;
 begin
   LClient := NewGreasingClient;
   LServer := NewServer(nil, 0);
 
   LClient.StartHandshake;
   // capture the server's first flight to prove nothing GREASE was selected
-  Feed(LServer, Drain(LClient));
-  LServerHello := ServerHelloFrom(Drain(LServer));
+  PumpCoalesced(LClient, LServer);
+  LServerHello := TTlsLibTestHandshakeDecoder.ServerHello(Drain(LServer));
   CheckFalse(TGrease.IsGrease(LServerHello.CipherSuite),
     'the server did not select a GREASE cipher suite');
   LContext := TExtensionContext.Create;
@@ -897,14 +1370,7 @@ begin
   // and the GREASE-laden handshake still completes end to end
   LClient := NewGreasingClient;
   LServer := NewServer(nil, 0);
-  LClient.StartHandshake;
-  LIterations := 0;
-  while (LClient.IsHandshaking or LServer.IsHandshaking) and (LIterations < 16) do
-  begin
-    Pump(LClient, LServer);
-    Pump(LServer, LClient);
-    Inc(LIterations);
-  end;
+  Handshake(LClient, LServer);
   CheckFalse(LClient.IsTerminal, 'the client completed with GREASE');
   CheckFalse(LServer.IsTerminal, 'the server tolerated the GREASE');
   CheckFalse(LClient.IsHandshaking or LServer.IsHandshaking, 'the handshake finished');
@@ -949,11 +1415,31 @@ begin
     try
       LExt.Consume(LDst, TBytes.Create($01, $01));
     except
-      on E: EDecodeErrorTlsLibException do
-        LRejected := True;
+      on E: EFatalAlertTlsLibException do
+        LRejected := E.AlertDescription = TTlsAlertDescription.IllegalParameter;
     end;
     CheckTrue(LRejected,
-      'a point-format list without uncompressed is rejected (decode_error)');
+      'a point-format list without uncompressed is rejected (illegal_parameter)');
+  finally
+    LDst.Free;
+  end;
+end;
+
+procedure TTestExtensionNegotiation.TestStatusRequestInCertificateRequestIsPermittedAndIgnored;
+var
+  LExt: ITlsExtension;
+  LDst: TExtensionContext;
+begin
+  // RFC 9846 4.3 lists status_request for CertificateRequest: the server asks for a status of OUR
+  // certificate. It is read and has no effect, since this client never staples.
+  LExt := TStatusRequestExtension.Create as ITlsExtension;
+  CheckTrue(TTlsExtensionContextKind.CertificateRequest in LExt.ValidContexts,
+    'status_request is valid in a CertificateRequest');
+  LDst := TExtensionContext.Create;
+  try
+    LDst.MessageContext := TTlsExtensionContextKind.CertificateRequest;
+    LExt.Consume(LDst, TBytes.Create($01, $00, $00, $00, $00));
+    CheckFalse(LDst.StatusRequestOffered, 'it does not arm a staple request');
   finally
     LDst.Free;
   end;
@@ -971,8 +1457,8 @@ begin
   try
     LDst.MessageContext := TTlsExtensionContextKind.ServerHello;
     LExt.Consume(LDst, TBytes.Create($00, $03, $02, $68, $32));
-    CheckEquals('h2', LDst.SelectedAlpn,
-      'the server''s ServerHello ALPN selection round-trips');
+    CheckEqualBytes('the server''s ServerHello ALPN selection round-trips', TAlpnProtocols.H2,
+      LDst.SelectedAlpn);
   finally
     LDst.Free;
   end;
@@ -1002,6 +1488,153 @@ begin
   finally
     LDst.Free;
   end;
+end;
+
+procedure TTestExtensionNegotiation.TestClientRejectsGreaseExtensionInEncryptedExtensions;
+var
+  LClient, LServer: IHandshakeMachine;
+  LClientHello, LServerHello, LEncryptedExtensions: TBytes;
+  LGreaseType: UInt16;
+  LAlert: TTlsAlertDescription;
+begin
+  // a client that splices a GREASE extension into its ClientHello must reject a server that
+  // echoes that GREASE type back in EncryptedExtensions (RFC 8701 3.1)
+  LClient := NewGreasingClientMachine;
+  LServer := NewServerMachine(nil);
+  LClientHello := FirstSendHandshake(LClient.Start);
+  LGreaseType := GreaseExtensionTypeOf(LClientHello);
+  CheckTrue(TGrease.IsGrease(LGreaseType),
+    'the greasing ClientHello carries a GREASE extension type');
+  LServerHello := FirstSendHandshake(LServer.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LClientHello)));
+  LClient.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LServerHello)); // installs handshake keys; awaits EncryptedExtensions
+  LEncryptedExtensions := BuildEncryptedExtensionsWithExtension(LGreaseType);
+  CheckTrue(FailAlertOf(LClient.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(LEncryptedExtensions)), LAlert),
+    'a GREASE extension type echoed in EncryptedExtensions aborts');
+  CheckTrue(LAlert = TTlsAlertDescription.IllegalParameter,
+    'a GREASE extension in EncryptedExtensions is illegal_parameter');
+end;
+
+procedure TTestExtensionNegotiation.TestGreaseInjectsBeforeEchThenPskThenEnd;
+var
+  LVector: TExtensionVector;
+  LGrease: UInt16;
+  LTypes: TArray<UInt16>;
+begin
+  LGrease := TGrease.ValueAt(3);
+  // ech and psk both present: GREASE joins the compressible run just before ech, psk stays last
+  LVector := TExtensionVector.Empty;
+  LVector.Append(TExtensionEntry.Create(TExtensionTypes.ServerName, nil));
+  LVector.Append(TExtensionEntry.Create(TExtensionTypes.SupportedGroups, nil));
+  LVector.Append(TExtensionEntry.Create(TExtensionTypes.EncryptedClientHello, nil));
+  LVector.Append(TExtensionEntry.Create(TExtensionTypes.PreSharedKey, nil));
+  LVector := TExtensionVector.Parse(TGrease.InjectExtension(LVector.Encode, LGrease));
+  LTypes := LVector.Types;
+  CheckEquals(5, Length(LTypes), 'the block gained one GREASE extension');
+  CheckEquals(Int64(LGrease), Int64(LTypes[2]), 'GREASE lands just before encrypted_client_hello');
+  CheckEquals(Int64(TExtensionTypes.EncryptedClientHello), Int64(LTypes[3]), 'ech follows GREASE');
+  CheckEquals(Int64(TExtensionTypes.PreSharedKey), Int64(LTypes[4]), 'pre_shared_key stays last');
+
+  // no ech but psk present: GREASE falls back to just before pre_shared_key
+  LVector := TExtensionVector.Empty;
+  LVector.Append(TExtensionEntry.Create(TExtensionTypes.ServerName, nil));
+  LVector.Append(TExtensionEntry.Create(TExtensionTypes.SupportedGroups, nil));
+  LVector.Append(TExtensionEntry.Create(TExtensionTypes.PreSharedKey, nil));
+  LVector := TExtensionVector.Parse(TGrease.InjectExtension(LVector.Encode, LGrease));
+  LTypes := LVector.Types;
+  CheckEquals(Int64(LGrease), Int64(LTypes[2]), 'GREASE lands just before pre_shared_key');
+  CheckEquals(Int64(TExtensionTypes.PreSharedKey), Int64(LTypes[3]), 'pre_shared_key stays last');
+
+  // neither present: GREASE goes at the very end
+  LVector := TExtensionVector.Empty;
+  LVector.Append(TExtensionEntry.Create(TExtensionTypes.ServerName, nil));
+  LVector.Append(TExtensionEntry.Create(TExtensionTypes.SupportedGroups, nil));
+  LVector := TExtensionVector.Parse(TGrease.InjectExtension(LVector.Encode, LGrease));
+  LTypes := LVector.Types;
+  CheckEquals(3, Length(LTypes), 'the block gained one GREASE extension');
+  CheckEquals(Int64(LGrease), Int64(LTypes[2]), 'GREASE goes last when neither ech nor psk is present');
+end;
+
+procedure TTestExtensionNegotiation.TestGreaseExtensionIsLastInPlainClientHello;
+var
+  LClient: IHandshakeMachine;
+  LClientHello: TBytes;
+  LHello: TTlsClientHello;
+  LVector: TExtensionVector;
+  LTypes: TArray<UInt16>;
+  LGreaseIndex, LI: Int32;
+begin
+  // a plain greasing ClientHello offers no pre_shared_key or ech, so the GREASE extension is
+  // appended at the very end rather than sitting ahead of server_name
+  LClient := NewGreasingClientMachine;
+  LClientHello := FirstSendHandshake(LClient.Start);
+  LHello := THandshakeMessages.DecodeClientHello(TTlsLibTestHandshakeDecoder.HandshakeMessage(LClientHello).Body);
+  LVector := TExtensionVector.Parse(LHello.Extensions);
+  LTypes := LVector.Types;
+  LGreaseIndex := -1;
+  for LI := 0 to High(LTypes) do
+    if TGrease.IsGrease(LTypes[LI]) then
+      LGreaseIndex := LI;
+  CheckEquals(Length(LTypes) - 1, LGreaseIndex,
+    'GREASE is the last extension in a plain greasing ClientHello');
+end;
+
+procedure TTestExtensionNegotiation.TestServerRejectsInnerEchWithoutBackend;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  // an inner-type encrypted_client_hello is a decrypted ClientHelloInner; a plain server (no ECH
+  // keys, not deployed as a split-mode backend) must refuse it with illegal_parameter (RFC 9849
+  // sec. 7), rather than confirm a backend role it was never configured for
+  CheckTrue(FailAlertOf(NewServerMachine(nil).ProcessMessage(
+    TTlsLibTestHandshakeDecoder.HandshakeMessage(InnerEchClientHello)), LAlert),
+    'an inner-type ech at a non-backend server aborts');
+  CheckTrue(LAlert = TTlsAlertDescription.IllegalParameter,
+    'an inner-type ech at a non-backend server is illegal_parameter');
+end;
+
+procedure TTestExtensionNegotiation.TestServerAcceptsInnerEchWhenBackend;
+var
+  LEffects: TArray<THandshakeEffect>;
+  LAlert: TTlsAlertDescription;
+begin
+  // a server deployed as a split-mode backend accepts the forwarded inner-type ech and drives the
+  // handshake off it (RFC 9849 sec. 7.2): no abort, a ServerHello is emitted
+  LEffects := NewEchServerMachine(TEchServerPolicy.Backend).ProcessMessage(
+    TTlsLibTestHandshakeDecoder.HandshakeMessage(InnerEchClientHello));
+  CheckFalse(FailAlertOf(LEffects, LAlert),
+    'a backend server does not abort an inner-type ech');
+  CheckTrue(FirstSendHandshake(LEffects) <> nil,
+    'a backend server answers an inner-type ech with a ServerHello');
+end;
+
+procedure TTestExtensionNegotiation.TestBackendServerRejectsOuterEch;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  // a split-mode backend only takes the forwarded inner hello: an outer-type ech MUST abort with
+  // illegal_parameter (RFC 9849 sec. 7), while a server with no ECH policy ignores it
+  CheckTrue(FailAlertOf(NewEchServerMachine(TEchServerPolicy.Backend).ProcessMessage(
+    TTlsLibTestHandshakeDecoder.HandshakeMessage(OuterEchClientHello)), LAlert), 'a backend aborts an outer-type ech');
+  CheckTrue(LAlert = TTlsAlertDescription.IllegalParameter, 'with illegal_parameter');
+  CheckFalse(FailAlertOf(NewServerMachine(nil).ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(OuterEchClientHello)),
+    LAlert), 'a server with no ECH policy ignores an outer-type ech');
+end;
+
+procedure TTestExtensionNegotiation.TestKeyedServerRejectsInnerEch;
+var
+  LGen: TEchKeyGenResult;
+  LServer: IHandshakeMachine;
+  LAlert: TTlsAlertDescription;
+begin
+  // an inner-type ech is a decrypted ClientHelloInner, which a server holding ECH keys must never
+  // take directly (RFC 9849 sec. 7): only a backend may
+  LGen := TEchKeyGenerator.Generate(Crypto, 'public.example', 'origin.example', $AA,
+    THpkeKem.DHKEM_X25519_HKDF_SHA256, THpkeKdf.HKDF_SHA256, THpkeAead.AES_128_GCM, 0);
+  LServer := NewEchServerMachine(TEchServerPolicy.Keyed(Crypto,
+    TInMemoryEchKeyStore.FromPem(LGen.Pem, Crypto), False));
+  CheckTrue(FailAlertOf(LServer.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(InnerEchClientHello)), LAlert),
+    'a keyed server aborts an inner-type ech');
+  CheckTrue(LAlert = TTlsAlertDescription.IllegalParameter, 'with illegal_parameter');
 end;
 
 initialization

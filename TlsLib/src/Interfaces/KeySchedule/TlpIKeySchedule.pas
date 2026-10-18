@@ -17,6 +17,7 @@ interface
 
 uses
   SysUtils,
+  TlpIKeyLog,
   TlpISecretBuffer;
 
 type
@@ -24,11 +25,13 @@ type
   TTlsEpoch = (EarlyData, Handshake, Application);
 
   /// <summary>
-  /// Which binder label a pre_shared_key derives its binder key under (RFC 8446 7.1,
-  /// RFC 9258 6): a resumption ticket uses "res binder", a raw out-of-band external PSK
+  /// Which binder label a pre_shared_key derives its binder key under (RFC 9846 7.1,
+  /// RFC 9258 5.2): a resumption ticket uses "res binder", a raw out-of-band external PSK
   /// uses "ext binder", and an RFC 9258 imported external PSK uses "imp binder". The
   /// three labels domain-separate the binder so a key provisioned for one role cannot be
-  /// replayed in another.
+  /// replayed in another. External is the raw "ext binder" label; the library provisions
+  /// every external PSK through the RFC 9258 importer (Imported), so no production path
+  /// selects External - it is kept for label completeness and the domain-separation tests.
   /// </summary>
   TPskBinderKind = (Resumption, External, Imported);
 
@@ -52,7 +55,7 @@ type
   /// knowing the negotiated version; the inputs and derivation are version-specific.
   /// </summary>
   IKeySchedule = interface(IInterface)
-    ['{2F8D5A16-9C43-4E70-B1A8-6D0E2C7F84B5}']
+    ['{7BF31957-5674-4D58-8A14-CE83BB7F497D}']
     /// <summary>
     /// The (key, iv) for an already-derived epoch and direction. Every version has
     /// an Application epoch; a schedule rejects an epoch it never derives.
@@ -64,25 +67,55 @@ type
     /// <summary>Constant-time check of a peer's verify_data against the expected.</summary>
     function VerifyFinished(ADirection: TTlsDirection;
       const ATranscriptHash, APeerVerifyData: TBytes): Boolean;
-    /// <summary>Exported keying material (RFC 8446 7.5 / RFC 5705). AUseContext
-    /// distinguishes a supplied (possibly empty) context from no context at all: in TLS 1.2
-    /// an empty-but-present context contributes a zero-length block to the seed while no
-    /// context contributes nothing, which produce different output (RFC 5705 4).</summary>
+    /// <summary>Exported keying material with no context value (RFC 9846 7.5 / RFC 5705).</summary>
+    function ExportKeyingMaterial(const ALabel: string;
+      ALength: Int32): TBytes; overload;
+    /// <summary>Exported keying material bound to AContext (RFC 9846 7.5 / RFC 5705). A supplied
+    /// context, empty or not, is distinct from no context at all: in TLS 1.2 an empty-but-present
+    /// context contributes a zero-length block to the seed while no context contributes nothing,
+    /// which produce different output (RFC 5705 4).</summary>
     function ExportKeyingMaterial(const ALabel: string; const AContext: TBytes;
-      AUseContext: Boolean; ALength: Int32): TBytes;
+      ALength: Int32): TBytes; overload;
+    /// <summary>Releases every stage input and intermediate secret the completed handshake no
+    /// longer needs, so a later heap disclosure cannot recover the key tree. Keeps only what the
+    /// live connection still uses: the TLS 1.3 application traffic secrets (for KeyUpdate), the
+    /// exporter secret, and the resumption secret (derive it first); the TLS 1.2
+    /// master secret (it is the RFC 5705 exporter secret). Call once both Finished are processed
+    /// - on TLS 1.3 after DeriveResumptionMasterSecret. Idempotent; a schedule that has forgotten
+    /// its handshake secrets rejects any further derivation.</summary>
+    procedure ForgetHandshakeSecrets;
+    /// <summary>Installs the key-log sink and the ClientHello.random every reported secret is keyed
+    /// by (the inner ClientHello's when ECH was accepted); nil disables reporting. Secrets derived
+    /// after this call are reported to the sink as they are derived (RFC 9850).</summary>
+    procedure SetKeyLog(const AKeyLog: IKeyLog; const AClientRandom: TBytes);
+    /// <summary>Whether exported keying material is available: TLS 1.3 once the Application epoch
+    /// is derived (incl. a server's half-RTT, before the peer Finished); TLS 1.2 once the master
+    /// secret exists (the machine still gates 1.2 export on handshake completion).</summary>
+    function CanExport: Boolean;
   end;
 
   /// <summary>
-  /// The TLS 1.3 key schedule (RFC 8446 7.1): the HKDF Early -> Handshake -> Master
+  /// The TLS 1.3 key schedule (RFC 9846 7.1): the HKDF Early -> Handshake -> Main
   /// tree, epoch traffic secrets derived from a transcript hash, the per-direction
-  /// Finished key, KeyUpdate, and the resumption master secret. The schedule
+  /// Finished key, KeyUpdate, and the resumption secret. The schedule
   /// derives; a driver installs the results into the record layer.
   /// </summary>
   ITls13KeySchedule = interface(IKeySchedule)
-    ['{7C3A9E12-4F85-4B60-A1D9-2E6C0B5F84A7}']
+    ['{1D0C239E-56C2-48CA-8A1E-08907741DB3E}']
+    /// <summary>Whether the early_exporter_secret has been derived (the early epoch was
+    /// taken), so ExportEarlyKeyingMaterial is available.</summary>
+    function CanExportEarly: Boolean;
+    /// <summary>Early-data keying material (RFC 9846 7.5) from the early_exporter_secret;
+    /// raises EInvalidOperationTlsLibException when the early epoch has not been derived.</summary>
+    function ExportEarlyKeyingMaterial(const ALabel: string; const AContext: TBytes;
+      ALength: Int32): TBytes;
+    /// <summary>Drops the early_exporter_secret once the server cannot have derived it
+    /// (0-RTT refused, or the offer withdrawn by a HelloRetryRequest), so CanExportEarly turns
+    /// false and nothing keyed to a secret only this side holds can be exported.</summary>
+    procedure ForgetEarlyExporter;
     /// <summary>Sets the pre-shared key (omit for a 0-PSK handshake).</summary>
     procedure SetPsk(const APsk: ISecretBuffer);
-    /// <summary>Sets the (EC)DHE shared secret.</summary>
+    /// <summary>Sets the asymmetric shared secret.</summary>
     procedure SetSharedSecret(const ASharedSecret: ISecretBuffer);
     /// <summary>
     /// Derives and caches an epoch's traffic secrets from the transcript hash at
@@ -94,19 +127,25 @@ type
     function FinishedKey(ADirection: TTlsDirection): ISecretBuffer;
     /// <summary>Advances the application traffic secret one generation (KeyUpdate).</summary>
     procedure AdvanceKeyUpdate(ADirection: TTlsDirection);
-    /// <summary>Whether the exporter_master_secret has been derived (RFC 8446 7.5): true once
-    /// the Application epoch secrets are derived - for a server that is half-RTT (after it has
-    /// sent its Finished), before the peer's Finished.</summary>
-    function HasExporterSecret: Boolean;
-    /// <summary>The resumption master secret from the ClientHello..client Finished hash.</summary>
-    function ResumptionMasterSecret(const ATranscriptHash: TBytes): ISecretBuffer;
+    /// <summary>Releases the resumption secret once a server has minted its tickets;
+    /// ResumptionPsk then raises. A client keeps it (tickets arrive later).</summary>
+    procedure ForgetResumptionMasterSecret;
+    /// <summary>Derives and caches the resumption secret from the ClientHello..client
+    /// Finished transcript hash. Call once at handshake completion, before ForgetHandshakeSecrets
+    /// (it is the one stage that outlives the released handshake secrets, since a NewSessionTicket
+    /// may issue arbitrarily later).</summary>
+    procedure DeriveResumptionMasterSecret(const ATranscriptHash: TBytes);
+    /// <summary>The resumption secret cached by DeriveResumptionMasterSecret; raises if it
+    /// has not been derived.</summary>
+    function ResumptionMasterSecret: ISecretBuffer;
     /// <summary>
-    /// The per-ticket resumption PSK (RFC 8446 4.6.1):
-    /// HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce).
+    /// The per-ticket resumption PSK (RFC 9846 4.7.1):
+    /// HKDF-Expand-Label(resumption_secret, "resumption", ticket_nonce). Requires the
+    /// resumption secret to have been derived.
     /// </summary>
-    function ResumptionPsk(const ATranscriptHash, ATicketNonce: TBytes): ISecretBuffer;
+    function ResumptionPsk(const ATicketNonce: TBytes): ISecretBuffer;
     /// <summary>
-    /// The PSK binder key (RFC 8446 7.1): Derive-Secret(early_secret, AKind's label, "").
+    /// The PSK binder key (RFC 9846 7.1): Derive-Secret(early_secret, AKind's label, "").
     /// AKind selects the binder label ("res binder" / "ext binder" / "imp binder").
     /// Requires the PSK to have been set.
     /// </summary>
@@ -114,7 +153,7 @@ type
     /// <summary>
     /// The PSK binder verify_data: HMAC(finished_key, ATruncatedTranscriptHash),
     /// where finished_key derives from the binder key and the hash is taken over
-    /// the ClientHello up to (excluding) the binders list (RFC 8446 4.2.11.2).
+    /// the ClientHello up to (excluding) the binders list (RFC 9846 4.3.11.2).
     /// </summary>
     function ComputeBinder(AKind: TPskBinderKind;
       const ATruncatedTranscriptHash: TBytes): TBytes;
@@ -124,13 +163,13 @@ type
   end;
 
   /// <summary>
-  /// The TLS 1.2 key schedule (RFC 5246 6.3 / RFC 7627): the PRF-derived master
+  /// The TLS 1.2 key schedule (RFC 5246 8.1 and 6.3 / RFC 7627): the PRF-derived master
   /// secret (plain or Extended Master Secret) and the key_block split into the
   /// AEAD write keys and salts. verify_data and the traffic keys are read back
   /// through the base IKeySchedule surface.
   /// </summary>
   ITls12KeySchedule = interface(IKeySchedule)
-    ['{3D8B1F60-5A24-4C93-8E17-9B0A6D2F45C8}']
+    ['{67991EBE-FDB6-47A9-9962-1A5835DE33F5}']
     /// <summary>Sets the pre-master secret (the (EC)DHE shared secret for ECDHE suites).</summary>
     procedure SetPreMasterSecret(const APreMasterSecret: ISecretBuffer);
     /// <summary>Installs a stored master secret directly, for an abbreviated (resumption)
@@ -139,9 +178,12 @@ type
     procedure SetMasterSecret(const AMasterSecret: ISecretBuffer);
     /// <summary>Sets the client and server randoms used as PRF seeds.</summary>
     procedure SetRandoms(const AClientRandom, AServerRandom: TBytes);
-    /// <summary>master_secret = PRF(pms, "master secret", client_random+server_random).</summary>
+    /// <summary>master_secret = PRF(pms, "master secret", client_random+server_random). Raises
+    /// EInvalidOperationTlsLibException when no pre-master secret is set, the master secret
+    /// already exists, or the handshake secrets were released.</summary>
     procedure DeriveMasterSecret;
-    /// <summary>master_secret = PRF(pms, "extended master secret", session_hash) (RFC 7627).</summary>
+    /// <summary>master_secret = PRF(pms, "extended master secret", session_hash) (RFC 7627). Raises
+    /// as DeriveMasterSecret does.</summary>
     procedure DeriveExtendedMasterSecret(const ASessionHash: TBytes);
     /// <summary>key_block = PRF(master, "key expansion", server_random+client_random), split.</summary>
     procedure DeriveKeyBlock;

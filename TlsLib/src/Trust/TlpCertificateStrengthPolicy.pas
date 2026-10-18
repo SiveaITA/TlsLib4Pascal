@@ -16,6 +16,7 @@ unit TlpCertificateStrengthPolicy;
 interface
 
 uses
+  TlpPkixDomainTypes,
   TlpNegotiationTypes;
 
 type
@@ -24,17 +25,26 @@ type
   /// leaf and intermediates (a configured trust anchor is exempt). MinRsaModulusBits sets the
   /// smallest accepted RSA modulus; MaxRsaModulusBits caps it as a verify-cost defence (0 = no
   /// cap); AllowedEcCurves is the accepted ECDSA named-group codes (empty = any curve the
-  /// provider recognises); AllowEdDsa admits Ed25519/Ed448 keys. The chain-signature algorithm
-  /// check (peer chain signed only with an advertised scheme, and the MD5/SHA-1 rejection RFC
-  /// 8446 4.4.2 mandates) is always applied and is not gated by this record.
+  /// provider recognises); AllowEdDsa admits Ed25519/Ed448 keys; AllowedDeprecatedHashes admits
+  /// signature hashes the library otherwise refuses. The chain-signature algorithm check (peer
+  /// chain signed only with an advertised scheme, and the MD5 (MUST) / SHA-1 (RECOMMENDED)
+  /// rejection of RFC 9846 4.5.1.3) is always applied; the only part of it this record loosens is
+  /// that admission. AllowedDeprecatedHashes governs the peer's chain only; our own chain is sent
+  /// with SHA-1 only when the peer advertised it (RFC 9846 4.5.1.2).
   /// </summary>
   TCertificateStrengthPolicy = record
     MinRsaModulusBits: Int32;
     MaxRsaModulusBits: Int32;
     AllowedEcCurves: TArray<UInt16>;
     AllowEdDsa: Boolean;
+    /// <summary>Deprecated signature hashes still accepted on the leaf and intermediates of a peer
+    /// chain, for a private PKI that has not been re-issued (empty = none). An admitted hash stands
+    /// in for an advertised scheme, since no scheme names a SHA-1 certificate signature. A
+    /// forbidden hash (MD5) is refused regardless; the key floors, PSS parameter checks, and the
+    /// fixed floor on OCSP responses, CRLs and responder certificates are unaffected.</summary>
+    AllowedDeprecatedHashes: TCertSignatureHashes;
     /// <summary>The default floors, applied by every preset: RSA 2048..8192, the NIST P-curves,
-    /// EdDSA admitted.</summary>
+    /// EdDSA admitted, no deprecated hash.</summary>
     class function Defaults: TCertificateStrengthPolicy; static;
   end;
 
@@ -50,6 +60,7 @@ begin
   Result.AllowedEcCurves := TArray<UInt16>.Create(TNamedGroupCatalog.Secp256r1,
     TNamedGroupCatalog.Secp384r1, TNamedGroupCatalog.Secp521r1);
   Result.AllowEdDsa := True;
+  Result.AllowedDeprecatedHashes := [];
 end;
 
 end.

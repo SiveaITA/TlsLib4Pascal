@@ -45,9 +45,15 @@ uses
   TlpCryptoDomainTypes,
   TlpICryptoProvider,
   TlpDefaultCryptoProvider,
+  TlpIPkixProvider,
+  TlpDefaultPkixProvider,
   TlpITlsConfig,
   TlpITlsConfigBuilder,
+  TlpCertificateVerifierSource,
   TlpTlsPresets,
+  TlpTlsVersion,
+  TlpEchClient,
+  TlpTlsCredential,
   TlpIEch,
   TlpInMemoryEchKeyStore,
   TlpEchConfig,
@@ -143,16 +149,22 @@ var
   LLastErr, LCipher: RawUtf8;
   LBuf: TBytes;
   LLen: Integer;
+  LDoBind, LAsync: Boolean;
+  LTimeoutMs, LRetry: Integer;
 begin
+  LDoBind := True;
+  LAsync := False;
+  LTimeoutMs := 3000;
+  LRetry := 0;
   try
     // the server credential + ECH key store ride on the process-wide ServerConfig, so the
     // context carries no cert/trust fields
     FillCharFast(LCtx, SizeOf(LCtx), 0);
-    if NewSocket(HOST, PORT, nlTcp, {dobind=}True, 3000, 3000, 3000, 0,
+    if NewSocket(HOST, PORT, nlTcp, LDoBind, LTimeoutMs, LTimeoutMs, LTimeoutMs, LRetry,
       LListener) <> nrOK then
       raise Exception.Create('server bind failed');
     GReady.SetEvent;
-    if LListener.Accept(LClient, LAddr, {async=}False) <> nrOK then
+    if LListener.Accept(LClient, LAddr, LAsync) <> nrOK then
       raise Exception.Create('accept failed');
     LConcrete := TTlsLibNetTls.Create;
     LTls := LConcrete; // used via INetTls; the interface owns it
@@ -175,7 +187,8 @@ end;
 
 class function TMormotEchLoopbackExample.Run: Integer;
 var
-  LProvider: ICryptoProvider;
+  LCrypto: ICryptoProvider;
+  LPkix: IPkixProvider;
   LEch: TEchKeyGenResult;
   LServerBuilder: ITlsServerConfigBuilder;
   LClientBuilder: ITlsClientConfigBuilder;
@@ -188,29 +201,36 @@ var
   LPing, LEcho: TBytes;
   LLen, LI: Integer;
   LOk: Boolean;
+  LDoBind: Boolean;
+  LTimeoutMs, LRetry: Integer;
 begin
+  LDoBind := False;
+  LTimeoutMs := 3000;
+  LRetry := 0;
   Result := 1;
   GServerError := '';
   GServerEch := TEchStatus.NotOffered;
   TVec.Locate;
-  LProvider := TDefaultCryptoProvider.Create as ICryptoProvider;
+  LCrypto := TDefaultCryptoProvider.Create as ICryptoProvider;
+  LPkix := TDefaultPkixProvider.Create as IPkixProvider;
 
-  LEch := TEchKeyGenerator.Generate(LProvider, PUBLIC_NAME, 1,
+  LEch := TEchKeyGenerator.Generate(LCrypto, PUBLIC_NAME, INNER_HOST, 1,
     THpkeKem.DHKEM_X25519_HKDF_SHA256, THpkeKdf.HKDF_SHA256,
     THpkeAead.AES_128_GCM, 0);
 
   // build and install each config fully before starting the next builder (a Compatible builder
   // is endpoint-chosen once), then install them process-wide (the mORMot config-in hatch)
-  LServerBuilder := TTlsPresets.Compatible(LProvider).Server
-    .WithCredential(TVec.Bytes('leaf_cert'), TVec.Bytes('leaf_key'), '');
+  LServerBuilder := TTlsPresets.Compatible(LCrypto, LPkix).Server
+    .WithCredential(TTlsCredential.Load(LCrypto, LPkix,
+    TVec.Bytes('leaf_cert'), TVec.Bytes('leaf_key')));
   LServerBuilder.Tls13.WithEchKeyStore(
-    TInMemoryEchKeyStore.FromPem(LEch.Pem, LProvider));
-  LServerBuilder.Tls13.WithEchTrialDecrypt(True);
+    TInMemoryEchKeyStore.FromPem(LEch.Pem, LCrypto), True);
   SetTlsLibMormotServerConfig(LServerBuilder.Build);
 
-  LClientBuilder := TTlsPresets.Compatible(LProvider).Client
-    .WithTrustAnchors(TVec.Bytes('root_cert'));
-  LClientBuilder.Tls13.WithEncryptedClientHello(LEch.EchConfigList);
+  LClientBuilder := TTlsPresets.Compatible(LCrypto, LPkix).Client
+    .WithServerVerification(TServerVerification.WebPki(TVec.Bytes('root_cert')).Build)
+    .WithSupportedVersions(TArray<UInt16>.Create(TlsWireVersionTls13));
+  LClientBuilder.Tls13.WithEch(TEchClientModes.Enable(LEch.EchConfigList));
   SetTlsLibMormotClientConfig(LClientBuilder.Build);
 
   GReady := TEvent.Create(nil, True, False, '');
@@ -223,7 +243,7 @@ begin
       raise Exception.Create('server: ' + GServerError);
 
     FillCharFast(LCtx, SizeOf(LCtx), 0);
-    if NewSocket(HOST, PORT, nlTcp, {dobind=}False, 3000, 3000, 3000, 0, LSock) <> nrOK then
+    if NewSocket(HOST, PORT, nlTcp, LDoBind, LTimeoutMs, LTimeoutMs, LTimeoutMs, LRetry, LSock) <> nrOK then
       raise Exception.Create('client connect failed');
     LConcrete := TTlsLibNetTls.Create;
     LTls := LConcrete;

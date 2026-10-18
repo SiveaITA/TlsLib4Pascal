@@ -19,7 +19,6 @@ interface
 
 uses
   SysUtils,
-  Classes,
 {$IFDEF FPC}
   fpcunit,
   testregistry,
@@ -30,19 +29,21 @@ uses
   TlpTlsAlert,
   TlpIClock,
   TlpClock,
-  TlpIHttpFetcher,
   TlpTrustPolicy,
   TlpTlsCredential,
   TlpITlsConfig,
   TlpITlsConfigBuilder,
+  TlpCertificateVerifierSource,
   TlpTlsPresets,
   TlpTlsEngineFactory,
   TlpITlsTransport,
   TlpTlsStream,
   TlpTlsLibExceptions,
   TlpLiveRevocation,
-  TlsStreamLoopbackTests, // TMemoryPipe / TMemoryTransport - the loopback duplex
-  LiveRevocationTests,    // TFakeHttpFetcher - the no-network OCSP/CRL double
+  MockTransport,
+  MockHttpFetcher,
+  MockVerifyHooks,
+  TlsLibTestCertificates,
   TlsLibTestBase;
 
 type
@@ -50,11 +51,9 @@ type
   /// certificate through the async verdict park with the supplied resolver. Captures whether the
   /// handshake completed, the client-chain size, and any fatal alert the server itself emitted
   /// (a rejected client-cert verdict aborts with that alert).</summary>
-  TMtlsLiveServerRunner = class(TThread)
+  TMtlsLiveServerRunner = class(TLoopbackServerThread)
   strict private
   var
-    FStream: TTlsStream;
-    FTransport: TMemoryTransport;
     FResolver: TCertificateVerdictResolver;
     FEcho: Boolean;
     FError: string;
@@ -65,9 +64,9 @@ type
   protected
     procedure Execute; override;
   public
-    constructor Create(const AStream: TTlsStream; const ATransport: TMemoryTransport;
-      const AResolver: TCertificateVerdictResolver; AEcho: Boolean);
-    destructor Destroy; override;
+    constructor Create(const AStream: TTlsStream; const ATransport,
+      AClientTransport: TMemoryTransport; const AResolver: TCertificateVerdictResolver;
+      AEcho: Boolean);
     property Error: string read FError;
     property HandshakeOk: Boolean read FHandshakeOk;
     property HasAlert: Boolean read FHasAlert;
@@ -85,20 +84,9 @@ type
   /// </summary>
   TTestServerSideLiveRevocation = class(TTlsLibAlgorithmTestCase)
   strict private
-    FFetcher: TFakeHttpFetcher; // one primed fetcher per test, referenced by the checker
-    function CertField(const AName: string): TBytes;
-    function ServerRoot: TBytes;
-    function ServerLeaf: TBytes;
-    function ServerKey: TBytes;
-    function ClientCa: TBytes;
-    function ClientLeaf: TBytes;
-    function ClientKey: TBytes;
+    FFetcher: TMockHttpFetcher; // one primed fetcher per test, referenced by the checker
     function ServerConfig(APosture: TRevocationPosture; AForce12: Boolean): ITlsServerConfig;
     function ClientConfig(AForce12: Boolean): ITlsClientConfig;
-    function NewClientStream(const ATransport: ITlsTransport;
-      const AConfig: ITlsClientConfig): TTlsStream;
-    function NewServerStream(const ATransport: ITlsTransport;
-      const AConfig: ITlsServerConfig): TTlsStream;
     procedure RunLoopback(const AClientConfig: ITlsClientConfig;
       const AServerConfig: ITlsServerConfig;
       const AResolver: TCertificateVerdictResolver; AEcho: Boolean;
@@ -108,8 +96,6 @@ type
     /// candidate so a leaf-only client chain resolves its issuer.</summary>
     function NewChecker(APosture: TRevocationPosture;
       AWithCandidates: Boolean): TLiveRevocationChecker;
-    function StubAccept(const ACtx: TCertificateVerdictContext;
-      out ARejectAlert: TTlsAlertDescription): Boolean;
     function StubReject(const ACtx: TCertificateVerdictContext;
       out ARejectAlert: TTlsAlertDescription): Boolean;
     /// <summary>Drives the client to completion then reads once, surfacing whatever fatal alert
@@ -128,7 +114,8 @@ type
     procedure TestLiveRevokedClientRejectedTls12;
     procedure TestStubResolverAcceptCompletes;
     procedure TestStubResolverRejectAborts;
-    procedure TestLeafOnlyWithoutIssuerCandidateRejectsUnderHard;
+    procedure TestLeafOnlyClientResolvesIssuerFromValidatedPathWithoutCandidates;
+    procedure TestLeafOnlyClientBadResponseRejectsUnderHardWithoutCandidates;
   end;
 
 implementation
@@ -140,23 +127,12 @@ const
 { TMtlsLiveServerRunner }
 
 constructor TMtlsLiveServerRunner.Create(const AStream: TTlsStream;
-  const ATransport: TMemoryTransport; const AResolver: TCertificateVerdictResolver;
-  AEcho: Boolean);
+  const ATransport, AClientTransport: TMemoryTransport;
+  const AResolver: TCertificateVerdictResolver; AEcho: Boolean);
 begin
-  inherited Create(True);
-  FStream := AStream;
-  FTransport := ATransport;
+  inherited Create(AStream, ATransport, AClientTransport);
   FResolver := AResolver;
   FEcho := AEcho;
-  FreeOnTerminate := False;
-end;
-
-destructor TMtlsLiveServerRunner.Destroy;
-begin
-  // inherited waits for Execute to finish; then free the server stream we own (it releases the
-  // engine and the transport)
-  inherited Destroy;
-  FStream.Free;
 end;
 
 procedure TMtlsLiveServerRunner.Execute;
@@ -176,8 +152,9 @@ begin
       LGot := FStream.Read(LChunk[0], System.Length(LChunk));
       if LGot > 0 then
         FStream.Write(LChunk[0], LGot);
-      FStream.CloseNotify;
     end;
+    // closing even when not echoing lets a client wrongly accepted here read EOF, not block
+    FStream.CloseNotify;
   except
     on E: ETlsStreamError do
     begin
@@ -191,6 +168,8 @@ begin
     on E: Exception do
       FError := E.ClassName + ': ' + E.Message;
   end;
+  // a server that ended has nothing more to send: release a client blocked on its read
+  FTransport.CloseWrite;
 end;
 
 { TTestServerSideLiveRevocation }
@@ -201,82 +180,21 @@ begin
   inherited TearDown;
 end;
 
-function TTestServerSideLiveRevocation.CertField(const AName: string): TBytes;
-var
-  LV: TStringList;
-begin
-  LV := LoadVectorFields('Certs/LiveRevocation.txt');
-  try
-    Result := DecodeHex(LV.Values[AName]);
-  finally
-    LV.Free;
-  end;
-end;
-
-function TTestServerSideLiveRevocation.ServerRoot: TBytes;
-var
-  LV: TStringList;
-begin
-  LV := LoadVectorFields('Certs/EcP256Chain.txt');
-  try
-    Result := DecodeHex(LV.Values['root_cert']);
-  finally
-    LV.Free;
-  end;
-end;
-
-function TTestServerSideLiveRevocation.ServerLeaf: TBytes;
-var
-  LV: TStringList;
-begin
-  LV := LoadVectorFields('Certs/EcP256Chain.txt');
-  try
-    Result := DecodeHex(LV.Values['leaf_cert']);
-  finally
-    LV.Free;
-  end;
-end;
-
-function TTestServerSideLiveRevocation.ServerKey: TBytes;
-var
-  LV: TStringList;
-begin
-  LV := LoadVectorFields('Certs/EcP256Chain.txt');
-  try
-    Result := DecodeHex(LV.Values['leaf_key']);
-  finally
-    LV.Free;
-  end;
-end;
-
-function TTestServerSideLiveRevocation.ClientCa: TBytes;
-begin
-  Result := CertField('ca_cert');
-end;
-
-function TTestServerSideLiveRevocation.ClientLeaf: TBytes;
-begin
-  // the LiveRevocation leaf carries no EKU (so it is acceptable as a client certificate) and an
-  // AIA OCSP + CRL DP with matching good/revoked responses in the same vector file
-  Result := CertField('leaf_cert');
-end;
-
-function TTestServerSideLiveRevocation.ClientKey: TBytes;
-begin
-  Result := CertField('leaf_key');
-end;
-
 function TTestServerSideLiveRevocation.ServerConfig(APosture: TRevocationPosture;
   AForce12: Boolean): ITlsServerConfig;
 var
   LServer: ITlsServerConfigBuilder;
 begin
-  LServer := TTlsPresets.Compatible(Provider).Server
-    .WithCredential(ServerLeaf, ServerKey)
+  LServer := TTlsPresets.Compatible(Crypto, Pkix).Server
+    .WithCredential(TTlsCredential.Load(Crypto, Pkix,
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_cert'),
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_key')))
     .WithPeerAuth(TClientAuthMode.Required)
-    .WithTrustAnchors(ClientCa) // the private client CA (issues the client leaf)
-    .WithRevocation(APosture)
-    .WithAsyncCertificateVerdict(True, 0); // arm the park so the resolver runs off the engine
+    // the private client CA (issues the client leaf)
+    .WithClientVerification(TClientVerification.WebPki(
+      TTlsLibTestCertificates.Field('Certs/LiveRevocation.txt', 'ca_cert'))
+      .WithRevocation(APosture).Build)
+    .WithLiveRevocationVerdict(0); // arm the park so the live resolver runs off the engine
   if AForce12 then
     LServer.WithSupportedVersions(TArray<UInt16>.Create(TlsWireVersionTls12));
   Result := LServer.Build;
@@ -286,26 +204,16 @@ function TTestServerSideLiveRevocation.ClientConfig(AForce12: Boolean): ITlsClie
 var
   LClient: ITlsClientConfigBuilder;
 begin
-  LClient := TTlsPresets.Compatible(Provider).Client
-    .WithTrustAnchors(ServerRoot)
-    .WithCredential(ClientLeaf, ClientKey); // present the client certificate (leaf only)
+  LClient := TTlsPresets.Compatible(Crypto, Pkix).Client
+    .WithServerVerification(TServerVerification.WebPki(
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'root_cert')).Build)
+    // the LiveRevocation leaf alone: no EKU, so client-auth capable, with OCSP/CRL vectors
+    .WithCredential(TTlsCredential.Load(Crypto, Pkix,
+      TTlsLibTestCertificates.Field('Certs/LiveRevocation.txt', 'leaf_cert'),
+      TTlsLibTestCertificates.Field('Certs/LiveRevocation.txt', 'leaf_key')));
   if AForce12 then
     LClient.WithSupportedVersions(TArray<UInt16>.Create(TlsWireVersionTls12));
   Result := LClient.Build;
-end;
-
-function TTestServerSideLiveRevocation.NewClientStream(const ATransport: ITlsTransport;
-  const AConfig: ITlsClientConfig): TTlsStream;
-begin
-  Result := TTlsStream.Create(ATransport,
-    TTlsEngineFactory.CreateClientEngine(AConfig, 'localhost'), True, 'localhost');
-end;
-
-function TTestServerSideLiveRevocation.NewServerStream(const ATransport: ITlsTransport;
-  const AConfig: ITlsServerConfig): TTlsStream;
-begin
-  Result := TTlsStream.Create(ATransport,
-    TTlsEngineFactory.CreateServerEngine(AConfig), False, '');
 end;
 
 procedure TTestServerSideLiveRevocation.RunLoopback(const AClientConfig: ITlsClientConfig;
@@ -322,30 +230,32 @@ begin
   LS2C := TMemoryPipe.Create;
   AClientTransport := TMemoryTransport.Create(LS2C, LC2S);
   LServerTransport := TMemoryTransport.Create(LC2S, LS2C);
-  AClient := NewClientStream(AClientTransport as ITlsTransport, AClientConfig);
-  LServerStream := NewServerStream(LServerTransport as ITlsTransport, AServerConfig);
-  AServer := TMtlsLiveServerRunner.Create(LServerStream, LServerTransport, AResolver, AEcho);
+  AClient := TTlsStream.Create(AClientTransport as ITlsTransport,
+    TTlsEngineFactory.CreateClientEngine(AClientConfig, 'localhost'), True, 'localhost');
+  LServerStream := TTlsStream.Create(LServerTransport as ITlsTransport,
+    TTlsEngineFactory.CreateServerEngine(AServerConfig), False, '');
+  AServer := TMtlsLiveServerRunner.Create(LServerStream, LServerTransport, AClientTransport,
+    AResolver, AEcho);
   AServer.Start;
 end;
 
 function TTestServerSideLiveRevocation.NewChecker(APosture: TRevocationPosture;
   AWithCandidates: Boolean): TLiveRevocationChecker;
+var
+  LOptions: TLiveRevocationOptions;
 begin
   if AWithCandidates then
-    Result := TLiveRevocationChecker.Create(Provider, TSystemClock.Create as ITlsClock,
-      FFetcher, APosture, TLiveRevocationMethod.OcspThenCrl, 0,
-      TArray<TBytes>.Create(ClientCa))
+  begin
+    LOptions.IssuerCandidates := TArray<TBytes>.Create(
+      TTlsLibTestCertificates.Field('Certs/LiveRevocation.txt', 'ca_cert'));
+    Result := TLiveRevocationChecker.Create(Pkix, TSystemClock.Create as ITlsClock,
+      TSystemMonotonicClock.Create as ITlsMonotonicClock, FFetcher, APosture,
+      TLiveRevocationMethod.OcspThenCrl, 0, LOptions);
+  end
   else
-    Result := TLiveRevocationChecker.Create(Provider, TSystemClock.Create as ITlsClock,
-      FFetcher, APosture, TLiveRevocationMethod.OcspThenCrl, 0);
-end;
-
-function TTestServerSideLiveRevocation.StubAccept(
-  const ACtx: TCertificateVerdictContext;
-  out ARejectAlert: TTlsAlertDescription): Boolean;
-begin
-  ARejectAlert := TTlsAlertDescription.BadCertificate;
-  Result := System.Length(ACtx.Chain) > 0;
+    Result := TLiveRevocationChecker.Create(Pkix, TSystemClock.Create as ITlsClock,
+      TSystemMonotonicClock.Create as ITlsMonotonicClock, FFetcher, APosture,
+      TLiveRevocationMethod.OcspThenCrl, 0);
 end;
 
 function TTestServerSideLiveRevocation.StubReject(
@@ -397,8 +307,9 @@ var
   LTransport: TMemoryTransport;
   LChecker: TLiveRevocationChecker;
 begin
-  FFetcher := TFakeHttpFetcher.Create;
-  FFetcher.SetPost(True, CertField('ocsp_good'));
+  FFetcher := TMockHttpFetcher.Create;
+  FFetcher.SetPost(True,
+    TTlsLibTestCertificates.Field('Certs/LiveRevocation.txt', 'ocsp_good'));
   LChecker := NewChecker(TRevocationPosture.Hard, True);
   try
     RunLoopback(ClientConfig(False), ServerConfig(TRevocationPosture.Hard, False),
@@ -408,7 +319,7 @@ begin
       CheckTrue(LClient.IsHandshakeComplete, 'the client completed the mTLS handshake');
       ExchangePingEcho(LClient);
       LClient.CloseNotify;
-      LServer.WaitFor;
+      LServer.Finish;
       CheckTrue(LServer.HandshakeOk, 'the server accepted the live-good client certificate');
       CheckTrue(LServer.PeerCertCount >= 1, 'the server surfaced the client certificate');
       CheckEquals('', LServer.Error, 'the server side ran without error');
@@ -430,8 +341,9 @@ var
   LChecker: TLiveRevocationChecker;
   LAlert: TTlsAlertDescription;
 begin
-  FFetcher := TFakeHttpFetcher.Create;
-  FFetcher.SetPost(True, CertField('ocsp_revoked'));
+  FFetcher := TMockHttpFetcher.Create;
+  FFetcher.SetPost(True,
+    TTlsLibTestCertificates.Field('Certs/LiveRevocation.txt', 'ocsp_revoked'));
   LChecker := NewChecker(TRevocationPosture.Hard, True);
   try
     RunLoopback(ClientConfig(False), ServerConfig(TRevocationPosture.Hard, False),
@@ -440,7 +352,7 @@ begin
       LAlert := ClientFatalAlert(LClient);
       CheckEquals(Int64(Ord(TTlsAlertDescription.CertificateRevoked)), Int64(Ord(LAlert)),
         'the client receives certificate_revoked for the revoked client certificate');
-      LServer.WaitFor;
+      LServer.Finish;
       CheckFalse(LServer.HandshakeOk, 'the server rejected the revoked client certificate');
       CheckTrue(LServer.HasAlert, 'the server aborted with an alert');
       CheckEquals(Int64(Ord(TTlsAlertDescription.CertificateRevoked)),
@@ -463,7 +375,7 @@ var
   LAlert: TTlsAlertDescription;
 begin
   // the responder is unreachable (fetch fails) -> indeterminate; under Hard the server rejects
-  FFetcher := TFakeHttpFetcher.Create;
+  FFetcher := TMockHttpFetcher.Create;
   FFetcher.SetPost(False, nil);
   FFetcher.SetGet(False, nil);
   LChecker := NewChecker(TRevocationPosture.Hard, True);
@@ -475,7 +387,7 @@ begin
       CheckEquals(Int64(Ord(TTlsAlertDescription.BadCertificateStatusResponse)),
         Int64(Ord(LAlert)),
         'an unreachable responder under Hard rejects with bad_certificate_status_response');
-      LServer.WaitFor;
+      LServer.Finish;
       CheckFalse(LServer.HandshakeOk, 'the server rejected the indeterminate client under Hard');
     finally
       LServer.Free;
@@ -494,7 +406,7 @@ var
   LChecker: TLiveRevocationChecker;
 begin
   // same unreachable responder, but Soft accepts an indeterminate result
-  FFetcher := TFakeHttpFetcher.Create;
+  FFetcher := TMockHttpFetcher.Create;
   FFetcher.SetPost(False, nil);
   FFetcher.SetGet(False, nil);
   LChecker := NewChecker(TRevocationPosture.Soft, True);
@@ -507,7 +419,7 @@ begin
         'Soft accepts an indeterminate live result and completes the handshake');
       ExchangePingEcho(LClient);
       LClient.CloseNotify;
-      LServer.WaitFor;
+      LServer.Finish;
       CheckTrue(LServer.HandshakeOk, 'the server accepted the client under Soft');
       CheckEquals('', LServer.Error, 'the server side ran without error');
     finally
@@ -527,8 +439,9 @@ var
   LChecker: TLiveRevocationChecker;
 begin
   // the TLS 1.2 server machine also parks on the client-chain verdict; a live-good client completes
-  FFetcher := TFakeHttpFetcher.Create;
-  FFetcher.SetPost(True, CertField('ocsp_good'));
+  FFetcher := TMockHttpFetcher.Create;
+  FFetcher.SetPost(True,
+    TTlsLibTestCertificates.Field('Certs/LiveRevocation.txt', 'ocsp_good'));
   LChecker := NewChecker(TRevocationPosture.Hard, True);
   try
     RunLoopback(ClientConfig(True), ServerConfig(TRevocationPosture.Hard, True),
@@ -541,7 +454,7 @@ begin
       CheckTrue(LClient.IsHandshakeComplete, 'the client completed the 1.2 mTLS handshake');
       ExchangePingEcho(LClient);
       LClient.CloseNotify;
-      LServer.WaitFor;
+      LServer.Finish;
       CheckTrue(LServer.HandshakeOk, 'the 1.2 server accepted the live-good client certificate');
       CheckEquals('', LServer.Error, 'the server side ran without error');
     finally
@@ -565,8 +478,9 @@ begin
   // aborts with certificate_revoked before it sends its ChangeCipherSpec. The client reads that
   // plaintext alert under the right epoch (its read epoch stays plaintext until the server's CCS)
   // and surfaces the exact code, matching the TLS 1.3 sibling.
-  FFetcher := TFakeHttpFetcher.Create;
-  FFetcher.SetPost(True, CertField('ocsp_revoked'));
+  FFetcher := TMockHttpFetcher.Create;
+  FFetcher.SetPost(True,
+    TTlsLibTestCertificates.Field('Certs/LiveRevocation.txt', 'ocsp_revoked'));
   LChecker := NewChecker(TRevocationPosture.Hard, True);
   try
     RunLoopback(ClientConfig(True), ServerConfig(TRevocationPosture.Hard, True),
@@ -575,7 +489,7 @@ begin
       LAlert := ClientFatalAlert(LClient);
       CheckEquals(Int64(Ord(TTlsAlertDescription.CertificateRevoked)), Int64(Ord(LAlert)),
         'the 1.2 client receives certificate_revoked for the revoked client certificate');
-      LServer.WaitFor;
+      LServer.Finish;
       CheckFalse(LServer.HandshakeOk, 'the 1.2 server rejected the revoked client certificate');
       CheckTrue(LServer.HasAlert, 'the 1.2 server aborted with an alert');
       CheckEquals(Int64(Ord(TTlsAlertDescription.CertificateRevoked)),
@@ -594,18 +508,23 @@ var
   LClient: TTlsStream;
   LServer: TMtlsLiveServerRunner;
   LTransport: TMemoryTransport;
+  LSpy: TVerdictResolverSpy;
 begin
   // the server park -> resolve -> resume wiring, independent of the live checker
+  LSpy := Own<TVerdictResolverSpy>(TVerdictResolverSpy.Create);
   RunLoopback(ClientConfig(False), ServerConfig(TRevocationPosture.Hard, False),
-    StubAccept, True, LClient, LServer, LTransport);
+    LSpy.Resolve, True, LClient, LServer, LTransport);
   try
     LClient.Handshake;
     CheckTrue(LClient.IsHandshakeComplete, 'an accepted server verdict completes the handshake');
     ExchangePingEcho(LClient);
     LClient.CloseNotify;
-    LServer.WaitFor;
+    LServer.Finish;
     CheckTrue(LServer.HandshakeOk, 'the server accepted the client via the stub resolver');
     CheckEquals('', LServer.Error, 'the server side ran without error');
+    // the server park concerns the mTLS client's chain (WaitFor is the memory barrier)
+    CheckEquals(Ord(TPeerRole.Client), Ord(LSpy.PeerRole),
+      'a server park attributes the parked chain to the client role');
   finally
     LServer.Free;
     LClient.Free;
@@ -625,7 +544,7 @@ begin
     LAlert := ClientFatalAlert(LClient);
     CheckEquals(Int64(Ord(TTlsAlertDescription.CertificateRevoked)), Int64(Ord(LAlert)),
       'a rejected server verdict aborts the handshake with the resolver alert');
-    LServer.WaitFor;
+    LServer.Finish;
     CheckFalse(LServer.HandshakeOk, 'the server rejected the client via the stub resolver');
   finally
     LServer.Free;
@@ -633,7 +552,45 @@ begin
   end;
 end;
 
-procedure TTestServerSideLiveRevocation.TestLeafOnlyWithoutIssuerCandidateRejectsUnderHard;
+procedure TTestServerSideLiveRevocation.TestLeafOnlyClientResolvesIssuerFromValidatedPathWithoutCandidates;
+var
+  LClient: TTlsStream;
+  LServer: TMtlsLiveServerRunner;
+  LTransport: TMemoryTransport;
+  LChecker: TLiveRevocationChecker;
+begin
+  // the client presents a leaf-only chain and the checker is given NO issuer candidates, yet the
+  // handshake park carries the pipeline-VALIDATED path (issuer at index 1), so the checker resolves
+  // the issuer from there and authenticates a Good response. The live check fetches once and the
+  // handshake completes - the issuer comes from PKIX, not from configured candidates.
+  FFetcher := TMockHttpFetcher.Create;
+  FFetcher.SetPost(True,
+    TTlsLibTestCertificates.Field('Certs/LiveRevocation.txt', 'ocsp_good'));
+  LChecker := NewChecker(TRevocationPosture.Hard, False);
+  try
+    RunLoopback(ClientConfig(False), ServerConfig(TRevocationPosture.Hard, False),
+      LChecker.ResolveVerdict, True, LClient, LServer, LTransport);
+    try
+      LClient.Handshake;
+      CheckTrue(LClient.IsHandshakeComplete,
+        'the leaf-only client completed: the issuer came from the validated path');
+      ExchangePingEcho(LClient);
+      LClient.CloseNotify;
+      LServer.Finish;
+      CheckTrue(LServer.HandshakeOk, 'the server accepted the live-good leaf-only client');
+      CheckEquals('', LServer.Error, 'the server side ran without error');
+      CheckEquals(1, FFetcher.PostCount,
+        'the responder was queried once - the validated path supplied the issuer');
+    finally
+      LServer.Free;
+      LClient.Free;
+    end;
+  finally
+    LChecker.Free;
+  end;
+end;
+
+procedure TTestServerSideLiveRevocation.TestLeafOnlyClientBadResponseRejectsUnderHardWithoutCandidates;
 var
   LClient: TTlsStream;
   LServer: TMtlsLiveServerRunner;
@@ -641,11 +598,11 @@ var
   LChecker: TLiveRevocationChecker;
   LAlert: TTlsAlertDescription;
 begin
-  // a good OCSP is primed, but the checker is given NO issuer candidates: a leaf-only client chain
-  // then has no issuer to authenticate a response, so the live check is indeterminate and never even
-  // fetches - under Hard the server rejects. This locks the documented recovery-required behaviour.
-  FFetcher := TFakeHttpFetcher.Create;
-  FFetcher.SetPost(True, CertField('ocsp_good'));
+  // the mirror of the accept case: leaf-only client, no candidates, but the responder returns an
+  // unusable answer. The validated path still lets the checker fetch (so the responder IS queried),
+  // and an unauthenticated/indeterminate answer under Hard rejects with bad_certificate_status_response.
+  FFetcher := TMockHttpFetcher.Create;
+  FFetcher.SetPost(False, nil); // the responder was reached, but no usable OCSP came back
   LChecker := NewChecker(TRevocationPosture.Hard, False);
   try
     RunLoopback(ClientConfig(False), ServerConfig(TRevocationPosture.Hard, False),
@@ -654,11 +611,11 @@ begin
       LAlert := ClientFatalAlert(LClient);
       CheckEquals(Int64(Ord(TTlsAlertDescription.BadCertificateStatusResponse)),
         Int64(Ord(LAlert)),
-        'a leaf-only client with no recoverable issuer is indeterminate -> Hard rejects');
-      LServer.WaitFor;
-      CheckFalse(LServer.HandshakeOk, 'the server rejected the unrecoverable-issuer client');
-      CheckEquals(0, FFetcher.PostCount,
-        'no OCSP fetch is attempted when the issuer cannot be recovered');
+        'an indeterminate live outcome under Hard rejects');
+      LServer.Finish;
+      CheckFalse(LServer.HandshakeOk, 'the server rejected the indeterminate client');
+      CheckEquals(1, FFetcher.PostCount,
+        'the responder was still queried - the validated path supplied the issuer');
     finally
       LServer.Free;
       LClient.Free;

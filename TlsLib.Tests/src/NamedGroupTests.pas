@@ -27,6 +27,7 @@ uses
   TestFramework,
 {$ENDIF FPC}
   TlpTlsAlert,
+  TlpEnumUtilities,
   TlpAlertMapping,
   TlpTlsLibExceptions,
   TlpISecretBuffer,
@@ -34,9 +35,10 @@ uses
   TlpArrayUtilities,
   TlpCryptoDomainTypes,
   TlpICryptoProvider,
-  TlpDefaultCryptoProvider,
-  TlpOSCryptoProvider,
+  TlsLibTestProviders,
+  MockCryptoProvider,
   TlpINamedGroup,
+  TlpIKeyExchangePrivateKey,
   TlpNamedGroups,
   TlpNegotiationTypes,
   TlsLibTestBase;
@@ -51,7 +53,7 @@ type
     /// <summary>Decapsulate on ABadShare must reject with a contained exception that
     /// maps to illegal_parameter (no backend exception may escape the group).</summary>
     procedure CheckDecapIllegalParameter(const AGroup: INamedGroup;
-      const APriv: ISecretBuffer; const ABadShare: TBytes; const AMsg: string);
+      const APriv: IKeyExchangePrivateKey; const ABadShare: TBytes; const AMsg: string);
     // export a fresh key's raw scalar, re-import it, and prove the derived public and
     // the resulting agreement are identical - the neutral-currency seam HPKE relies on
     procedure CheckKeyImportRoundTrip(AAlgorithm: TKeyAgreementAlgorithm);
@@ -60,7 +62,7 @@ type
     procedure CheckStaticUsageAgreesLikeEphemeral(AAlgorithm: TKeyAgreementAlgorithm);
     // import an UNCLAMPED external X25519 scalar (RFC 7748 6.1 Alice) and prove the derived
     // public is the RFC's published value - the seam an external HPKE/ECH key crosses
-    procedure CheckUnclampedScalarImport(const AProvider: ICryptoProvider);
+    procedure CheckUnclampedScalarImport(const ACryptoProvider: ICryptoProvider);
     // pins a hybrid's wire layout: split the client share at the claimed boundary, encapsulate
     // each leg standalone, reassemble the ciphertext in the claimed order, and prove the hybrid
     // decapsulates to the concatenation in that same order - a flipped KEM/classical order fails
@@ -68,6 +70,7 @@ type
       AClassicalShareBytes, AKemEncapsBytes: Int32; AKemFirst: Boolean);
   published
     procedure TestX25519Rfc7748Kat;
+    procedure TestX25519AcceptsNonCanonicalU;
     procedure TestX25519Agreement;
     procedure TestMlKem768Agreement;
     procedure TestHybridAgreement;
@@ -79,8 +82,11 @@ type
     procedure TestX25519ValidationRejectsWrongLength;
     procedure TestX25519RejectsAllZeroPeerShare;
     procedure TestMlKemValidationRejectsWrongLength;
+    procedure TestMlKemValidationRejectsOutOfRangeCoefficient;
     procedure TestNistDecapsulateRejectsOffCurvePoint;
     procedure TestHybridDecapsulateRejectsShortCiphertext;
+    procedure TestMlKemDecapsulateRejectsWrongLengthCiphertext;
+    procedure TestMlKemBackendDecapsulationFaultIsInternalError;
     procedure TestRegistry;
     procedure TestClassicalRegistryOmitsPostQuantum;
     procedure TestGroupKindClassifiesEcdheKemHybrid;
@@ -88,8 +94,6 @@ type
     procedure TestKeyImportExportRoundTrip;
     procedure TestStaticUsageAgreesLikeEphemeral;
     procedure TestX25519ImportUnclampedScalar;
-    procedure TestSystemX25519ImportUnclampedScalar;
-    procedure TestSystemHybridAgreement;
   end;
 
 implementation
@@ -113,7 +117,7 @@ end;
 procedure TTestNamedGroups.CheckAgreement(const AGroup: INamedGroup;
   AExpectedSecretLen: Int32);
 var
-  LPrivA: ISecretBuffer;
+  LPrivA: IKeyExchangePrivateKey;
   LPubA, LCiphertext: TBytes;
   LSecretA, LSecretB: ISecretBuffer;
 begin
@@ -128,15 +132,24 @@ end;
 procedure TTestNamedGroups.TestX25519Rfc7748Kat;
 var
   LVec: TStringList;
+  LCrypto: ICryptoProvider;
   LGroup: INamedGroup;
+  LKa: IKeyAgreement;
+  LKey: IKeyExchangePrivateKey;
   LSecret: ISecretBuffer;
+  LPub: TBytes;
 begin
   LVec := LoadVectorFields('Crypto/Ecdh/X25519Rfc7748.txt');
   try
-    LGroup := TNamedGroups.CreateX25519(Provider);
-    // Decapsulate is ECDH(scalar, u), the raw RFC 7748 scalar multiplication
-    LGroup.Decapsulate(TSecretBuffer.From(DecodeHex(LVec.Values['scalar'])),
-      DecodeHex(LVec.Values['u']), LSecret);
+    // portable: the vector's u lies outside the prime-order subgroup, refused by Windows Server
+    // 2025 CNG (build 26100)
+    LCrypto := TTlsLibTestProviders.Crypto(TCryptoProviderChoice.Portable);
+    LGroup := TNamedGroups.CreateX25519(LCrypto);
+    // adopt the raw RFC 7748 scalar into a key; Decapsulate is then ECDH(scalar, u)
+    LKa := LCrypto.Primitives.CreateKeyAgreement(TKeyAgreementAlgorithm.X25519);
+    LKey := LKa.ImportPrivateKey(TSecretBuffer.From(DecodeHex(LVec.Values['scalar'])),
+      TKeyAgreementUsage.Ephemeral, LPub);
+    LGroup.Decapsulate(LKey, DecodeHex(LVec.Values['u']), LSecret);
     CheckEqualBytes('X25519 RFC 7748', DecodeHex(LVec.Values['output']),
       SecretBytes(LSecret));
   finally
@@ -144,48 +157,83 @@ begin
   end;
 end;
 
+procedure TTestNamedGroups.TestX25519AcceptsNonCanonicalU;
+var
+  LVec: TStringList;
+  LKa: IKeyAgreement;
+  LKey: IKeyExchangePrivateKey;
+  LPub, LExpected: TBytes;
+begin
+  // RFC 7748 5: a receiver masks bit 255 and accepts a non-canonical u, so p+9 and 9 with
+  // bit 255 set both agree like u = 9 (Alice's public key)
+  LVec := LoadVectorFields('Crypto/Ecdh/X25519Rfc7748.txt');
+  try
+    LExpected := DecodeHex(LVec.Values['alice_public']);
+    LKa := Crypto.Primitives.CreateKeyAgreement(TKeyAgreementAlgorithm.X25519);
+    LKey := LKa.ImportPrivateKey(TSecretBuffer.From(DecodeHex(LVec.Values['alice_private'])),
+      TKeyAgreementUsage.Ephemeral, LPub);
+    CheckEqualBytes('the public key of the RFC 7748 6.1 private key', LExpected, LPub);
+    CheckEqualBytes('u = p+9 reduces to 9', LExpected,
+      SecretBytes(LKa.Agree(LKey, DecodeHex(LVec.Values['u_p_plus_9']))));
+    CheckEqualBytes('bit 255 of u is masked', LExpected,
+      SecretBytes(LKa.Agree(LKey, DecodeHex(LVec.Values['u_9_bit255']))));
+    CheckEqualBytes('RFC 7748 6.1 shared secret with Bob''s public key',
+      DecodeHex(LVec.Values['shared_k']),
+      SecretBytes(LKa.Agree(LKey, DecodeHex(LVec.Values['bob_public']))));
+  finally
+    LVec.Free;
+  end;
+end;
+
 procedure TTestNamedGroups.TestX25519Agreement;
 begin
-  CheckAgreement(TNamedGroups.CreateX25519(Provider), 32);
+  CheckAgreement(TNamedGroups.CreateX25519(Crypto), 32);
 end;
 
 procedure TTestNamedGroups.CheckKeyImportRoundTrip(
   AAlgorithm: TKeyAgreementAlgorithm);
 var
   LKa: IKeyAgreement;
-  LPriv, LScalar, LPriv2, LPeerPriv: ISecretBuffer;
+  LPriv, LPriv2, LPeerPriv: IKeyExchangePrivateKey;
+  LScalar: ISecretBuffer;
   LPub, LPub2, LPeerPub: TBytes;
+  LName: string;
 begin
-  LKa := Provider.Primitives.CreateKeyAgreement(AAlgorithm);
+  LName := TEnumUtilities.GetName<TKeyAgreementAlgorithm>(AAlgorithm);
+  LKa := Crypto.Primitives.CreateKeyAgreement(AAlgorithm);
   LKa.GenerateKeyPair(LPriv, LPub);
   // export the raw scalar and re-import it; the derived public must match the original
-  LScalar := LKa.ExportPrivateKey(LPriv);
-  LPriv2 := LKa.ImportPrivateKey(LScalar, LPub2);
-  CheckEqualBytes(LKa.Name + ' import derives the same public', LPub, LPub2);
+  LScalar := LPriv.ExportRaw;
+  LPriv2 := LKa.ImportPrivateKey(LScalar, TKeyAgreementUsage.Ephemeral, LPub2);
+  CheckEqualBytes(LName + ' import derives the same public', LPub, LPub2);
   // the re-imported key agrees identically with a peer (functionally the same key)
   LKa.GenerateKeyPair(LPeerPriv, LPeerPub);
-  CheckEqualBytes(LKa.Name + ' re-imported key agrees identically',
-    SecretBytes(LKa.Agree(LPriv, LPeerPub, TKeyAgreementUsage.Ephemeral)),
-    SecretBytes(LKa.Agree(LPriv2, LPeerPub, TKeyAgreementUsage.Ephemeral)));
+  CheckEqualBytes(LName + ' re-imported key agrees identically',
+    SecretBytes(LKa.Agree(LPriv, LPeerPub)),
+    SecretBytes(LKa.Agree(LPriv2, LPeerPub)));
 end;
 
 procedure TTestNamedGroups.CheckStaticUsageAgreesLikeEphemeral(
   AAlgorithm: TKeyAgreementAlgorithm);
 var
   LKa: IKeyAgreement;
-  LPriv, LPeerPriv: ISecretBuffer;
-  LPub, LPeerPub: TBytes;
+  LPriv, LStaticPriv, LPeerPriv: IKeyExchangePrivateKey;
+  LPub, LPubDup, LPeerPub: TBytes;
+  LName: string;
 begin
-  LKa := Provider.Primitives.CreateKeyAgreement(AAlgorithm);
+  LName := TEnumUtilities.GetName<TKeyAgreementAlgorithm>(AAlgorithm);
+  LKa := Crypto.Primitives.CreateKeyAgreement(AAlgorithm);
+  // one scalar adopted twice: once Ephemeral (as generated), once Static (posture-on-handle)
   LKa.GenerateKeyPair(LPriv, LPub);
+  LStaticPriv := LKa.ImportPrivateKey(LPriv.ExportRaw, TKeyAgreementUsage.Static, LPubDup);
   LKa.GenerateKeyPair(LPeerPriv, LPeerPub);
-  CheckEqualBytes(LKa.Name + ' static usage agrees like ephemeral',
-    SecretBytes(LKa.Agree(LPriv, LPeerPub, TKeyAgreementUsage.Ephemeral)),
-    SecretBytes(LKa.Agree(LPriv, LPeerPub, TKeyAgreementUsage.Static)));
+  CheckEqualBytes(LName + ' static usage agrees like ephemeral',
+    SecretBytes(LKa.Agree(LPriv, LPeerPub)),
+    SecretBytes(LKa.Agree(LStaticPriv, LPeerPub)));
   // both parties reach the same secret under full blinding (DH is commutative)
-  CheckEqualBytes(LKa.Name + ' static usage is commutative',
-    SecretBytes(LKa.Agree(LPriv, LPeerPub, TKeyAgreementUsage.Static)),
-    SecretBytes(LKa.Agree(LPeerPriv, LPub, TKeyAgreementUsage.Static)));
+  CheckEqualBytes(LName + ' static usage is commutative',
+    SecretBytes(LKa.Agree(LStaticPriv, LPeerPub)),
+    SecretBytes(LKa.Agree(LPeerPriv, LPub)));
 end;
 
 procedure TTestNamedGroups.TestKeyImportExportRoundTrip;
@@ -205,7 +253,7 @@ begin
 end;
 
 procedure TTestNamedGroups.CheckUnclampedScalarImport(
-  const AProvider: ICryptoProvider);
+  const ACryptoProvider: ICryptoProvider);
 const
   // RFC 7748 6.1: Alice's private scalar is unclamped (low bits set) - the shape of an
   // external HPKE/ECH key; import must clamp it and derive Alice's published public key
@@ -215,58 +263,40 @@ var
   LKa: IKeyAgreement;
   LPub: TBytes;
 begin
-  LKa := AProvider.Primitives.CreateKeyAgreement(TKeyAgreementAlgorithm.X25519);
-  LKa.ImportPrivateKey(TSecretBuffer.From(DecodeHex(ALICE_SK)), LPub);
+  LKa := ACryptoProvider.Primitives.CreateKeyAgreement(TKeyAgreementAlgorithm.X25519);
+  LKa.ImportPrivateKey(TSecretBuffer.From(DecodeHex(ALICE_SK)),
+    TKeyAgreementUsage.Ephemeral, LPub);
   CheckEqualBytes('X25519 unclamped import derives the RFC 7748 public',
     DecodeHex(ALICE_PK), LPub);
 end;
 
 procedure TTestNamedGroups.TestX25519ImportUnclampedScalar;
 begin
-  CheckUnclampedScalarImport(Provider);
-end;
-
-procedure TTestNamedGroups.TestSystemX25519ImportUnclampedScalar;
-begin
-  // the OS-native overlay: exercises the native X25519 import where present, portable
-  // fallback elsewhere, so the KAT holds on every host while guarding the native clamp
-  CheckUnclampedScalarImport(
-    TOSCryptoProvider.Compose(TDefaultCryptoProvider.Create as ICryptoProvider));
+  CheckUnclampedScalarImport(Crypto);
 end;
 
 procedure TTestNamedGroups.TestMlKem768Agreement;
 begin
-  CheckAgreement(TNamedGroups.CreateMlKem768(Provider), 32);
-end;
-
-procedure TTestNamedGroups.TestSystemHybridAgreement;
-var
-  LProvider: ICryptoProvider;
-begin
-  // the OS-native overlay: both hybrids compose over its primitives (P-256/X25519 + ML-KEM-768),
-  // native where CNG serves them and portable otherwise, so the round-trip holds on every host
-  LProvider := TOSCryptoProvider.Compose(TDefaultCryptoProvider.Create as ICryptoProvider);
-  CheckAgreement(TNamedGroups.CreateX25519MlKem768(LProvider), 64);
-  CheckAgreement(TNamedGroups.CreateSecP256r1MlKem768(LProvider), 64);
+  CheckAgreement(TNamedGroups.CreateMlKem768(Crypto), 32);
 end;
 
 procedure TTestNamedGroups.TestHybridAgreement;
 begin
   // shared secret = ML-KEM-768 secret (32) || X25519 secret (32)
-  CheckAgreement(TNamedGroups.CreateX25519MlKem768(Provider), 64);
+  CheckAgreement(TNamedGroups.CreateX25519MlKem768(Crypto), 64);
 end;
 
 procedure TTestNamedGroups.TestSecP256r1MlKem768Agreement;
 begin
   // shared secret = P-256 ECDH secret (32) || ML-KEM-768 secret (32) (RFC 10024)
-  CheckAgreement(TNamedGroups.CreateSecP256r1MlKem768(Provider), 64);
+  CheckAgreement(TNamedGroups.CreateSecP256r1MlKem768(Crypto), 64);
 end;
 
 procedure TTestNamedGroups.CheckHybridOrder(const AHybrid, AClassical,
   AKem: INamedGroup; AClassicalShareBytes, AKemEncapsBytes: Int32;
   AKemFirst: Boolean);
 var
-  LPriv: ISecretBuffer;
+  LPriv: IKeyExchangePrivateKey;
   LPubShare, LClassPub, LKemPub, LClassCt, LKemCt, LCipher, LExpected: TBytes;
   LClassSs, LKemSs, LHybridSs: ISecretBuffer;
 begin
@@ -303,21 +333,21 @@ end;
 procedure TTestNamedGroups.TestHybridShareOrdering;
 begin
   // X25519MLKEM768 writes ML-KEM first; SecP256r1MLKEM768 writes ECDH first (RFC 10024)
-  CheckHybridOrder(TNamedGroups.CreateX25519MlKem768(Provider),
-    TNamedGroups.CreateX25519(Provider), TNamedGroups.CreateMlKem768(Provider),
+  CheckHybridOrder(TNamedGroups.CreateX25519MlKem768(Crypto),
+    TNamedGroups.CreateX25519(Crypto), TNamedGroups.CreateMlKem768(Crypto),
     32, 1184, True);
-  CheckHybridOrder(TNamedGroups.CreateSecP256r1MlKem768(Provider),
-    TNamedGroups.CreateNistEcdh(Provider, 'secp256r1'),
-    TNamedGroups.CreateMlKem768(Provider), 65, 1184, False);
+  CheckHybridOrder(TNamedGroups.CreateSecP256r1MlKem768(Crypto),
+    TNamedGroups.CreateNistEcdh(Crypto, 'secp256r1'),
+    TNamedGroups.CreateMlKem768(Crypto), 65, 1184, False);
 end;
 
 procedure TTestNamedGroups.TestSecP256r1MlKem768DecapsulateRejectsShortCiphertext;
 var
   LGroup: INamedGroup;
-  LPriv: ISecretBuffer;
+  LPriv: IKeyExchangePrivateKey;
   LPub: TBytes;
 begin
-  LGroup := TNamedGroups.CreateSecP256r1MlKem768(Provider);
+  LGroup := TNamedGroups.CreateSecP256r1MlKem768(Crypto);
   LGroup.GenerateKeyPair(LPriv, LPub);
   // far shorter than the 65 + 1088 hybrid ciphertext; slicing must not reach the backend
   CheckDecapIllegalParameter(LGroup, LPriv, Zeros(100),
@@ -326,18 +356,18 @@ end;
 
 procedure TTestNamedGroups.TestNistAgreement;
 begin
-  CheckAgreement(TNamedGroups.CreateNistEcdh(Provider, 'secp256r1'), 32);
-  CheckAgreement(TNamedGroups.CreateNistEcdh(Provider, 'secp384r1'), 48);
-  CheckAgreement(TNamedGroups.CreateNistEcdh(Provider, 'secp521r1'), 66);
+  CheckAgreement(TNamedGroups.CreateNistEcdh(Crypto, 'secp256r1'), 32);
+  CheckAgreement(TNamedGroups.CreateNistEcdh(Crypto, 'secp384r1'), 48);
+  CheckAgreement(TNamedGroups.CreateNistEcdh(Crypto, 'secp521r1'), 66);
 end;
 
 procedure TTestNamedGroups.TestNistValidationRejectsBadPoints;
 var
   LGroup: INamedGroup;
-  LPriv: ISecretBuffer;
+  LPriv: IKeyExchangePrivateKey;
   LPub, LOffCurve, LCompressed: TBytes;
 begin
-  LGroup := TNamedGroups.CreateNistEcdh(Provider, 'secp256r1');
+  LGroup := TNamedGroups.CreateNistEcdh(Crypto, 'secp256r1');
   // point at infinity (single 0x00 byte)
   CheckFalse(LGroup.ValidatePeerShare(DecodeHex('00')), 'infinity rejected');
   // empty / malformed
@@ -352,7 +382,7 @@ begin
   LGroup.GenerateKeyPair(LPriv, LPub);
   CheckTrue(LGroup.ValidatePeerShare(LPub), 'valid point accepted');
   // the same on-curve point in COMPRESSED form must be rejected: modern TLS requires
-  // the uncompressed form (RFC 8446 4.2.8.2, RFC 8422 5.1.2), though the curve decodes it
+  // the uncompressed form (RFC 9846 4.3.8.2, RFC 8422 5.1.2), though the curve decodes it
   LCompressed := nil;
   SetLength(LCompressed, 33);
   Move(LPub[1], LCompressed[1], 32); // the X coordinate
@@ -366,7 +396,7 @@ procedure TTestNamedGroups.TestX25519ValidationRejectsWrongLength;
 var
   LGroup: INamedGroup;
 begin
-  LGroup := TNamedGroups.CreateX25519(Provider);
+  LGroup := TNamedGroups.CreateX25519(Crypto);
   CheckFalse(LGroup.ValidatePeerShare(DecodeHex('0011')), 'short rejected');
   CheckFalse(LGroup.ValidatePeerShare(Zeros(31)), '31 bytes rejected');
   CheckTrue(LGroup.ValidatePeerShare(Zeros(32)), 'any 32 bytes accepted');
@@ -375,13 +405,14 @@ end;
 procedure TTestNamedGroups.TestX25519RejectsAllZeroPeerShare;
 var
   LGroup: INamedGroup;
-  LPriv, LSecret: ISecretBuffer;
+  LPriv: IKeyExchangePrivateKey;
+  LSecret: ISecretBuffer;
   LPub: TBytes;
   LRaised: Boolean;
 begin
   // an all-zero u-coordinate is a small-order point: the agreement yields an
   // all-zero (non-contributory) shared secret, which must be refused
-  LGroup := TNamedGroups.CreateX25519(Provider);
+  LGroup := TNamedGroups.CreateX25519(Crypto);
   LGroup.GenerateKeyPair(LPriv, LPub);
   LRaised := False;
   try
@@ -396,10 +427,10 @@ end;
 procedure TTestNamedGroups.TestMlKemValidationRejectsWrongLength;
 var
   LGroup: INamedGroup;
-  LPriv: ISecretBuffer;
+  LPriv: IKeyExchangePrivateKey;
   LPub: TBytes;
 begin
-  LGroup := TNamedGroups.CreateMlKem768(Provider);
+  LGroup := TNamedGroups.CreateMlKem768(Crypto);
   CheckFalse(LGroup.ValidatePeerShare(DecodeHex('0011')), 'short rejected');
   CheckFalse(LGroup.ValidatePeerShare(Zeros(1183)), 'wrong length rejected');
   LGroup.GenerateKeyPair(LPriv, LPub);
@@ -407,8 +438,56 @@ begin
   CheckTrue(LGroup.ValidatePeerShare(LPub), 'valid encaps key accepted');
 end;
 
+procedure TTestNamedGroups.TestMlKemValidationRejectsOutOfRangeCoefficient;
+var
+  LProviders: array [0 .. 1] of ICryptoProvider;
+  LI: Int32;
+  LGroup: INamedGroup;
+  LKey: TBytes;
+  LPriv: IKeyExchangePrivateKey;
+  LPub: TBytes;
+begin
+  // the key is 1152 bytes of 12-bit coefficients (two per three bytes) then rho; the bound
+  // q = 3329 (FIPS 203 sec. 7.2) is the group's own, so it holds whichever backend sits below -
+  // including one that only checks the length
+  LProviders[0] := Crypto;
+  LProviders[1] := TMissingAeadProvider.CreateLenientKem(Crypto) as ICryptoProvider;
+  for LI := 0 to System.High(LProviders) do
+  begin
+    LGroup := TNamedGroups.CreateMlKem768(LProviders[LI]);
+    LKey := Zeros(1184);
+    CheckTrue(LGroup.ValidatePeerShare(LKey), 'all-zero coefficients are accepted');
+    LKey[1] := $0D; // 0xD00 = 3328 = q - 1
+    CheckTrue(LGroup.ValidatePeerShare(LKey), 'q - 1 is the largest accepted value');
+    LKey[0] := $01; // 0xD01 = 3329 = q
+    CheckFalse(LGroup.ValidatePeerShare(LKey), 'a first coefficient of q is refused');
+    LKey[0] := $00;
+    LKey[1] := $10; // coefficient 1 = (b1 >> 4) | (b2 << 4)
+    LKey[2] := $D0; // 0xD01 = 3329
+    CheckFalse(LGroup.ValidatePeerShare(LKey), 'a second coefficient of q is refused');
+    LKey := Zeros(1184);
+    LKey[1149] := $01;
+    LKey[1150] := $0D;
+    CheckFalse(LGroup.ValidatePeerShare(LKey), 'the last coefficient pair is checked');
+
+    // both hybrids carry the same ML-KEM half, so the bound covers them too
+    LGroup := TNamedGroups.CreateX25519MlKem768(LProviders[LI]);
+    LGroup.GenerateKeyPair(LPriv, LPub);
+    CheckTrue(LGroup.ValidatePeerShare(LPub), 'a generated hybrid share is accepted');
+    LPub[0] := $01;
+    LPub[1] := (LPub[1] and $F0) or $0D; // first ML-KEM coefficient = q
+    CheckFalse(LGroup.ValidatePeerShare(LPub), 'X25519MLKEM768 refuses a coefficient of q');
+    LGroup := TNamedGroups.CreateSecP256r1MlKem768(LProviders[LI]);
+    LGroup.GenerateKeyPair(LPriv, LPub);
+    CheckTrue(LGroup.ValidatePeerShare(LPub), 'a generated SecP256r1 hybrid share is accepted');
+    LPub[65] := $01; // the classical half comes first
+    LPub[66] := (LPub[66] and $F0) or $0D;
+    CheckFalse(LGroup.ValidatePeerShare(LPub), 'SecP256r1MLKEM768 refuses a coefficient of q');
+  end;
+end;
+
 procedure TTestNamedGroups.CheckDecapIllegalParameter(const AGroup: INamedGroup;
-  const APriv: ISecretBuffer; const ABadShare: TBytes; const AMsg: string);
+  const APriv: IKeyExchangePrivateKey; const ABadShare: TBytes; const AMsg: string);
 var
   LSecret: ISecretBuffer;
   LOutcome: string;
@@ -433,10 +512,10 @@ end;
 procedure TTestNamedGroups.TestNistDecapsulateRejectsOffCurvePoint;
 var
   LGroup: INamedGroup;
-  LPriv: ISecretBuffer;
+  LPriv: IKeyExchangePrivateKey;
   LPub, LBad: TBytes;
 begin
-  LGroup := TNamedGroups.CreateNistEcdh(Provider, 'secp256r1');
+  LGroup := TNamedGroups.CreateNistEcdh(Crypto, 'secp256r1');
   LGroup.GenerateKeyPair(LPriv, LPub);
   // an uncompressed point whose coordinates are not on the curve
   LBad := nil;
@@ -450,30 +529,80 @@ end;
 procedure TTestNamedGroups.TestHybridDecapsulateRejectsShortCiphertext;
 var
   LGroup: INamedGroup;
-  LPriv: ISecretBuffer;
+  LPriv: IKeyExchangePrivateKey;
   LPub: TBytes;
 begin
-  LGroup := TNamedGroups.CreateX25519MlKem768(Provider);
+  LGroup := TNamedGroups.CreateX25519MlKem768(Crypto);
   LGroup.GenerateKeyPair(LPriv, LPub);
   // far shorter than the 1088 + 32 hybrid ciphertext; slicing must not reach the backend
   CheckDecapIllegalParameter(LGroup, LPriv, Zeros(100),
     'a short hybrid ciphertext is rejected as illegal_parameter');
 end;
 
+procedure TTestNamedGroups.TestMlKemDecapsulateRejectsWrongLengthCiphertext;
+var
+  LGroup: INamedGroup;
+  LPriv: IKeyExchangePrivateKey;
+  LPub: TBytes;
+begin
+  LGroup := TNamedGroups.CreateMlKem768(Crypto);
+  LGroup.GenerateKeyPair(LPriv, LPub);
+  // RFC 10024 4.2: a ciphertext that is not 1088 bytes is illegal_parameter, at the exact bounds
+  CheckDecapIllegalParameter(LGroup, LPriv, Zeros(100),
+    'a short ML-KEM-768 ciphertext is rejected as illegal_parameter');
+  CheckDecapIllegalParameter(LGroup, LPriv, Zeros(1087),
+    'a ciphertext one byte short is rejected as illegal_parameter');
+  CheckDecapIllegalParameter(LGroup, LPriv, Zeros(1089),
+    'a ciphertext one byte long is rejected as illegal_parameter');
+end;
+
+procedure TTestNamedGroups.TestMlKemBackendDecapsulationFaultIsInternalError;
+var
+  LKem: IKem;
+  LPriv: IKeyExchangePrivateKey;
+  LPub: TBytes;
+  LSecret: ISecretBuffer;
+  LAlert: Int32;
+  LLeaked: string;
+begin
+  LKem := Crypto.Primitives.CreateKem(TKemAlgorithm.ML_KEM_768);
+  LKem.GenerateKeyPair(LPriv, LPub);
+  LAlert := -1;
+  LLeaked := '';
+  try
+    // below the group's length check the backend fault is local, not peer input
+    LKem.Decapsulate(LPriv, Zeros(100), LSecret);
+  except
+    on E: EBaseTlsLibException do
+      LAlert := Ord(TAlertMapping.AlertFor(E).Description);
+    on E: Exception do
+      LLeaked := E.ClassName;
+  end;
+  CheckEquals('', LLeaked, 'no backend exception escapes the KEM');
+  CheckEquals(Ord(TTlsAlertDescription.InternalError), LAlert,
+    'a backend decapsulation fault maps to internal_error');
+end;
+
 procedure TTestNamedGroups.TestRegistry;
 var
   LReg: INamedGroupRegistry;
+  LBuilder: INamedGroupRegistryBuilder;
   LGroup: INamedGroup;
 begin
-  LReg := TNamedGroups.CreateDefaultRegistry(Provider);
+  LReg := TNamedGroups.CreateDefaultRegistry(Crypto);
   CheckTrue(LReg.Contains(TNamedGroupCatalog.X25519), 'has X25519');
   CheckTrue(LReg.Contains(TNamedGroupCatalog.X25519MlKem768), 'has the hybrid');
   CheckTrue(LReg.Contains(TNamedGroupCatalog.SecP256r1MlKem768), 'has the P-256 hybrid');
   CheckTrue(LReg.TryGet(TNamedGroupCatalog.X25519, LGroup), 'lookup by code');
   CheckEquals('X25519', LGroup.Name, 'get returns the group');
-  LReg.Prune(TNamedGroupCatalog.Secp521r1);
+  LBuilder := LReg.ToBuilder;
+  LBuilder.Prune(TNamedGroupCatalog.Secp521r1);
+  CheckTrue(LReg.Contains(TNamedGroupCatalog.Secp521r1), 'the built registry is unchanged');
+  LReg := LBuilder.Build;
   CheckFalse(LReg.Contains(TNamedGroupCatalog.Secp521r1), 'pruned entry gone');
-  LReg.Add(TNamedGroups.CreateNistEcdh(Provider, 'secp521r1'));
+  LBuilder.Add(TNamedGroups.CreateNistEcdh(Crypto, 'secp521r1'));
+  CheckFalse(LReg.Contains(TNamedGroupCatalog.Secp521r1), 'a later Add does not reach a built registry');
+  LReg := LBuilder.Build;
   CheckTrue(LReg.Contains(TNamedGroupCatalog.Secp521r1), 're-added');
   CheckFalse(LReg.TryGet($FFFF, LGroup), 'unknown code is not found');
 end;
@@ -484,7 +613,7 @@ var
 begin
   // the classical registry is the default minus the post-quantum hybrids, so a ClientHello
   // driven off it carries no ~1KB ML-KEM key share (the constrained-path escape hatch)
-  LReg := TNamedGroups.CreateClassicalRegistry(Provider);
+  LReg := TNamedGroups.CreateClassicalRegistry(Crypto);
   CheckTrue(LReg.Contains(TNamedGroupCatalog.X25519), 'has X25519');
   CheckTrue(LReg.Contains(TNamedGroupCatalog.Secp256r1), 'has secp256r1');
   CheckTrue(LReg.Contains(TNamedGroupCatalog.Secp384r1), 'has secp384r1');
@@ -496,15 +625,15 @@ end;
 
 procedure TTestNamedGroups.TestGroupKindClassifiesEcdheKemHybrid;
 begin
-  CheckTrue(TNamedGroups.CreateX25519(Provider).Kind = TNamedGroupKind.Ecdhe,
+  CheckTrue(TNamedGroups.CreateX25519(Crypto).Kind = TNamedGroupKind.Ecdhe,
     'X25519 is classical ECDHE');
-  CheckTrue(TNamedGroups.CreateNistEcdh(Provider, 'secp256r1').Kind =
+  CheckTrue(TNamedGroups.CreateNistEcdh(Crypto, 'secp256r1').Kind =
     TNamedGroupKind.Ecdhe, 'secp256r1 is classical ECDHE');
-  CheckTrue(TNamedGroups.CreateMlKem768(Provider).Kind = TNamedGroupKind.Kem,
+  CheckTrue(TNamedGroups.CreateMlKem768(Crypto).Kind = TNamedGroupKind.Kem,
     'ML-KEM-768 is a KEM');
-  CheckTrue(TNamedGroups.CreateX25519MlKem768(Provider).Kind =
+  CheckTrue(TNamedGroups.CreateX25519MlKem768(Crypto).Kind =
     TNamedGroupKind.Hybrid, 'X25519MLKEM768 is a hybrid');
-  CheckTrue(TNamedGroups.CreateSecP256r1MlKem768(Provider).Kind =
+  CheckTrue(TNamedGroups.CreateSecP256r1MlKem768(Crypto).Kind =
     TNamedGroupKind.Hybrid, 'SecP256r1MLKEM768 is a hybrid');
 end;
 
@@ -515,7 +644,7 @@ var
 begin
   // the hybrid and pure-KEM groups are excluded from a TLS 1.2 handshake: only
   // Kind = Ecdhe is eligible (the filter the 1.2 negotiation applies)
-  LReg := TNamedGroups.CreateDefaultRegistry(Provider);
+  LReg := TNamedGroups.CreateDefaultRegistry(Crypto);
   CheckTrue(LReg.TryGet(TNamedGroupCatalog.X25519MlKem768, LGroup), 'hybrid present');
   CheckFalse(LGroup.Kind = TNamedGroupKind.Ecdhe, 'the hybrid is not 1.2-eligible');
   CheckTrue(LReg.TryGet(TNamedGroupCatalog.MlKem768, LGroup), 'ML-KEM present');

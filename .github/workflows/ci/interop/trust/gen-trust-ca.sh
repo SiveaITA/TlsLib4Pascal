@@ -10,9 +10,15 @@
 #   leaf.pem/.key            EC serverAuth leaf, SAN localhost, serial 0x1001
 #   muststaple.pem/.key      as leaf + RFC 7633 TLS-feature status_request(5), serial 0x1002
 #   wrongeku.pem/.key        clientAuth-only leaf (no serverAuth), serial 0x1003
+#   ipleaf.pem/.key          serverAuth leaf, SAN IP:127.0.0.1 (no DNS), serial 0x1005
 #   foreign_root.pem/.key    an unrelated self-signed CA (the untrusted-root negative)
 #   foreign_leaf.pem/.key    serverAuth leaf under foreign_root, SAN localhost
-#   fullchain.pem            leaf + issuer (what a server presents)
+#   distrust_issuer.pem/.key a second root-signed intermediate (the one the distrust cells distrust)
+#   distrust_twin.pem        another certificate for distrust_issuer's key and subject (serial 0x6002)
+#   distrust_leaf.pem/.key   serverAuth leaf under distrust_issuer, serial 0x1006
+#   distrust_leaf_fullchain.pem  distrust_leaf + distrust_issuer
+#   distrust_alt_fullchain.pem   distrust_leaf + distrust_issuer + distrust_twin
+#   leaf_fullchain.pem       leaf + issuer (what a server presents)
 #   muststaple_fullchain.pem muststaple + issuer
 #   wrongeku_fullchain.pem   wrongeku + issuer
 #   foreign_fullchain.pem    foreign_leaf + foreign_root
@@ -35,6 +41,9 @@ LIVE_OCSP_URL="${3:-http://127.0.0.1:8888}"
 # a loopback URL whose port is DEAD (connection refused): baked into the live client "down" leaf so
 # its live revocation is genuinely indeterminate (the OS reaches the network and is refused fast).
 DEAD_OCSP_URL="${4:-http://127.0.0.1:8889}"
+# a reachable loopback CRL URL run-trust.sh serves (the Windows-only CRL-source cell); the CDP is
+# baked into the crl_revoked_leaf at mint time. Cache-only leaves keep the unreachable .invalid URL.
+LIVE_CRL_URL="${5:-http://127.0.0.1:8890/root.crl}"
 OPENSSL="${OPENSSL:-openssl}"
 mkdir -p "$OUTDIR"
 
@@ -43,6 +52,7 @@ asn1_date() { # <days-from-now>
   date -u -d "+$1 days" +%y%m%d%H%M%SZ 2>/dev/null || date -u -v+"$1"d +%y%m%d%H%M%SZ
 }
 newkey() { "$OPENSSL" ecparam -name prime256v1 -genkey -noout -out "$1"; }
+newkey_rsa() { "$OPENSSL" genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$1"; }
 
 cd "$OUTDIR"
 
@@ -66,26 +76,44 @@ EOF
   -sha256 -days 3650 -extfile issuer.ext -out issuer.pem
 
 # --- leaf (serverAuth, SAN localhost, explicit serial for the OCSP index) -----------------
-mk_leaf() { # <name> <serial-hex> <extra-ext-lines>
-  local name="$1" serial="$2" extra="$3"
+mk_leaf() { # <name> <serial-hex> <extra-ext-lines> [subjectAltName] [issuer-basename]
+  local name="$1" serial="$2" extra="$3" san="${4:-DNS:localhost}" issuer="${5:-issuer}"
   newkey "$name.key"
   "$OPENSSL" req -new -key "$name.key" -out "$name.csr" -subj "/CN=localhost"
   { cat <<EOF
 basicConstraints=critical,CA:FALSE
 keyUsage=critical,digitalSignature
-subjectAltName=DNS:localhost
+subjectAltName=$san
 authorityInfoAccess=OCSP;URI:http://ocsp.tlslib.invalid/
 crlDistributionPoints=URI:http://crl.tlslib.invalid/issuer.crl
 EOF
     printf '%s\n' "$extra"; } > "$name.ext"
-  "$OPENSSL" x509 -req -in "$name.csr" -CA issuer.pem -CAkey issuer.key \
+  "$OPENSSL" x509 -req -in "$name.csr" -CA "$issuer.pem" -CAkey "$issuer.key" \
     -set_serial "$serial" -sha256 -days 30 -extfile "$name.ext" -out "$name.pem"
-  cat "$name.pem" issuer.pem > "${name}_fullchain.pem"
+  cat "$name.pem" "$issuer.pem" > "${name}_fullchain.pem"
 }
 mk_leaf leaf       0x1001 "extendedKeyUsage=serverAuth"
 # RFC 7633 TLS Feature (OID 1.3.6.1.5.5.7.1.24) = SEQUENCE OF INTEGER { status_request(5) }
 mk_leaf muststaple 0x1002 $'extendedKeyUsage=serverAuth\n1.3.6.1.5.5.7.1.24=DER:30:03:02:01:05'
 mk_leaf wrongeku   0x1003 "extendedKeyUsage=clientAuth"
+# an IP-literal leaf (iPAddress SAN, no DNS): the delegate matches an IP host against it in-library
+mk_leaf ipleaf     0x1005 "extendedKeyUsage=serverAuth" "IP:127.0.0.1"
+
+# --- a second intermediate the run-trust.sh distrust cells put in the OS "distrusted" store -----
+# distrust_issuer is root-signed like issuer; distrust_twin is a DIFFERENT certificate for the same
+# issuer (same CSR, so same key and subject, new serial), so distrust_leaf chains through either.
+# distrusting only distrust_issuer therefore leaves a valid alternate path through the twin.
+newkey distrust_issuer.key
+"$OPENSSL" req -new -key distrust_issuer.key -out distrust_issuer.csr \
+  -subj "/CN=TlsLib Distrusted Issuer $RUNID"
+"$OPENSSL" x509 -req -in distrust_issuer.csr -CA root.pem -CAkey root.key -set_serial 0x6001 \
+  -sha256 -days 3650 -extfile issuer.ext -out distrust_issuer.pem
+"$OPENSSL" x509 -req -in distrust_issuer.csr -CA root.pem -CAkey root.key -set_serial 0x6002 \
+  -sha256 -days 3650 -extfile issuer.ext -out distrust_twin.pem
+mk_leaf distrust_leaf 0x1006 "extendedKeyUsage=serverAuth" "DNS:localhost" distrust_issuer
+# the same chain with the twin also presented: a verifier that sets the distrusted issuer aside
+# still has a valid path
+cat distrust_leaf.pem distrust_issuer.pem distrust_twin.pem > distrust_alt_fullchain.pem
 
 # a 2-tier leaf signed DIRECTLY by the root (no intermediate), for the delegate accept/Hard cell:
 # with only the leaf as a non-anchor cert and a good stapled OCSP for it, every non-anchor element
@@ -158,11 +186,11 @@ EOF
 "$OPENSSL" x509 -req -in ocsp_signer.csr -CA root.pem -CAkey root.key -set_serial 0x5001 \
   -sha256 -days 30 -extfile ocsp_signer.ext -out ocsp_signer.pem
 
-mk_live_leaf() { # <name> <serial-hex> <eku> <aia-url>
-  local name="$1" serial="$2" eku="$3" aia="$4" cn="localhost"
+mk_live_leaf() { # <name> <serial-hex> <eku> <aia-url> [keygen-fn]
+  local name="$1" serial="$2" eku="$3" aia="$4" keygen="${5:-newkey}" cn="localhost"
   # a serverAuth leaf carries the SAN a client name-checks; a clientAuth leaf is name-less
   [ "$eku" = "clientAuth" ] && cn="live-client"
-  newkey "$name.key"
+  "$keygen" "$name.key"
   "$OPENSSL" req -new -key "$name.key" -out "$name.csr" -subj "/CN=$cn"
   {
     echo "basicConstraints=critical,CA:FALSE"
@@ -179,6 +207,8 @@ mk_live_leaf() { # <name> <serial-hex> <eku> <aia-url>
 # serverAuth leaves (client-verifies-server live cells)
 mk_live_leaf live_leaf              0x4001 serverAuth "$LIVE_OCSP_URL"
 mk_live_leaf live_revoked_leaf      0x4002 serverAuth "$LIVE_OCSP_URL"
+# an RSA-2048 revoked leaf: the OS engine renders Revoked from the fetched OCSP regardless of key type
+mk_live_leaf live_revoked_leaf_rsa  0x4006 serverAuth "$LIVE_OCSP_URL" newkey_rsa
 # clientAuth leaves (server-verifies-client live cells): good, revoked, and one whose AIA is a dead
 # port so its live check is indeterminate (never in the responder index - the port is dead by design)
 mk_live_leaf live_client_good       0x4003 clientAuth "$LIVE_OCSP_URL"
@@ -188,7 +218,43 @@ mk_live_leaf live_client_down       0x4005 clientAuth "$DEAD_OCSP_URL"
 # one live index the responder serves: accept leaves Valid, revoked leaves Revoked
 printf 'V\t%s\t\t4001\tunknown\t/CN=localhost\n'    "$EXP"        > index_live.txt
 printf 'R\t%s\t%s\t4002\tunknown\t/CN=localhost\n'  "$EXP" "$REV" >> index_live.txt
+printf 'R\t%s\t%s\t4006\tunknown\t/CN=localhost\n'  "$EXP" "$REV" >> index_live.txt
 printf 'V\t%s\t\t4003\tunknown\t/CN=live-client\n'  "$EXP"        >> index_live.txt
 printf 'R\t%s\t%s\t4004\tunknown\t/CN=live-client\n' "$EXP" "$REV" >> index_live.txt
 
-echo "generated trust hierarchy in $OUTDIR (run id: $RUNID, live ocsp: $LIVE_OCSP_URL)"
+# --- CRL-sourced revocation (Windows-only cell) -------------------------------------------
+# A root-issued leaf with NO OCSP AIA and a reachable CRL distribution point, plus a root-signed CRL
+# that lists it revoked. crypt32 fetches the CRL and renders Revoked -> certificate_revoked(44);
+# trustd does not fetch CRLs for TLS eval, so run-trust.sh gates this cell to Windows.
+newkey crl_revoked_leaf.key
+"$OPENSSL" req -new -key crl_revoked_leaf.key -out crl_revoked_leaf.csr -subj "/CN=localhost"
+cat > crl_revoked_leaf.ext <<EOF
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+subjectAltName=DNS:localhost
+extendedKeyUsage=serverAuth
+crlDistributionPoints=URI:$LIVE_CRL_URL
+EOF
+"$OPENSSL" x509 -req -in crl_revoked_leaf.csr -CA root.pem -CAkey root.key -set_serial 0x4007 \
+  -sha256 -days 30 -extfile crl_revoked_leaf.ext -out crl_revoked_leaf.pem
+cat crl_revoked_leaf.pem root.pem > crl_revoked_leaf_fullchain.pem
+
+# a root-signed CRL revoking 0x4007. -gencrl needs only the TXT_DB database (new_certs_dir/serial are
+# cert-signing-only). Keep a SEPARATE db from index_live.txt (the running OCSP responder reloads that
+# on mtime change). Serve the CRL in DER from a dir holding ONLY the CRL - never the CA dir with keys.
+printf 'R\t%s\t%s\t4007\tunknown\t/CN=localhost\n' "$EXP" "$REV" > index_crl.txt
+echo 1000 > crlnumber_crl
+cat > crl.cnf <<'EOF'
+[ca]
+default_ca = CA_default
+[CA_default]
+database = index_crl.txt
+crlnumber = crlnumber_crl
+default_md = sha256
+default_crl_days = 7
+EOF
+mkdir -p www
+"$OPENSSL" ca -config crl.cnf -gencrl -keyfile root.key -cert root.pem -crldays 7 -out root.crl.pem
+"$OPENSSL" crl -in root.crl.pem -outform DER -out www/root.crl
+
+echo "generated trust hierarchy in $OUTDIR (run id: $RUNID, live ocsp: $LIVE_OCSP_URL, live crl: $LIVE_CRL_URL)"

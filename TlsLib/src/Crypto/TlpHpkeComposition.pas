@@ -17,10 +17,12 @@ interface
 
 uses
   SysUtils,
+  TlpAeadUtilities,
   TlpArrayUtilities,
   TlpCryptoDomainTypes,
   TlpDer,
   TlpICryptoProvider,
+  TlpIKeyExchangePrivateKey,
   TlpISecretBuffer,
   TlpSecretBuffer,
   TlpSecureMemory,
@@ -33,10 +35,24 @@ type
   /// serves both the portable and the OS-native provider: it uses whatever primitives the seam
   /// hands back, so on the native overlay the KEM/KDF/AEAD run on the OS backend where available.
   /// </summary>
-  THpkeComposition = class(TInterfacedObject, IHpkeCrypto)
+  THpkeComposition = class(TInterfacedObject, IHpkeCrypto, IHpkeComposition)
   strict private
   var
     FPrimitives: ICryptoPrimitives;
+    // which primitives this provider can actually build, probed once at construction: a known id an
+    // overlay lacks makes Suite return nil (a clean ECH reject, not internal_error), off the hot path
+    FKemOk: array [0 .. 3] of Boolean;  // P-256, P-384, P-521, X25519
+    FHkdfOk: array [0 .. 2] of Boolean; // SHA-256, SHA-384, SHA-512
+    FAeadOk: array [0 .. 2] of Boolean; // AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305
+    class function KaAvailable(const APrimitives: ICryptoPrimitives;
+      AAlgorithm: TKeyAgreementAlgorithm): Boolean; static;
+    class function HkdfAvailable(const APrimitives: ICryptoPrimitives;
+      AHash: THashAlgorithm): Boolean; static;
+    class function AeadAvailable(const APrimitives: ICryptoPrimitives;
+      AAead: TAeadAlgorithm): Boolean; static;
+    class function HashIndex(AHash: THashAlgorithm): Int32; static;
+    class function KemIndex(AKem: UInt16): Int32; static;
+    class function AeadIndex(AAead: UInt16): Int32; static;
   public
     constructor Create(const APrimitives: ICryptoPrimitives);
     function Suite(AKem, AKdf, AAead: UInt16): IHpkeSuite;
@@ -48,6 +64,7 @@ type
     function SupportedSuites(AKem: UInt16): TArray<THpkeSuiteId>;
     function ValidatePublicKey(AKem: UInt16; const APublicKey: TBytes): Boolean;
     function RandomEncapsulation(AKem: UInt16): TBytes;
+    function ComposedOver: ICryptoPrimitives;
   end;
 
 implementation
@@ -56,8 +73,11 @@ resourcestring
   SHpkeUnsupportedKem = 'the HPKE KEM is not supported';
   SHpkeRecipientKemMismatch =
     'the HPKE suite KEM does not match the recipient key';
+  SHpkeUnsupportedKdfOrAead =
+    'the HPKE suite names a KDF or AEAD this composition does not implement';
   SHpkeMalformedPrivateKey = 'the HPKE recipient private key is malformed';
   SHpkeMalformedEnc = 'the HPKE encapsulated key could not be processed';
+  SHpkeOpenAuthFailed = 'the HPKE ciphertext failed authentication';
   SHpkeMalformedPublicKey = 'the HPKE recipient public key is malformed';
   SHpkeMessageLimit = 'the HPKE context sequence number is exhausted';
 
@@ -74,6 +94,7 @@ type
     procedure AdvanceSequence;
   public
     constructor Create(const AAead: IAead; const ABaseNonce: TBytes);
+    destructor Destroy; override;
     function Seal(const AAad, APlaintext: TBytes): TBytes;
     function Open(const AAad, ACiphertext: TBytes): TBytes;
   end;
@@ -83,14 +104,13 @@ type
   THpkeCore = class sealed(TObject)
   strict private
     class function I2OSP2(AValue: Int32): TBytes; static;
-    class function KemKdfHash(AKem: UInt16): THashAlgorithm; static;
     class function KemNsecret(AKem: UInt16): Int32; static;
     class function KemSuiteId(AKem: UInt16): TBytes; static;
     class function HpkeSuiteId(AKem, AKdf, AAead: UInt16): TBytes; static;
     // LabeledExtract(salt, label, ikm) = Extract(salt, "HPKE-v1" || suite_id || label || ikm)
     class function LabeledExtract(const APrimitives: ICryptoPrimitives;
-      AHash: THashAlgorithm; const ASuiteId, ASalt: TBytes; const ALabel: string;
-      const AIkm: ISecretBuffer): ISecretBuffer; static;
+      AHash: THashAlgorithm; const ASuiteId: TBytes; const ASalt: ISecretBuffer;
+      const ALabel: string; const AIkm: ISecretBuffer): ISecretBuffer; static;
     // LabeledExpand(prk, label, info, L) = Expand(prk, I2OSP(L,2)||"HPKE-v1"||suite_id||label||info, L)
     class function LabeledExpand(const APrimitives: ICryptoPrimitives;
       AHash: THashAlgorithm; const ASuiteId: TBytes; const APrk: ISecretBuffer;
@@ -100,6 +120,7 @@ type
   public
     class function KemKeyAgreement(AKem: UInt16): TKeyAgreementAlgorithm; static;
     class function KemNsk(AKem: UInt16): Int32; static;
+    class function KemKdfHash(AKem: UInt16): THashAlgorithm; static;
     class function KdfHash(AKdf: UInt16): THashAlgorithm; static;
     class function AeadAlgorithm(AAead: UInt16): TAeadAlgorithm; static;
     class function IsKnownKem(AKem: UInt16): Boolean; static;
@@ -111,7 +132,8 @@ type
       out AEnc: TBytes); static;
     // Decap(enc, skR) -> shared_secret; ARecipientPublicKey is the recipient's own derived public
     class function Decap(const APrimitives: ICryptoPrimitives; AKem: UInt16;
-      const AEnc: TBytes; const APrivateKey: ISecretBuffer;
+      const AEnc: TBytes; const AKeyAgreement: IKeyAgreement;
+      const APrivateKey: IKeyExchangePrivateKey;
       const ARecipientPublicKey: TBytes): ISecretBuffer; static;
     // the base-mode key schedule (RFC 9180 sec. 5.1) yielding a ready context
     class function NewBaseContext(const APrimitives: ICryptoPrimitives;
@@ -139,11 +161,15 @@ type
   var
     FPrimitives: ICryptoPrimitives;
     FKem: UInt16;
-    FPrivateKey: ISecretBuffer;
+    // the key-agreement that adopted the recipient key (Static) and the resulting key handle;
+    // held together so every SetupOpener reuses the one imported, backend-bound key
+    FAgreement: IKeyAgreement;
+    FKey: IKeyExchangePrivateKey;
     FPublicKey: TBytes;
   public
     constructor Create(const APrimitives: ICryptoPrimitives; AKem: UInt16;
-      const APrivateKey: ISecretBuffer; const APublicKey: TBytes);
+      const AAgreement: IKeyAgreement; const AKey: IKeyExchangePrivateKey;
+      const APublicKey: TBytes);
     function Kem: UInt16;
     function PublicKey: TBytes;
     function SetupOpener(const ASuite: IHpkeSuite;
@@ -170,6 +196,14 @@ begin
   FSeq := 0;
 end;
 
+destructor THpkeContext.Destroy;
+begin
+  // the base nonce is secret-derived; wipe it on release
+  TSecureMemory.WipeBytes(FBaseNonce);
+  FAead := nil;
+  inherited Destroy;
+end;
+
 function THpkeContext.ComputeNonce: TBytes;
 var
   LNn, LI: Int32;
@@ -187,27 +221,41 @@ end;
 procedure THpkeContext.AdvanceSequence;
 begin
   // Nn is 12 for every HPKE AEAD, so the RFC 9180 limit (2^96-1) is beyond UInt64; guard the
-  // UInt64 wrap instead so a run never silently reuses a nonce
+  // UInt64 wrap so a run never silently reuses a nonce
   if FSeq = High(UInt64) then
-    raise EHpkeOpenTlsLibException.CreateRes(@SHpkeMessageLimit);
+    raise EInvalidOperationTlsLibException.CreateRes(@SHpkeMessageLimit);
   Inc(FSeq);
 end;
 
 function THpkeContext.Seal(const AAad, APlaintext: TBytes): TBytes;
+var
+  LNonce: TBytes;
 begin
-  Result := FAead.Seal(ComputeNonce, AAad, APlaintext);
+  LNonce := ComputeNonce;
+  try
+    Result := TAeadUtilities.Seal(FAead, LNonce, AAad, APlaintext);
+  finally
+    TSecureMemory.WipeBytes(LNonce);
+  end;
   AdvanceSequence; // advance only after a successful seal
 end;
 
 function THpkeContext.Open(const AAad, ACiphertext: TBytes): TBytes;
+var
+  LNonce: TBytes;
 begin
   // FAead.Open raises on authentication failure without advancing, so a rejected
   // ciphertext never desynchronises the sequence
+  LNonce := ComputeNonce;
   try
-    Result := FAead.Open(ComputeNonce, AAad, ACiphertext);
-  except
-    on E: EBaseTlsLibException do
-      raise EHpkeOpenTlsLibException.CreateRes(@SHpkeMalformedEnc);
+    try
+      Result := TAeadUtilities.Open(FAead, LNonce, AAad, ACiphertext);
+    except
+      on E: EBaseTlsLibException do
+        raise EHpkeOpenTlsLibException.CreateRes(@SHpkeOpenAuthFailed);
+    end;
+  finally
+    TSecureMemory.WipeBytes(LNonce);
   end;
   AdvanceSequence;
 end;
@@ -330,8 +378,8 @@ begin
 end;
 
 class function THpkeCore.LabeledExtract(const APrimitives: ICryptoPrimitives;
-  AHash: THashAlgorithm; const ASuiteId, ASalt: TBytes; const ALabel: string;
-  const AIkm: ISecretBuffer): ISecretBuffer;
+  AHash: THashAlgorithm; const ASuiteId: TBytes; const ASalt: ISecretBuffer;
+  const ALabel: string; const AIkm: ISecretBuffer): ISecretBuffer;
 var
   LPrefix: TBytes;
 begin
@@ -371,25 +419,26 @@ class procedure THpkeCore.Encap(const APrimitives: ICryptoPrimitives; AKem: UInt
   out AEnc: TBytes);
 var
   LKa: IKeyAgreement;
-  LSkE, LDh: ISecretBuffer;
+  LSkE: IKeyExchangePrivateKey;
+  LDh: ISecretBuffer;
 begin
   LKa := APrimitives.CreateKeyAgreement(KemKeyAgreement(AKem));
   LKa.GenerateKeyPair(LSkE, AEnc); // AEnc is the serialized ephemeral public key (pkE)
-  LDh := LKa.Agree(LSkE, ARecipientPublicKey, TKeyAgreementUsage.Ephemeral);
+  LDh := LKa.Agree(LSkE, ARecipientPublicKey);
   ASharedSecret := ExtractAndExpand(APrimitives, AKem, LDh,
     TArrayUtilities.Concat(AEnc, ARecipientPublicKey));
 end;
 
 class function THpkeCore.Decap(const APrimitives: ICryptoPrimitives; AKem: UInt16;
-  const AEnc: TBytes; const APrivateKey: ISecretBuffer;
+  const AEnc: TBytes; const AKeyAgreement: IKeyAgreement;
+  const APrivateKey: IKeyExchangePrivateKey;
   const ARecipientPublicKey: TBytes): ISecretBuffer;
 var
-  LKa: IKeyAgreement;
   LDh: ISecretBuffer;
 begin
-  LKa := APrimitives.CreateKeyAgreement(KemKeyAgreement(AKem));
-  // The recipient key is long-lived and reused against attacker-chosen enc values.
-  LDh := LKa.Agree(APrivateKey, AEnc, TKeyAgreementUsage.Static);
+  // the recipient key is long-lived (a Static handle), reused against attacker-chosen enc
+  // values; the agreement that adopted it does the reuse-hardened work
+  LDh := AKeyAgreement.Agree(APrivateKey, AEnc);
   Result := ExtractAndExpand(APrimitives, AKem, LDh,
     TArrayUtilities.Concat(AEnc, ARecipientPublicKey));
 end;
@@ -399,7 +448,7 @@ class function THpkeCore.NewBaseContext(const APrimitives: ICryptoPrimitives;
   const AInfo: TBytes): THpkeContext;
 var
   LHash: THashAlgorithm;
-  LSuiteId, LKsContext, LSharedBytes, LBaseNonce: TBytes;
+  LSuiteId, LKsContext, LBaseNonce: TBytes;
   LAead: IAead;
   LPskIdHash, LInfoHash, LSecret, LKey: ISecretBuffer;
 begin
@@ -413,14 +462,10 @@ begin
     TSecretBuffer.From(AInfo));
   LKsContext := TArrayUtilities.Concat([TBytes.Create(0), LPskIdHash.ToBytes,
     LInfoHash.ToBytes]);
-  // secret = LabeledExtract(shared_secret, "secret", psk): the shared secret is the salt
-  LSharedBytes := ASharedSecret.ToBytes;
-  try
-    LSecret := LabeledExtract(APrimitives, LHash, LSuiteId, LSharedBytes, 'secret',
-      TSecretBuffer.From(nil));
-  finally
-    TSecureMemory.WipeBytes(LSharedBytes);
-  end;
+  // secret = LabeledExtract(shared_secret, "secret", psk): the shared secret is the salt, passed
+  // straight through as a wiped buffer
+  LSecret := LabeledExtract(APrimitives, LHash, LSuiteId, ASharedSecret, 'secret',
+    TSecretBuffer.From(nil));
   LKey := LabeledExpand(APrimitives, LHash, LSuiteId, LSecret, 'key', LKsContext,
     LAead.KeySize);
   LBaseNonce := LabeledExpand(APrimitives, LHash, LSuiteId, LSecret, 'base_nonce',
@@ -484,12 +529,14 @@ end;
 { THpkeCompositionRecipientKey }
 
 constructor THpkeCompositionRecipientKey.Create(const APrimitives: ICryptoPrimitives;
-  AKem: UInt16; const APrivateKey: ISecretBuffer; const APublicKey: TBytes);
+  AKem: UInt16; const AAgreement: IKeyAgreement;
+  const AKey: IKeyExchangePrivateKey; const APublicKey: TBytes);
 begin
   inherited Create;
   FPrimitives := APrimitives;
   FKem := AKem;
-  FPrivateKey := APrivateKey;
+  FAgreement := AAgreement;
+  FKey := AKey;
   FPublicKey := APublicKey;
 end;
 
@@ -500,7 +547,7 @@ end;
 
 function THpkeCompositionRecipientKey.PublicKey: TBytes;
 begin
-  Result := FPublicKey;
+  Result := System.Copy(FPublicKey);
 end;
 
 function THpkeCompositionRecipientKey.SetupOpener(const ASuite: IHpkeSuite;
@@ -510,8 +557,11 @@ var
 begin
   if ASuite.Kem <> FKem then
     raise EArgumentTlsLibException.CreateRes(@SHpkeRecipientKemMismatch);
+  if not (THpkeCore.IsKnownKdf(ASuite.Kdf) and THpkeCore.IsRealAead(ASuite.Aead)) then
+    raise EArgumentTlsLibException.CreateRes(@SHpkeUnsupportedKdfOrAead);
   try
-    LSharedSecret := THpkeCore.Decap(FPrimitives, FKem, AEnc, FPrivateKey, FPublicKey);
+    LSharedSecret := THpkeCore.Decap(FPrimitives, FKem, AEnc, FAgreement, FKey,
+      FPublicKey);
   except
     on E: EPeerInputTlsLibException do
       raise EHpkeOpenTlsLibException.CreateRes(@SHpkeMalformedEnc);
@@ -528,14 +578,14 @@ end;
 
 class function THpkePkcs8.LeftPad(const A: TBytes; ALen: Int32): TBytes;
 begin
-  if System.Length(A) >= ALen then
-    Result := System.Copy(A, System.Length(A) - ALen, ALen)
-  else
-  begin
-    Result := nil;
-    SetLength(Result, ALen);
+  // a scalar wider than the field is never a leading-zero artefact to trim - it is malformed, and
+  // truncating it would silently accept a different key
+  if System.Length(A) > ALen then
+    raise EArgumentTlsLibException.CreateRes(@SHpkeMalformedPrivateKey);
+  Result := nil;
+  SetLength(Result, ALen);
+  if System.Length(A) > 0 then
     Move(A[0], Result[ALen - System.Length(A)], System.Length(A));
-  end;
 end;
 
 class function THpkePkcs8.DecodeScalar(AKem: UInt16;
@@ -549,8 +599,9 @@ const
   OidP384: array [0 .. 4] of Byte = ($2B, $81, $04, $00, $22); // 1.3.132.0.34
   OidP521: array [0 .. 4] of Byte = ($2B, $81, $04, $00, $23); // 1.3.132.0.35
 var
-  LOfs, LCOfs, LCLen, LNext, LAlgOfs, LAlgLen, LAlgNext, LOidOfs, LOidLen: Int32;
-  LScalar: TBytes;
+  LOfs, LCOfs, LCLen, LNext, LEnd, LAlgOfs, LAlgLen, LAlgNext, LKeyEnd, LEcEnd, LOidOfs,
+    LOidLen: Int32;
+  LScalar, LRaw: TBytes;
   LX25519, LCurveOk: Boolean;
 
   procedure Fail;
@@ -558,35 +609,45 @@ var
     raise EArgumentTlsLibException.CreateRes(@SHpkeMalformedPrivateKey);
   end;
 
-  function Expect(AOffset: Int32; AExpectedTag: Byte;
-    out AContentOffset, AContentLen, ANext: Int32): Int32;
+  // a nested TLV must end inside its parent
+  procedure Expect(AOffset, AParentEnd: Int32; AExpectedTag: Byte;
+    out AContentOffset, AContentLen, ANext: Int32);
   var
     LGotTag: Byte;
   begin
     if (not TDer.ReadTlv(APkcs8Der, AOffset, LGotTag, AContentOffset, AContentLen, ANext)) or
-      (LGotTag <> AExpectedTag) then
+      (LGotTag <> AExpectedTag) or (ANext > AParentEnd) then
       Fail;
-    Result := AContentOffset;
+  end;
+
+  procedure ExpectVersion(ALow, AHigh: Byte);
+  begin
+    if (LCLen <> 1) or (APkcs8Der[LCOfs] < ALow) or (APkcs8Der[LCOfs] > AHigh) then
+      Fail;
   end;
 
 begin
   LX25519 := AKem = THpkeKem.DHKEM_X25519_HKDF_SHA256;
   // PrivateKeyInfo ::= SEQUENCE { version, AlgorithmIdentifier, privateKey OCTET STRING }
-  Expect(0, $30, LOfs, LCLen, LNext);
-  Expect(LOfs, $02, LCOfs, LCLen, LNext); // version
-  LOfs := LNext;
-  Expect(LOfs, $30, LAlgOfs, LAlgLen, LAlgNext); // AlgorithmIdentifier
-  Expect(LAlgOfs, $06, LOidOfs, LOidLen, LNext); // algorithm OID
+  Expect(0, System.Length(APkcs8Der), $30, LOfs, LCLen, LEnd);
+  if LEnd <> System.Length(APkcs8Der) then
+    Fail;
+  Expect(LOfs, LEnd, $02, LCOfs, LCLen, LNext); // version
+  ExpectVersion(0, 1);
+  Expect(LNext, LEnd, $30, LAlgOfs, LAlgLen, LAlgNext); // AlgorithmIdentifier
+  Expect(LAlgOfs, LAlgNext, $06, LOidOfs, LOidLen, LNext); // algorithm OID
   if LX25519 then
   begin
-    if not TDer.OidMatches(APkcs8Der, LOidOfs, LOidLen, OidX25519) then
+    if (not TDer.OidMatches(APkcs8Der, LOidOfs, LOidLen, OidX25519)) or (LNext <> LAlgNext) then
       Fail;
   end
   else
   begin
     if not TDer.OidMatches(APkcs8Der, LOidOfs, LOidLen, OidEcPublicKey) then
       Fail;
-    Expect(LNext, $06, LOidOfs, LOidLen, LNext); // namedCurve OID
+    Expect(LNext, LAlgNext, $06, LOidOfs, LOidLen, LNext); // namedCurve OID
+    if LNext <> LAlgNext then
+      Fail;
     case AKem of
       THpkeKem.DHKEM_P256_HKDF_SHA256:
         LCurveOk := TDer.OidMatches(APkcs8Der, LOidOfs, LOidLen, OidP256);
@@ -600,22 +661,35 @@ begin
     if not LCurveOk then
       Fail;
   end;
-  LOfs := LAlgNext;
-  Expect(LOfs, $04, LCOfs, LCLen, LNext); // privateKey OCTET STRING
+  Expect(LAlgNext, LEnd, $04, LCOfs, LCLen, LKeyEnd); // privateKey OCTET STRING
   if LX25519 then
   begin
-    // CurvePrivateKey ::= OCTET STRING (the 32-byte scalar)
-    Expect(LCOfs, $04, LCOfs, LCLen, LNext);
+    // CurvePrivateKey ::= OCTET STRING (the 32-byte scalar), exactly the KEM scalar width
+    Expect(LCOfs, LKeyEnd, $04, LCOfs, LCLen, LNext);
+    if (LNext <> LKeyEnd) or (LCLen <> THpkeCore.KemNsk(AKem)) then
+      Fail;
     LScalar := System.Copy(APkcs8Der, LCOfs, LCLen);
   end
   else
   begin
     // ECPrivateKey ::= SEQUENCE { version, privateKey OCTET STRING, ... }
-    Expect(LCOfs, $30, LCOfs, LCLen, LNext);
-    Expect(LCOfs, $02, LOidOfs, LOidLen, LNext);     // version
-    Expect(LNext, $04, LCOfs, LCLen, LNext);         // privateKey OCTET STRING
-    // RFC 5915 fixes the scalar at field width; normalise defensively
-    LScalar := LeftPad(System.Copy(APkcs8Der, LCOfs, LCLen), THpkeCore.KemNsk(AKem));
+    Expect(LCOfs, LKeyEnd, $30, LCOfs, LCLen, LEcEnd);
+    if LEcEnd <> LKeyEnd then
+      Fail;
+    Expect(LCOfs, LEcEnd, $02, LCOfs, LCLen, LNext); // version, RFC 5915 3
+    ExpectVersion(1, 1);
+    Expect(LNext, LEcEnd, $04, LCOfs, LCLen, LNext); // privateKey OCTET STRING
+    // RFC 5915 3 fixes the scalar at ceiling(log2(n)/8) octets; some encoders strip leading zeros,
+    // so accept a shorter one (never wider), reject a missing or oversized scalar, and left-pad to
+    // the field width
+    if (LCLen = 0) or (LCLen > THpkeCore.KemNsk(AKem)) then
+      Fail;
+    LRaw := System.Copy(APkcs8Der, LCOfs, LCLen);
+    try
+      LScalar := LeftPad(LRaw, THpkeCore.KemNsk(AKem));
+    finally
+      TSecureMemory.WipeBytes(LRaw);
+    end;
   end;
   try
     Result := TSecretBuffer.From(LScalar);
@@ -630,12 +704,110 @@ constructor THpkeComposition.Create(const APrimitives: ICryptoPrimitives);
 begin
   inherited Create;
   FPrimitives := APrimitives;
+  // probe each primitive once here rather than per Suite() call on the ECH hot path
+  FKemOk[0] := KaAvailable(APrimitives, TKeyAgreementAlgorithm.SECP256R1);
+  FKemOk[1] := KaAvailable(APrimitives, TKeyAgreementAlgorithm.SECP384R1);
+  FKemOk[2] := KaAvailable(APrimitives, TKeyAgreementAlgorithm.SECP521R1);
+  FKemOk[3] := KaAvailable(APrimitives, TKeyAgreementAlgorithm.X25519);
+  FHkdfOk[0] := HkdfAvailable(APrimitives, THashAlgorithm.SHA_256);
+  FHkdfOk[1] := HkdfAvailable(APrimitives, THashAlgorithm.SHA_384);
+  FHkdfOk[2] := HkdfAvailable(APrimitives, THashAlgorithm.SHA_512);
+  FAeadOk[0] := AeadAvailable(APrimitives, TAeadAlgorithm.AES_128_GCM);
+  FAeadOk[1] := AeadAvailable(APrimitives, TAeadAlgorithm.AES_256_GCM);
+  FAeadOk[2] := AeadAvailable(APrimitives, TAeadAlgorithm.CHACHA20_POLY1305);
+end;
+
+function THpkeComposition.ComposedOver: ICryptoPrimitives;
+begin
+  Result := FPrimitives;
+end;
+
+class function THpkeComposition.KaAvailable(const APrimitives: ICryptoPrimitives;
+  AAlgorithm: TKeyAgreementAlgorithm): Boolean;
+begin
+  // a backend that lacks the primitive raises a typed ENotSupported ("not usable here", not a fault)
+  Result := False;
+  try
+    APrimitives.CreateKeyAgreement(AAlgorithm);
+    Result := True;
+  except
+    on E: EBaseTlsLibException do
+      Result := False;
+  end;
+end;
+
+class function THpkeComposition.HkdfAvailable(const APrimitives: ICryptoPrimitives;
+  AHash: THashAlgorithm): Boolean;
+begin
+  Result := False;
+  try
+    APrimitives.CreateHkdf(AHash);
+    Result := True;
+  except
+    on E: EBaseTlsLibException do
+      Result := False;
+  end;
+end;
+
+class function THpkeComposition.AeadAvailable(const APrimitives: ICryptoPrimitives;
+  AAead: TAeadAlgorithm): Boolean;
+begin
+  Result := False;
+  try
+    APrimitives.CreateAead(AAead);
+    Result := True;
+  except
+    on E: EBaseTlsLibException do
+      Result := False;
+  end;
+end;
+
+class function THpkeComposition.HashIndex(AHash: THashAlgorithm): Int32;
+begin
+  case AHash of
+    THashAlgorithm.SHA_384:
+      Result := 1;
+    THashAlgorithm.SHA_512:
+      Result := 2;
+  else
+    Result := 0; // SHA-256
+  end;
+end;
+
+class function THpkeComposition.KemIndex(AKem: UInt16): Int32;
+begin
+  case AKem of
+    THpkeKem.DHKEM_P384_HKDF_SHA384:
+      Result := 1;
+    THpkeKem.DHKEM_P521_HKDF_SHA512:
+      Result := 2;
+    THpkeKem.DHKEM_X25519_HKDF_SHA256:
+      Result := 3;
+  else
+    Result := 0; // P-256
+  end;
+end;
+
+class function THpkeComposition.AeadIndex(AAead: UInt16): Int32;
+begin
+  case AAead of
+    THpkeAead.AES_256_GCM:
+      Result := 1;
+    THpkeAead.CHACHA20_POLY1305:
+      Result := 2;
+  else
+    Result := 0; // AES-128-GCM
+  end;
 end;
 
 function THpkeComposition.Suite(AKem, AKdf, AAead: UInt16): IHpkeSuite;
 begin
+  // return a suite only when the ids are known AND this provider's primitives can actually build
+  // it - otherwise a caller (ECH) would get a non-nil suite whose Encap/SetupOpener then fails
   if THpkeCore.IsKnownKem(AKem) and THpkeCore.IsKnownKdf(AKdf) and
-    THpkeCore.IsRealAead(AAead) then
+    THpkeCore.IsRealAead(AAead) and FKemOk[KemIndex(AKem)] and
+    FHkdfOk[HashIndex(THpkeCore.KemKdfHash(AKem))] and
+    FHkdfOk[HashIndex(THpkeCore.KdfHash(AKdf))] and FAeadOk[AeadIndex(AAead)] then
     Result := THpkeCompositionSuite.Create(FPrimitives, AKem, AKdf, AAead) as IHpkeSuite
   else
     Result := nil;
@@ -645,20 +817,21 @@ function THpkeComposition.ImportRecipientKey(AKem: UInt16;
   const APrivateKey: ISecretBuffer): IHpkeRecipientKey;
 var
   LKa: IKeyAgreement;
-  LKey: ISecretBuffer;
+  LKey: IKeyExchangePrivateKey;
   LPub: TBytes;
 begin
   if not THpkeCore.IsKnownKem(AKem) then
     raise ENotSupportedTlsLibException.CreateRes(@SHpkeUnsupportedKem);
   LKa := FPrimitives.CreateKeyAgreement(THpkeCore.KemKeyAgreement(AKem));
   try
-    // adopt the raw scalar into an agreement key, deriving its public value once
-    LKey := LKa.ImportPrivateKey(APrivateKey, LPub);
+    // adopt the raw scalar as a long-lived (Static) agreement key, deriving its public value
+    // once; the recipient key retains this agreement so every open reuses the one handle
+    LKey := LKa.ImportPrivateKey(APrivateKey, TKeyAgreementUsage.Static, LPub);
   except
     on E: Exception do
       raise EArgumentTlsLibException.CreateRes(@SHpkeMalformedPrivateKey);
   end;
-  Result := THpkeCompositionRecipientKey.Create(FPrimitives, AKem, LKey, LPub)
+  Result := THpkeCompositionRecipientKey.Create(FPrimitives, AKem, LKa, LKey, LPub)
     as IHpkeRecipientKey;
 end;
 
@@ -666,13 +839,13 @@ procedure THpkeComposition.GenerateKeyPair(AKem: UInt16; out APublicKey: TBytes;
   out APrivateKey: ISecretBuffer);
 var
   LKa: IKeyAgreement;
-  LKey: ISecretBuffer;
+  LKey: IKeyExchangePrivateKey;
 begin
   if not THpkeCore.IsKnownKem(AKem) then
     raise ENotSupportedTlsLibException.CreateRes(@SHpkeUnsupportedKem);
   LKa := FPrimitives.CreateKeyAgreement(THpkeCore.KemKeyAgreement(AKem));
   LKa.GenerateKeyPair(LKey, APublicKey);
-  APrivateKey := LKa.ExportPrivateKey(LKey); // the raw scalar, the neutral currency
+  APrivateKey := LKey.ExportRaw; // the raw scalar, the neutral currency
 end;
 
 function THpkeComposition.ImportPrivateKey(AKem: UInt16;
@@ -699,10 +872,14 @@ begin
   LN := 0;
   for LI := 0 to System.High(CKdfs) do
     for LJ := 0 to System.High(CAeads) do
-    begin
-      Result[LN] := THpkeSuiteId.Create(AKem, CKdfs[LI], CAeads[LJ]);
-      Inc(LN);
-    end;
+      // advertise only a suite this provider can actually instantiate (Suite honors the capability
+      // probes), so a caller never offers one whose Encap/SetupOpener would then fail
+      if Suite(AKem, CKdfs[LI], CAeads[LJ]) <> nil then
+      begin
+        Result[LN] := THpkeSuiteId.Create(AKem, CKdfs[LI], CAeads[LJ]);
+        Inc(LN);
+      end;
+  SetLength(Result, LN);
 end;
 
 function THpkeComposition.ValidatePublicKey(AKem: UInt16;
@@ -725,15 +902,15 @@ end;
 
 function THpkeComposition.RandomEncapsulation(AKem: UInt16): TBytes;
 var
-  LSharedSecret, LPriv: ISecretBuffer;
-  LPub: TBytes;
+  LPriv: ISecretBuffer;
 begin
   Result := nil;
-  if not THpkeCore.IsKnownKem(AKem) then
+  // a KEM this provider cannot instantiate yields no encapsulation, as Suite yields no suite
+  if (not THpkeCore.IsKnownKem(AKem)) or (not FKemOk[KemIndex(AKem)]) then
     Exit;
-  // encapsulate against a throwaway recipient and hand back the KEM encapsulation
-  GenerateKeyPair(AKem, LPub, LPriv);
-  THpkeCore.Encap(FPrimitives, AKem, LPub, LSharedSecret, Result);
+  // every known KEM is a DH-KEM, whose enc is the serialized ephemeral public key (RFC 9180 4.1),
+  // so a fresh public key is a valid enc
+  GenerateKeyPair(AKem, Result, LPriv);
 end;
 
 end.

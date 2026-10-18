@@ -1,0 +1,323 @@
+{ *********************************************************************************** }
+{ *                                 TlsLib Library                                  * }
+{ *                          Author - Ugochukwu Mmaduekwe                           * }
+{ *                  Github Repository <https://github.com/Xor-el>                  * }
+{ *                                                                                 * }
+{ *  Distributed under the MIT software license, see the accompanying file LICENSE  * }
+{ *          or visit http://www.opensource.org/licenses/mit-license.php.           * }
+{ * ******************************************************************************* * }
+
+(* &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&& *)
+
+unit TlpIPkixProvider;
+
+{$I ..\..\..\Include\TlsLib.inc}
+
+interface
+
+uses
+  SysUtils,
+  TlpCryptoDomainTypes,
+  TlpPkixDomainTypes,
+  TlpITrustAnchorStore;
+
+type
+
+{ ===== Certificate operations ===== }
+
+  /// <summary>
+  /// A single certificate parsed once into an opaque handle, answering the
+  /// per-certificate queries from that one decode. It lets a caller that inspects the
+  /// same leaf several times in a handshake pay the ASN.1 decode a single time. The
+  /// handle is obtained from <see cref="ICertificateInspector.Parse" /> and is not
+  /// shared across threads.
+  /// </summary>
+  IInspectedCertificate = interface(IInterface)
+    ['{6E69C0FB-F1B3-49F6-A5BD-D135DF2B2631}']
+    function PublicKeyInfo: TBytes;
+    function DnsNames: TArray<string>;
+    function IpAddresses: TArray<TBytes>;
+    /// <summary>
+    /// Whether the certificate's keyUsage extension (RFC 5280 4.2.1.3) permits AUsage.
+    /// Yes when the extension is absent (no restriction) or asserts the bit; No only when
+    /// the extension is present and the bit is clear; Undetermined on a malformed certificate.
+    /// </summary>
+    function KeyUsagePermits(AUsage: TCertKeyUsage): TCertAnswer;
+    /// <summary>
+    /// Whether the certificate's SubjectPublicKeyInfo algorithm is id-RSASSA-PSS
+    /// (OID 1.2.840.113549.1.1.10), the restricted RSA-PSS key type that the
+    /// rsa_pss_rsae_* schemes must not be used with (RFC 9846 4.3.3). Yes when it is,
+    /// No when it is not, Undetermined on a malformed certificate.
+    /// </summary>
+    function KeyIsRsaPss:TCertAnswer;
+    /// <summary>
+    /// Whether the certificate asserts basicConstraints cA=TRUE (RFC 5280 4.2.1.9): Yes, No when
+    /// the extension is absent or cA is FALSE, Undetermined on a malformed certificate.
+    /// </summary>
+    function IsCertificateAuthority: TCertAnswer;
+    function KeyKind(out AKind: TSignatureKeyKind; out AEcNamedGroup: UInt16): Boolean;
+    /// <summary>
+    /// The subject public key's strength facts (family, size, curve). Returns False (facts
+    /// undeterminable - unknown key OID, explicit EC parameters, malformed) so the caller
+    /// fails closed.
+    /// </summary>
+    function KeyFacts(out AFacts: TCertKeyFacts): Boolean;
+    /// <summary>
+    /// The algorithm the certificate was signed with (family, hash, canonical-PSS flag).
+    /// Returns False (undeterminable - unknown signature OID, malformed parameters) so the
+    /// caller fails closed.
+    /// </summary>
+    function SignatureFacts(out AFacts: TCertSignatureFacts): Boolean;
+    /// <summary>
+    /// Extracts the certificate's human-readable identity from the already-decoded handle:
+    /// the subject and issuer distinguished names, the subject common name, and the serial
+    /// number in hex. Returns False (all empty) on a malformed field; never raises.
+    /// </summary>
+    function PeerInfo(out ASubject, AIssuer, ACommonName, ASerialHex: string): Boolean;
+  end;
+
+  /// <summary>
+  /// Pure, per-certificate, side-effect-free X.509 inspection. The Boolean-returning
+  /// queries are fail-closed: they never raise on malformed input, returning False (or
+  /// an empty result) so the caller decides the alert. Parse, LoadChain, and the
+  /// extractor methods (PublicKeyInfo, DnsNames, IpAddresses) raise on malformed input.
+  /// </summary>
+  ICertificateInspector = interface(IInterface)
+    ['{2ED46833-4DDD-484C-B6A7-6785C0C2FC44}']
+    /// <summary>
+    /// Decodes ADer once into a handle that answers the per-certificate queries from
+    /// that single decode. Raises when ADer does not decode to a certificate (empty or
+    /// malformed); otherwise returns a handle over a well-formed certificate. Unlike the
+    /// fail-closed DER-taking queries it raises rather than returning False, so use it
+    /// where the certificate is already known well-formed.
+    /// </summary>
+    function Parse(const ADer: TBytes): IInspectedCertificate;
+    /// <summary>
+    /// Decodes certificates from AData into their raw DER encodings. AData is a PEM block (a single
+    /// certificate or a whole leaf-first chain/bundle), a single DER certificate, or a PKCS#7 / CMS
+    /// DER bundle (RFC 5652). PEM preserves the given order (leaf first); a PKCS#7 bundle yields the
+    /// container's SET order, which is NOT necessarily leaf-first, so it suits trust anchors /
+    /// intermediates - load a leaf-first credential chain from PEM. A bare DER certificate with
+    /// trailing bytes (a non-standard concatenated bundle) is rejected. Raises
+    /// EArgumentTlsLibException if nothing parses.
+    /// </summary>
+    function LoadChain(const AData: TBytes): TArray<TBytes>;
+    /// <summary>
+    /// True if ADer decodes as a structurally well-formed X.509 certificate. A
+    /// parse-only gate (no trust, expiry or signature check) used to screen raw
+    /// OS-harvested trust anchors before they reach path validation.
+    /// </summary>
+    function IsWellFormed(const ADer: TBytes): Boolean;
+    /// <summary>The DER SubjectPublicKeyInfo of the X.509 certificate in ACertificateDer.</summary>
+    function PublicKeyInfo(const ACertificateDer: TBytes): TBytes;
+    /// <summary>The dNSName SubjectAltName entries of the X.509 certificate in ACertificateDer.</summary>
+    function DnsNames(const ACertificateDer: TBytes): TArray<string>;
+    /// <summary>The iPAddress SAN entries (raw 4- or 16-byte octets) in ACertificateDer.</summary>
+    function IpAddresses(const ACertificateDer: TBytes): TArray<TBytes>;
+    /// <summary>
+    /// Extracts a certificate's human-readable identity: the subject and issuer
+    /// distinguished names, the subject common name, and the serial number in hex. Returns
+    /// False (all empty) on a malformed certificate; never raises.
+    /// </summary>
+    function PeerInfo(const ACertificateDer: TBytes;
+      out ASubject, AIssuer, ACommonName, ASerialHex: string): Boolean;
+    /// <summary>
+    /// Reads the RFC 7633 TLS Feature extension (id-pe-tlsfeature, OID
+    /// 1.3.6.1.5.5.7.1.24) of the certificate and returns its feature codepoints.
+    /// An absent extension yields True with an empty list. A present value that is
+    /// not a well-formed ASN.1 SEQUENCE OF INTEGER yields False, so the caller can
+    /// abort with bad_certificate.
+    /// </summary>
+    function TlsFeatures(const ACert: TBytes;
+      out AFeatures: TArray<UInt16>): Boolean;
+    /// <summary>
+    /// Whether the certificate's keyUsage extension (RFC 5280 4.2.1.3) permits AUsage.
+    /// Yes when the extension is absent (no restriction) or asserts the bit; No only when
+    /// the extension is present and the bit is clear; Undetermined on a malformed certificate.
+    /// </summary>
+    function KeyUsagePermits(const ACertificateDer: TBytes;
+      AUsage: TCertKeyUsage): TCertAnswer;
+    /// <summary>
+    /// Whether the certificate's SubjectPublicKeyInfo algorithm is id-RSASSA-PSS
+    /// (OID 1.2.840.113549.1.1.10), the restricted RSA-PSS key type that the
+    /// rsa_pss_rsae_* schemes must not be used with (RFC 9846 4.3.3). Yes when it is,
+    /// No when it is not, Undetermined on a malformed certificate.
+    /// </summary>
+    function KeyIsRsaPss(const ACertificateDer: TBytes): TCertAnswer;
+    /// <summary>
+    /// Whether the certificate asserts basicConstraints cA=TRUE (RFC 5280 4.2.1.9). Yes when it
+    /// does, No when the extension is absent or cA is FALSE, Undetermined on a malformed certificate.
+    /// </summary>
+    function IsCertificateAuthority(const ACertificateDer: TBytes): TCertAnswer;
+    /// <summary>
+    /// Classifies the certificate leaf key: AKind is the public-key algorithm, and for an
+    /// ECDSA key AEcNamedGroup is the named-group code of its curve (secp256r1 = 0x0017,
+    /// secp384r1 = 0x0018, secp521r1 = 0x0019), 0 otherwise. Returns False (could not
+    /// determine) on a malformed or unrecognized certificate; on False AKind is unspecified,
+    /// so a caller must branch on the result, not on AKind.
+    /// </summary>
+    function KeyKind(const ACertificateDer: TBytes;
+      out AKind: TSignatureKeyKind; out AEcNamedGroup: UInt16): Boolean;
+    /// <summary>
+    /// Whether two DER SubjectPublicKeyInfo encodings denote the same public key. Compared by key
+    /// value, not by bytes, so equal keys that differ only in encoding still match - an absent RSA
+    /// NULL parameter, a compressed vs uncompressed EC point (RFC 5480 2.2), named vs explicit EC
+    /// curve parameters, or an id-RSASSA-PSS vs rsaEncryption algorithm over the same RSA key.
+    /// RSA/EC/EdDSA keys are compared structurally; any other family falls back to a canonical-DER
+    /// comparison. Yes when the key values match, No when they differ (including different key
+    /// families), Undetermined when either input cannot be parsed as a public key.
+    /// </summary>
+    function SamePublicKey(const ASpkiA, ASpkiB: TBytes): TCertAnswer;
+  end;
+
+  /// <summary>
+  /// The trust decision: RFC 5280 path validation. The highest-stakes call in the
+  /// library - it raises a fatal-alert exception on failure rather than returning a
+  /// boolean.
+  /// </summary>
+  ICertificatePathValidator = interface(IInterface)
+    ['{7F7CB2B2-C167-452E-9166-A01BDBDA5FF1}']
+    /// <summary>
+    /// Validates the DER chain (leaf first) to one of the store's trust anchors (RFC
+    /// 5280 path validation; revocation is out of band). A nil store or one with no anchors
+    /// raises unknown_ca. The store is immutable, so an implementation may cache work derived
+    /// from it by identity. Returns normally when the
+    /// chain is trusted; on failure it raises a fatal-alert exception carrying the
+    /// reason (certificate_expired / unknown_ca / bad_certificate). Every validity
+    /// check (chain notBefore/notAfter and the PKIX path date) is evaluated at
+    /// AValidationTimeUtc, so the caller's injected clock drives the whole time-based
+    /// trust decision from one source. AIntermediates are extra untrusted DER
+    /// certificates seeded into path building for a peer that sends an incomplete
+    /// chain (e.g. a leaf-only server); empty builds the path only from what the peer sent.
+    /// They never anchor a path and never bypass validation. The presented certificates and the
+    /// intermediates form one pool from which a path is built from the leaf up to an anchor, so
+    /// extraneous, misordered or expired-but-unused certificates are left out (RFC 9846 4.5.1).
+    /// AEffectiveChain returns the validated path in issuer order (leaf at [0], its issuer at [1],
+    /// ...), ending at the configured trust anchor exactly once - never the peer's presented order -
+    /// so the caller's staple and pin checks key off the real issuer. It is a var parameter so a
+    /// caller may pre-seed it with AChain as a fallback; an implementation that returns normally
+    /// must set it. AKeyPurpose selects the extendedKeyUsage the
+    /// path must carry (server vs client role); a certificate on the path (leaf or
+    /// intermediate, never the anchor) that carries an EKU extension lacking the purpose
+    /// is rejected with unsupported_certificate, while one with no EKU is unrestricted.
+    /// </summary>
+    procedure ValidateCertificatePath(const AChain: TArray<TBytes>;
+      const ATrustAnchors: ITrustAnchorStore; const AIntermediates: TArray<TBytes>;
+      const AValidationTimeUtc: TDateTime; AKeyPurpose: TCertKeyPurpose;
+      var AEffectiveChain: TArray<TBytes>);
+  end;
+
+  /// <summary>
+  /// Revocation checks (OCSP / CRL). Indeterminate-tolerant: a Boolean result means
+  /// "could I determine", never raises a backend exception, so an unreachable or
+  /// malformed responder degrades to indeterminate rather than a hard failure.
+  /// </summary>
+  IRevocationChecker = interface(IInterface)
+    ['{2705234F-EB3D-4A94-8A55-CBC82BD7E6FF}']
+    /// <summary>
+    /// Verifies a stapled OCSP response (RFC 6960) about the leaf certificate,
+    /// in-band only - no network. Confirms the response is signed by the leaf's
+    /// issuer or an authorized delegated responder (id-kp-OCSPSigning, RFC 6960
+    /// sec. 4.2.2.2) and that its CertID matches the leaf (serial + issuer name/key
+    /// hash), then returns the reported status and the response's
+    /// thisUpdate/nextUpdate window. A malformed, unauthorized, or non-matching
+    /// response returns False (indeterminate); it never raises a backend exception.
+    /// ANextUpdate is 0 when the responder omitted nextUpdate (no upper bound). The
+    /// delegated-responder certificate validity is evaluated at AValidationTimeUtc,
+    /// so the caller's injected clock drives it (the caller enforces the
+    /// thisUpdate/nextUpdate freshness window against the same source).
+    /// </summary>
+    function ValidateOcspStaple(const ALeafCert, AIssuerCert,
+      AOcspResponseDer: TBytes; const AValidationTimeUtc: TDateTime;
+      out AStatus: TOcspStatus;
+      out AThisUpdate, ANextUpdate: TDateTime): Boolean;
+    /// <summary>
+    /// Builds an unsigned DER OCSP request (RFC 6960 4.1.1) for the leaf, its CertID formed
+    /// from the issuer name/key hash and the leaf serial - the request a live OCSP check
+    /// POSTs to the responder. Returns False (no request) on a malformed input; never raises.
+    /// The engine core never calls this; it is used only by the driver-edge live-revocation
+    /// resolver.
+    /// </summary>
+    function BuildOcspRequest(const ALeafCert, AIssuerCert: TBytes;
+      out ARequestDer: TBytes): Boolean;
+    /// <summary>
+    /// Reads the certificate's Authority Information Access extension (RFC 5280 4.2.2.1) and
+    /// returns every id-ad-ocsp responder URL (an http/https accessLocation) in certificate
+    /// order, duplicates kept: choosing among them is the caller's fetch policy. Returns False
+    /// (empty) when the extension is absent or carries no such URI; never raises.
+    /// </summary>
+    function TryGetOcspResponderUrls(const ACert: TBytes;
+      out AUrls: TArray<string>): Boolean;
+    /// <summary>
+    /// Reads the certificate's CRL Distribution Points extension (RFC 5280 4.2.1.13) and
+    /// returns the full-name http/https URLs of the points the issuer serves itself (a point
+    /// naming a separate cRLIssuer is skipped: its indirect CRL is never authoritative here).
+    /// Returns False (empty) when absent or carrying no such URI; never raises.
+    /// </summary>
+    function TryGetCrlDistributionPoints(const ACert: TBytes;
+      out AUrls: TArray<string>): Boolean;
+    /// <summary>
+    /// Checks the leaf against a fetched DER CRL (RFC 5280): confirms the CRL is signed by the
+    /// issuer, that its scope covers the leaf (RFC 5280 6.3.3 / 5.2: same issuer name, issuer
+    /// key permits cRLSign, no unrecognized critical extension, not a delta or indirect CRL,
+    /// and any issuingDistributionPoint covers the leaf's certificate kind, all reasons and one
+    /// of its own distribution points), enforces its thisUpdate/nextUpdate freshness window at
+    /// AValidationTimeUtc (so the caller's injected clock drives it, not the wall clock; a CRL
+    /// without nextUpdate is current for only 7 days after thisUpdate), then
+    /// reports whether the leaf serial is listed with a revoking reason (removeFromCRL is not
+    /// one; certificateHold is). Returns True when the CRL parsed, verified, is in scope and is
+    /// current (ARevoked then meaningful); False on a malformed, unverifiable, wrong-scope or
+    /// out-of-window CRL (indeterminate: a validly signed CRL of the wrong scope says nothing
+    /// about the leaf). AThisUpdate/ANextUpdate report the window (ANextUpdate 0 when absent).
+    /// Never raises.
+    /// </summary>
+    function CheckCrlRevocation(const ALeafCert, AIssuerCert, ACrlDer: TBytes;
+      const AValidationTimeUtc: TDateTime; out ARevoked: Boolean;
+      out AThisUpdate, ANextUpdate: TDateTime): Boolean;
+    /// <summary>
+    /// Finds, among ACandidates, the certificate that issued ALeaf - for a live revocation check on a
+    /// peer that presented a leaf-only chain (a mutual-TLS client whose issuer is a configured anchor,
+    /// not sent on the wire; RFC 9846 4.5.1). A candidate qualifies only when its subject name matches
+    /// the leaf's issuer name AND its public key verifies the leaf's signature, so a same-name/wrong-key
+    /// candidate is rejected (it would otherwise mis-key the OCSP CertID). Candidates must come from
+    /// local configuration (anchors / configured intermediates), never the peer. Returns False (no
+    /// issuer) when none qualifies or on malformed input; never raises.
+    /// </summary>
+    function TryFindIssuer(const ALeafCert: TBytes; const ACandidates: TArray<TBytes>;
+      out AIssuerCert: TBytes): Boolean;
+  end;
+
+{ ===== Composition root ===== }
+
+  /// <summary>
+  /// The PKIX composition root: X.509 certificate inspection, RFC 5280 path
+  /// validation, and revocation - the policy layer that sits above the crypto
+  /// primitives, injected alongside <see cref="ICryptoProvider" />. Each accessor
+  /// returns a stable, thread-safe, never-nil facet reference (the same reference
+  /// every call); consumers hold this aggregator and reach a facet through its accessor.
+  /// </summary>
+  IPkixProvider = interface(IInterface)
+    ['{7E1D9A34-6C82-4B57-A0F9-3D8E2C5B1F60}']
+    function Certificates: ICertificateInspector;
+    function PathValidation: ICertificatePathValidator;
+    function Revocation: IRevocationChecker;
+  end;
+
+  /// <summary>
+  /// Fluent builder for a composed <see cref="IPkixProvider" />: each With* overrides
+  /// one facet, and <see cref="Build" /> composes the provider. An unset facet defaults;
+  /// composing coherent facets (and supplying only thread-safe overrides) is the caller's
+  /// responsibility. Mirrors <see cref="ICryptoProviderBuilder" />.
+  /// </summary>
+  IPkixProviderBuilder = interface(IInterface)
+    ['{3C8A5F19-2E74-4D06-9B58-1F7A6C0E4D23}']
+    function WithInspector(const AInspector: ICertificateInspector): IPkixProviderBuilder;
+    function WithPathValidation(const APathValidation: ICertificatePathValidator): IPkixProviderBuilder;
+    function WithRevocation(const ARevocation: IRevocationChecker): IPkixProviderBuilder;
+    /// <summary>Composes the provider from the accumulated overrides.</summary>
+    function Build: IPkixProvider;
+  end;
+
+implementation
+
+end.

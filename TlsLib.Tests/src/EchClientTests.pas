@@ -36,11 +36,12 @@ uses
   TlpWireVectorMarker,
   TlpHandshakeMessages,
   TlpCoreExtensions,
+  TlpExtensionVector,
   TlpEchConfig,
-  TlpEchExtension,
   TlpEchOuterExtensions,
   TlpEchClient,
   TlpSecureMemory,
+  TlpTlsLibExceptions,
   TlsLibTestBase;
 
 type
@@ -55,16 +56,16 @@ type
   private
     FVec: TStringList;
     function SelectConfig(out ASuite: IHpkeSuite): TEchConfig;
-    function Entry(AType: UInt16; const AData: TBytes): TEchExtEntry;
-    function ServerNameEntry(const AHost: string): TEchExtEntry;
-    function ExtField(const AEntries: TArray<TEchExtEntry>): TBytes;
-    function InnerBody(const AEntries: TArray<TEchExtEntry>): TBytes;
+    function Entry(AType: UInt16; const AData: TBytes): TExtensionEntry;
+    function ServerNameEntry(const AHost: string): TExtensionEntry;
+    function Vec(const AEntries: array of TExtensionEntry): TExtensionVector;
+    function InnerBody(const AEntries: TExtensionVector): TBytes;
     procedure ParseEncodedInner(const AEncoded: TBytes;
-      out AEntries: TArray<TEchExtEntry>; out APadding: TBytes);
+      out AEntries: TExtensionVector; out APadding: TBytes);
   protected
     procedure SetUp; override;
-    procedure TearDown; override;
   published
+    procedure TestRecipientPublicKeyIsACopy;
     procedure TestPaddingWithServerName;
     procedure TestPaddingWithoutServerName;
     procedure TestPaddingMaxNameLengthZero;
@@ -72,8 +73,10 @@ type
     procedure TestSealOpenReconstructRoundTrip;
     procedure TestEncodedInnerHasEmptySessionIdAndZeroPadding;
     procedure TestCompressionReferencesSharedExtensions;
+    procedure TestGreasePlacementDrivesCompression;
     procedure TestAcceptConfirmationMatch;
     procedure TestGreaseEncapsulationIsValid;
+    procedure TestForgetSecretsMakesSealMethodsRefuse;
   end;
 
 implementation
@@ -83,13 +86,7 @@ implementation
 procedure TTestEchClient.SetUp;
 begin
   inherited SetUp;
-  FVec := LoadVectorFields('Certs/Ech.txt');
-end;
-
-procedure TTestEchClient.TearDown;
-begin
-  FVec.Free;
-  inherited TearDown;
+  FVec := Own<TStringList>(LoadVectorFields('Certs/Ech.txt'));
 end;
 
 function TTestEchClient.SelectConfig(out ASuite: IHpkeSuite): TEchConfig;
@@ -98,18 +95,27 @@ var
   LChosen: TEchConfig;
 begin
   LConfigs := TEchConfigList.Parse(DecodeHex(FVec.Values['config_list']));
-  CheckTrue(TEchConfigList.TrySelect(LConfigs, Provider, LChosen, ASuite),
+  CheckTrue(TEchConfigList.TrySelect(LConfigs, Crypto, LChosen, ASuite),
     'the vector config is usable');
   Result := LChosen;
 end;
 
-function TTestEchClient.Entry(AType: UInt16; const AData: TBytes): TEchExtEntry;
+function TTestEchClient.Entry(AType: UInt16; const AData: TBytes): TExtensionEntry;
 begin
-  Result.ExtType := AType;
-  Result.Data := AData;
+  Result := TExtensionEntry.Create(AType, AData);
 end;
 
-function TTestEchClient.ServerNameEntry(const AHost: string): TEchExtEntry;
+function TTestEchClient.Vec(
+  const AEntries: array of TExtensionEntry): TExtensionVector;
+var
+  LI: Int32;
+begin
+  Result := TExtensionVector.Empty;
+  for LI := 0 to System.High(AEntries) do
+    Result.Append(AEntries[LI]);
+end;
+
+function TTestEchClient.ServerNameEntry(const AHost: string): TExtensionEntry;
 var
   LWriter: IWireWriter;
   LList, LName: TWireVectorMarker;
@@ -127,19 +133,7 @@ begin
   Result := Entry(TExtensionTypes.ServerName, LWriter.ToBytes);
 end;
 
-function TTestEchClient.ExtField(const AEntries: TArray<TEchExtEntry>): TBytes;
-var
-  LWriter: IWireWriter;
-  LMarker: TWireVectorMarker;
-begin
-  LWriter := TWireWriter.Create;
-  LMarker := LWriter.OpenVector(2);
-  LWriter.WriteBytes(TEchOuterExtensions.EncodeExtensions(AEntries));
-  LWriter.CloseVector(LMarker);
-  Result := LWriter.ToBytes;
-end;
-
-function TTestEchClient.InnerBody(const AEntries: TArray<TEchExtEntry>): TBytes;
+function TTestEchClient.InnerBody(const AEntries: TExtensionVector): TBytes;
 var
   LHello: TTlsClientHello;
 begin
@@ -150,14 +144,14 @@ begin
     'a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf');
   LHello.CipherSuites := TArray<UInt16>.Create(TCipherSuites13.Aes128GcmSha256,
     TCipherSuites13.ChaCha20Poly1305Sha256);
-  LHello.Extensions := ExtField(AEntries);
+  LHello.Extensions := AEntries.Encode;
   Result := THandshakeMessages.EncodeClientHello(LHello);
 end;
 
 procedure TTestEchClient.ParseEncodedInner(const AEncoded: TBytes;
-  out AEntries: TArray<TEchExtEntry>; out APadding: TBytes);
+  out AEntries: TExtensionVector; out APadding: TBytes);
 var
-  LReader, LSession, LCipher, LComp, LExts: TWireReader;
+  LReader, LSession, LCipher, LComp: TWireReader;
 begin
   // EncodedClientHelloInner = client_hello || zeros. The client_hello ends at its
   // extensions vector; everything after is padding (must be zero).
@@ -168,11 +162,28 @@ begin
   CheckEquals(0, LSession.Remaining, 'EncodedClientHelloInner session_id is empty');
   LCipher := LReader.OpenVector(2); // cipher_suites
   LComp := LReader.OpenVector(1); // legacy_compression_methods
-  CheckTrue((LCipher.Remaining >= 0) and (LComp.Remaining >= 0), 'framed');
-  LExts := LReader.OpenVector(2); // extensions
-  AEntries := TEchOuterExtensions.ParseExtensions(
-    LExts.ReadBytes(LExts.Remaining));
+  CheckTrue((LCipher.Remaining > 0) and (LCipher.Remaining mod 2 = 0),
+    'cipher_suites holds whole two-byte suites');
+  CheckEquals(1, LComp.Remaining, 'legacy_compression_methods holds one method');
+  CheckEquals(0, LComp.ReadUInt8, 'and it is the null method');
+  // extensions vector, followed by the padding
+  AEntries := TExtensionVector.ParseFrom(LReader);
   APadding := LReader.ReadBytes(LReader.Remaining);
+end;
+
+procedure TTestEchClient.TestRecipientPublicKeyIsACopy;
+var
+  LKey: IHpkeRecipientKey;
+  LFirst, LSecond: TBytes;
+begin
+  // the key keeps its public key private: a caller changing the returned array must not alter it
+  LKey := Crypto.Hpke.ImportRecipientKey(THpkeKem.DHKEM_X25519_HKDF_SHA256,
+    Crypto.Hpke.ImportPrivateKey(THpkeKem.DHKEM_X25519_HKDF_SHA256,
+    DecodeHex(FVec.Values['config_private_key'])));
+  LFirst := LKey.PublicKey;
+  LFirst[0] := Byte(LFirst[0] xor $FF);
+  LSecond := LKey.PublicKey;
+  CheckTrue(LFirst[0] <> LSecond[0], 'the returned public key is a copy');
 end;
 
 procedure TTestEchClient.TestPaddingWithServerName;
@@ -214,7 +225,7 @@ var
   LConfig: TEchConfig;
   LSuite: IHpkeSuite;
   LEch: TEchClientHandshake;
-  LInnerEntries, LOuterEntries, LEncEntries, LReconstructed: TArray<TEchExtEntry>;
+  LInnerEntries, LOuterEntries, LEncEntries, LReconstructed: TExtensionVector;
   LInner, LEncoded, LEnc, LAad, LPayload, LDecrypted, LPadding: TBytes;
   LSk: ISecretBuffer;
   LOpener: IHpkeOpener;
@@ -222,21 +233,21 @@ var
 begin
   LConfig := SelectConfig(LSuite);
   // inner: real SNI + a contiguous run of extensions the outer shares verbatim
-  LInnerEntries := TArray<TEchExtEntry>.Create(
+  LInnerEntries := Vec([
     ServerNameEntry('secret.internal.example'),
     Entry(TExtensionTypes.SupportedGroups, DecodeHex('00020017')),
     Entry(TExtensionTypes.KeyShare, DecodeHex('0017000401020304')),
     Entry(TExtensionTypes.SupportedVersions, DecodeHex('020304')),
-    Entry(TExtensionTypes.RecordSizeLimit, DecodeHex('4001')));
+    Entry(TExtensionTypes.RecordSizeLimit, DecodeHex('4001'))]);
   // outer: public_name SNI (differs, not shared) + the same shared extensions in order
-  LOuterEntries := TArray<TEchExtEntry>.Create(
+  LOuterEntries := Vec([
     ServerNameEntry('cover.example'),
     Entry(TExtensionTypes.SupportedGroups, DecodeHex('00020017')),
     Entry(TExtensionTypes.KeyShare, DecodeHex('0017000401020304')),
-    Entry(TExtensionTypes.SupportedVersions, DecodeHex('020304')));
+    Entry(TExtensionTypes.SupportedVersions, DecodeHex('020304'))]);
 
   LInner := InnerBody(LInnerEntries);
-  LEch := TEchClientHandshake.Create(Provider, LConfig, LSuite);
+  LEch := TEchClientHandshake.Create(Crypto, LConfig, LSuite);
   try
     LEncoded := LEch.BuildEncodedInner(LInner, LOuterEntries);
     LEnc := LEch.SetupSeal;
@@ -247,9 +258,9 @@ begin
   end;
 
   // server side: decrypt with the config's real private key + the same HPKE info
-  LSk := Provider.Hpke.ImportPrivateKey(THpkeKem.DHKEM_X25519_HKDF_SHA256,
+  LSk := Crypto.Hpke.ImportPrivateKey(THpkeKem.DHKEM_X25519_HKDF_SHA256,
     DecodeHex(FVec.Values['config_private_key']));
-  LOpener := Provider.Hpke.ImportRecipientKey(LSuite.Kem, LSk)
+  LOpener := Crypto.Hpke.ImportRecipientKey(LSuite.Kem, LSk)
     .SetupOpener(LSuite, LEnc, LConfig.HpkeInfo);
   LDecrypted := LOpener.Open(LAad, LPayload);
   CheckEqualBytes('decrypted equals the encoded inner', LEncoded, LDecrypted);
@@ -257,14 +268,15 @@ begin
   // reconstruct the inner extensions from the decrypted encoded-inner + the outer
   ParseEncodedInner(LDecrypted, LEncEntries, LPadding);
   LReconstructed := TEchOuterExtensions.Reconstruct(LOuterEntries, LEncEntries);
-  CheckEquals(System.Length(LInnerEntries), System.Length(LReconstructed),
+  CheckEquals(LInnerEntries.Count, LReconstructed.Count,
     'reconstructed inner has the original extension count');
-  for LI := 0 to System.High(LInnerEntries) do
+  for LI := 0 to LInnerEntries.Count - 1 do
   begin
-    CheckEquals(Integer(LInnerEntries[LI].ExtType),
-      Integer(LReconstructed[LI].ExtType), 'reconstructed extension type');
-    CheckEqualBytes('reconstructed extension data', LInnerEntries[LI].Data,
-      LReconstructed[LI].Data);
+    CheckEquals(Integer(LInnerEntries.Entries[LI].ExtensionType),
+      Integer(LReconstructed.Entries[LI].ExtensionType),
+      'reconstructed extension type');
+    CheckEqualBytes('reconstructed extension data',
+      LInnerEntries.Entries[LI].Data, LReconstructed.Entries[LI].Data);
   end;
 end;
 
@@ -273,15 +285,14 @@ var
   LConfig: TEchConfig;
   LSuite: IHpkeSuite;
   LEch: TEchClientHandshake;
-  LEntries, LOuter, LEncEntries: TArray<TEchExtEntry>;
+  LEntries, LOuter, LEncEntries: TExtensionVector;
   LEncoded, LPadding: TBytes;
 begin
   LConfig := SelectConfig(LSuite);
-  LEntries := TArray<TEchExtEntry>.Create(ServerNameEntry('secret.example.com'),
-    Entry(TExtensionTypes.SupportedGroups, DecodeHex('00020017')));
-  LOuter := TArray<TEchExtEntry>.Create(
-    Entry(TExtensionTypes.SupportedGroups, DecodeHex('00020017')));
-  LEch := TEchClientHandshake.Create(Provider, LConfig, LSuite);
+  LEntries := Vec([ServerNameEntry('secret.example.com'),
+    Entry(TExtensionTypes.SupportedGroups, DecodeHex('00020017'))]);
+  LOuter := Vec([Entry(TExtensionTypes.SupportedGroups, DecodeHex('00020017'))]);
+  LEch := TEchClientHandshake.Create(Crypto, LConfig, LSuite);
   try
     LEncoded := LEch.BuildEncodedInner(InnerBody(LEntries), LOuter);
   finally
@@ -299,19 +310,19 @@ var
   LConfig: TEchConfig;
   LSuite: IHpkeSuite;
   LEch: TEchClientHandshake;
-  LInnerEntries, LOuter, LEncEntries: TArray<TEchExtEntry>;
+  LInnerEntries, LOuter, LEncEntries: TExtensionVector;
   LEncoded, LPadding: TBytes;
   LI: Int32;
   LHasOuterExt, LHasInlinedGroups: Boolean;
 begin
   LConfig := SelectConfig(LSuite);
-  LInnerEntries := TArray<TEchExtEntry>.Create(ServerNameEntry('secret.example.com'),
+  LInnerEntries := Vec([ServerNameEntry('secret.example.com'),
     Entry(TExtensionTypes.SupportedGroups, DecodeHex('00020017')),
-    Entry(TExtensionTypes.KeyShare, DecodeHex('0017000401020304')));
-  LOuter := TArray<TEchExtEntry>.Create(
+    Entry(TExtensionTypes.KeyShare, DecodeHex('0017000401020304'))]);
+  LOuter := Vec([
     Entry(TExtensionTypes.SupportedGroups, DecodeHex('00020017')),
-    Entry(TExtensionTypes.KeyShare, DecodeHex('0017000401020304')));
-  LEch := TEchClientHandshake.Create(Provider, LConfig, LSuite);
+    Entry(TExtensionTypes.KeyShare, DecodeHex('0017000401020304'))]);
+  LEch := TEchClientHandshake.Create(Crypto, LConfig, LSuite);
   try
     LEncoded := LEch.BuildEncodedInner(InnerBody(LInnerEntries), LOuter);
   finally
@@ -320,16 +331,83 @@ begin
   ParseEncodedInner(LEncoded, LEncEntries, LPadding);
   LHasOuterExt := False;
   LHasInlinedGroups := False;
-  for LI := 0 to System.High(LEncEntries) do
+  for LI := 0 to LEncEntries.Count - 1 do
   begin
-    if LEncEntries[LI].ExtType = TExtensionTypes.EchOuterExtensions then
+    if LEncEntries.Entries[LI].ExtensionType = TExtensionTypes.EchOuterExtensions then
       LHasOuterExt := True;
-    if LEncEntries[LI].ExtType = TExtensionTypes.SupportedGroups then
+    if LEncEntries.Entries[LI].ExtensionType = TExtensionTypes.SupportedGroups then
       LHasInlinedGroups := True;
   end;
   CheckTrue(LHasOuterExt, 'an ech_outer_extensions block was produced');
   CheckFalse(LHasInlinedGroups,
     'the shared supported_groups was compressed out, not inlined');
+end;
+
+procedure TTestEchClient.TestGreasePlacementDrivesCompression;
+const
+  GreaseType = UInt16($0A0A); // a GREASE codepoint (RFC 8701): compressible, duplicated in the outer
+var
+  LConfig: TEchConfig;
+  LSuite: IHpkeSuite;
+  LInner, LOuter, LEncEntries: TExtensionVector;
+
+  function Encoded(const AInner, AOuter: TExtensionVector): TExtensionVector;
+  var
+    LH: TEchClientHandshake;
+    LBytes, LPad: TBytes;
+    LParsed: TExtensionVector;
+  begin
+    LH := TEchClientHandshake.Create(Crypto, LConfig, LSuite);
+    try
+      LBytes := LH.BuildEncodedInner(InnerBody(AInner), AOuter);
+    finally
+      LH.Free;
+    end;
+    ParseEncodedInner(LBytes, LParsed, LPad);
+    Result := LParsed;
+  end;
+
+  function Has(const AEntries: TExtensionVector; AType: UInt16): Boolean;
+  var
+    LI: Int32;
+  begin
+    Result := False;
+    for LI := 0 to AEntries.Count - 1 do
+      if AEntries.Entries[LI].ExtensionType = AType then
+        Exit(True);
+  end;
+
+begin
+  LConfig := SelectConfig(LSuite);
+  // contiguous placement (what the GREASE injector now produces): GREASE sits with the other
+  // compressible extensions, so ech_outer_extensions folds it in and it is not left inline
+  LInner := Vec([ServerNameEntry('secret.example.com'),
+    Entry(TExtensionTypes.SupportedGroups, DecodeHex('00020017')),
+    Entry(TExtensionTypes.KeyShare, DecodeHex('0017000401020304')),
+    Entry(GreaseType, nil)]);
+  LOuter := Vec([ServerNameEntry('cover.example'),
+    Entry(TExtensionTypes.SupportedGroups, DecodeHex('00020017')),
+    Entry(TExtensionTypes.KeyShare, DecodeHex('0017000401020304')),
+    Entry(GreaseType, nil)]);
+  LEncEntries := Encoded(LInner, LOuter);
+  CheckTrue(Has(LEncEntries, TExtensionTypes.EchOuterExtensions),
+    'an ech_outer_extensions block was produced');
+  CheckFalse(Has(LEncEntries, GreaseType),
+    'a contiguous GREASE extension is compressed out, not left inline');
+
+  // front placement (the old shape): server_name splits GREASE from the compressible run, so the
+  // block covers only groups+key_share and the empty GREASE extension stays inline - the waste avoided
+  LInner := Vec([Entry(GreaseType, nil), ServerNameEntry('secret.example.com'),
+    Entry(TExtensionTypes.SupportedGroups, DecodeHex('00020017')),
+    Entry(TExtensionTypes.KeyShare, DecodeHex('0017000401020304'))]);
+  LOuter := Vec([Entry(GreaseType, nil), ServerNameEntry('cover.example'),
+    Entry(TExtensionTypes.SupportedGroups, DecodeHex('00020017')),
+    Entry(TExtensionTypes.KeyShare, DecodeHex('0017000401020304'))]);
+  LEncEntries := Encoded(LInner, LOuter);
+  CheckTrue(Has(LEncEntries, TExtensionTypes.EchOuterExtensions),
+    'the groups+key_share run still compresses');
+  CheckTrue(Has(LEncEntries, GreaseType),
+    'a front-placed GREASE extension is left inline, non-contiguous with the run');
 end;
 
 procedure TTestEchClient.TestAcceptConfirmationMatch;
@@ -344,25 +422,89 @@ begin
   LGood := DecodeHex(
     '000000000000000000000000000000000000000000000000113047a36d18f54c');
   CheckTrue(TEchClientHandshake.AcceptConfirmationMatches(
-    Provider.Primitives.CreateHkdf(THashAlgorithm.SHA_256), LInnerRandom,
+    Crypto.Primitives.CreateHkdf(THashAlgorithm.SHA_256), LInnerRandom,
     LTranscript, LGood), 'a matching confirmation is accepted');
   LBad := DecodeHex(
     '0000000000000000000000000000000000000000000000000000000000000000');
   CheckFalse(TEchClientHandshake.AcceptConfirmationMatches(
-    Provider.Primitives.CreateHkdf(THashAlgorithm.SHA_256), LInnerRandom,
+    Crypto.Primitives.CreateHkdf(THashAlgorithm.SHA_256), LInnerRandom,
     LTranscript, LBad), 'a non-matching confirmation is rejected');
 end;
 
 procedure TTestEchClient.TestGreaseEncapsulationIsValid;
+type
+  TKemCase = record
+    Kem: UInt16;
+    Size: Int32;
+    Name: string;
+  end;
+const
+  LCases: array [0 .. 3] of TKemCase = (
+    (Kem: THpkeKem.DHKEM_P256_HKDF_SHA256; Size: 65; Name: 'P-256'),
+    (Kem: THpkeKem.DHKEM_P384_HKDF_SHA384; Size: 97; Name: 'P-384'),
+    (Kem: THpkeKem.DHKEM_P521_HKDF_SHA512; Size: 133; Name: 'P-521'),
+    (Kem: THpkeKem.DHKEM_X25519_HKDF_SHA256; Size: 32; Name: 'X25519'));
 var
   LEnc: TBytes;
+  LI: Int32;
 begin
-  // a GREASE ech carries a real KEM encapsulation as its enc (RFC 9849 sec. 6.2): for X25519 that
-  // is a 32-byte value the KEM accepts, not merely a bare generated public key
-  LEnc := Provider.Hpke.RandomEncapsulation(THpkeKem.DHKEM_X25519_HKDF_SHA256);
-  CheckEquals(32, System.Length(LEnc), 'an X25519 encapsulation is 32 bytes');
-  CheckTrue(Provider.Hpke.ValidatePublicKey(THpkeKem.DHKEM_X25519_HKDF_SHA256, LEnc),
-    'the GREASE encapsulation is a well-formed KEM value');
+  // a GREASE ech's enc is a well-formed KEM value (RFC 9849 sec. 6.2): a serialized ephemeral
+  // public key of the DH-KEM's Npk
+  for LI := 0 to System.High(LCases) do
+  begin
+    LEnc := Crypto.Hpke.RandomEncapsulation(LCases[LI].Kem);
+    CheckEquals(LCases[LI].Size, System.Length(LEnc),
+      LCases[LI].Name + ': encapsulation size is Npk');
+    CheckTrue(Crypto.Hpke.ValidatePublicKey(LCases[LI].Kem, LEnc),
+      LCases[LI].Name + ': a well-formed KEM value');
+  end;
+end;
+
+procedure TTestEchClient.TestForgetSecretsMakesSealMethodsRefuse;
+var
+  LConfig: TEchConfig;
+  LSuite: IHpkeSuite;
+  LEch: TEchClientHandshake;
+  LRefused: Boolean;
+begin
+  LConfig := SelectConfig(LSuite);
+  LEch := TEchClientHandshake.Create(Crypto, LConfig, LSuite);
+  try
+    LEch.ForgetSecrets;
+    // the object is spent: every seal method refuses (a typed error) rather than resurrecting the
+    // sealer or dereferencing the released one
+    LRefused := False;
+    try
+      LEch.SetupSeal;
+    except
+      on E: EInvalidOperationTlsLibException do
+        LRefused := True;
+    end;
+    CheckTrue(LRefused, 'SetupSeal refuses after ForgetSecrets');
+
+    LRefused := False;
+    try
+      LEch.Seal(nil, nil);
+    except
+      on E: EInvalidOperationTlsLibException do
+        LRefused := True;
+    end;
+    CheckTrue(LRefused, 'Seal refuses after ForgetSecrets');
+
+    LRefused := False;
+    try
+      LEch.BuildEncodedInner(nil, Vec([]));
+    except
+      on E: EInvalidOperationTlsLibException do
+        LRefused := True;
+    end;
+    CheckTrue(LRefused, 'BuildEncodedInner refuses after ForgetSecrets');
+
+    // forgetting again is a harmless no-op: a raise here fails the test
+    LEch.ForgetSecrets;
+  finally
+    LEch.Free;
+  end;
 end;
 
 initialization

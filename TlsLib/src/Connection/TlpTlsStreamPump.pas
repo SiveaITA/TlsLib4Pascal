@@ -1,0 +1,536 @@
+{ *********************************************************************************** }
+{ *                                 TlsLib Library                                  * }
+{ *                          Author - Ugochukwu Mmaduekwe                           * }
+{ *                  Github Repository <https://github.com/Xor-el>                  * }
+{ *                                                                                 * }
+{ *  Distributed under the MIT software license, see the accompanying file LICENSE  * }
+{ *          or visit http://www.opensource.org/licenses/mit-license.php.           * }
+{ * ******************************************************************************* * }
+
+(* &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&& *)
+
+unit TlpTlsStreamPump;
+
+{$I ..\Include\TlsLib.inc}
+
+interface
+
+uses
+  SysUtils,
+  TlpTlsAlert,
+  TlpTlsAlertProtocol,
+  TlpTlsError,
+  TlpTlsLibExceptions,
+  TlpEchConfig,
+  TlpTrustPolicy,
+  TlpTlsConnectionInfo,
+  TlpITlsEngine,
+  TlpITlsTransport;
+
+type
+  /// <summary>How a single application read cycle ended.</summary>
+  TTlsReadStatus = (
+    Data,        // plaintext was produced (the returned count is > 0)
+    CleanEof,    // the peer sent close_notify: an orderly end of stream
+    Truncated);  // the transport closed without close_notify: a possible truncation
+
+  /// <summary>
+  /// Drives a sans-IO ITlsEngine over a blocking ITlsTransport: flush outbound,
+  /// read inbound, repeat. The deferred certificate verdict resolves inline here (the
+  /// engine's trust pipeline runs synchronously while ProcessInput drives the handshake).
+  /// A fatal outcome raises ETlsStreamError; a transport EOF mid-handshake raises
+  /// ETlsTransportTruncated. Every call takes the caller's transport buffer (ATransportBuffer),
+  /// grown to TransportChunk on first use and reused, so a read or flush cycle allocates nothing.
+  /// </summary>
+  TTlsStreamPump = class sealed(TObject)
+  public
+  const
+    // one TLS record's plaintext never exceeds 2^14; a 16 KiB transport read comfortably
+    // holds a framed record and lets the record layer reassemble across reads
+    TransportChunk = Int32(16384);
+    // the most plaintext WriteApp seals before draining to the transport: four max-size
+    // records, the record layer's retained outbound capacity, so a chunked bulk write never
+    // regrows the outbound buffer and holds at most one slice of ciphertext at a time
+    WriteChunk = Int32(4 * 16384);
+  strict private
+    /// <summary>Flushes best-effort: a transport failure is swallowed because the caller is
+    /// already surfacing a TLS-level error, or has data to return, that a transport error must not
+    /// mask. Flush has still latched the engine or emptied its queue.</summary>
+    class procedure FlushQuietly(const AEngine: ITlsEngine;
+      const ATransport: ITlsTransport; var ATransportBuffer: TBytes); static;
+    /// <summary>Flushes what the engine queued; a transport failure raises while it is live and is
+    /// swallowed once it is terminal.</summary>
+    class procedure FlushPending(const AEngine: ITlsEngine;
+      const ATransport: ITlsTransport; var ATransportBuffer: TBytes); static;
+    /// <summary>Flushes, then raises if the engine is terminal. The flush comes first so the
+    /// fatal alert a failed ProcessInput/Write queued reaches the peer before the error surfaces
+    /// here (the peer then reads an alert, not a truncation); once terminal it is best-effort.</summary>
+    class procedure FlushThenRaiseIfFatal(const AEngine: ITlsEngine;
+      const ATransport: ITlsTransport; var ATransportBuffer: TBytes); static;
+    /// <summary>Whether the engine ended because the peer sent close_notify before the handshake
+    /// completed; that is a truncation for the caller, not a fatal alert.</summary>
+    class function PeerClosedDuringHandshake(const AEngine: ITlsEngine): Boolean; static;
+    /// <summary>DrainEvents for the stream: a peer fatal alert raises ETlsStreamError with its
+    /// description (internal_error for an unmapped code); reports a clean peer close via
+    /// APeerClosed and captures a parked-certificate event, and returns True on a clean close.</summary>
+    class function DrainEventsOrRaise(const AEngine: ITlsEngine; out APeerClosed: Boolean;
+      out ACertEvent: ICertificateReceivedEvent): Boolean; static;
+  public
+    /// <summary>Drains the engine's event queue: reports a peer fatal alert (APeerAlert, nil when
+    /// none) and a peer close_notify (APeerClosed), and captures a parked-certificate event so a
+    /// resolver can decide the verdict. Never raises; the caller maps a terminal event to its own
+    /// signalling. Returns True when a terminal event was seen.</summary>
+    class function DrainEvents(const AEngine: ITlsEngine; out APeerAlert: IPeerAlertEvent;
+      out APeerClosed: Boolean; out ACertEvent: ICertificateReceivedEvent): Boolean; static;
+    /// <summary>Resolves a parked peer-certificate verdict through AResolveVerdict on the captured
+    /// park event; fail-closed with certificate_unknown when there is no resolver or no captured
+    /// chain (an unspecified acceptability problem, not a corrupt certificate). Sets the verdict on
+    /// the engine only: the caller flushes the resumed flight, or the abort alert of a reject, and
+    /// surfaces a terminal outcome its own way.</summary>
+    class procedure ResolveVerdict(const AEngine: ITlsEngine;
+      const ACertEvent: ICertificateReceivedEvent;
+      const AResolveVerdict: TCertificateVerdictResolver; APeerRole: TPeerRole); overload; static;
+    /// <summary>As above, handing the resolver ADeadlineMs as its time budget (0 = none set).</summary>
+    class procedure ResolveVerdict(const AEngine: ITlsEngine;
+      const ACertEvent: ICertificateReceivedEvent;
+      const AResolveVerdict: TCertificateVerdictResolver; APeerRole: TPeerRole;
+      ADeadlineMs: Cardinal); overload; static;
+    /// <summary>Raises the engine's terminal failure as the precise TLS error (its alert), or after
+    /// a transport failure as an ETlsStreamError with no alert, when it is in a fatal state; a
+    /// no-op otherwise. Lets a caller re-surface a latched handshake failure with what the engine
+    /// recorded.</summary>
+    class procedure RaiseIfFatal(const AEngine: ITlsEngine); static;
+    /// <summary>Sends every pending outbound byte to the transport. A transport failure raises
+    /// unchanged and ends the connection: a live engine is latched (no alert, sessions kept), a
+    /// terminal one drops its unsent queue. Later calls raise the latched error with no
+    /// alert.</summary>
+    class procedure Flush(const AEngine: ITlsEngine;
+      const ATransport: ITlsTransport; var ATransportBuffer: TBytes); static;
+    /// <summary>Runs the handshake to completion. A client sends its opening flight first
+    /// (StartHandshake); a server waits for the ClientHello. Raises on failure. This overload has
+    /// no resolver, so with async certificate verdicts enabled a parked verdict fails closed with
+    /// certificate_unknown; use the resolver overload to decide it out-of-band.</summary>
+    class procedure DriveHandshake(const AEngine: ITlsEngine;
+      const ATransport: ITlsTransport; var ATransportBuffer: TBytes;
+      AIsClient: Boolean); overload; static;
+    /// <summary>Runs the handshake to completion, resolving any parked peer-certificate
+    /// verdict through AResolveVerdict (a nil resolver fails such a park closed). With async
+    /// verdicts disabled the handshake never parks and this behaves exactly like the plain
+    /// overload.</summary>
+    class procedure DriveHandshake(const AEngine: ITlsEngine;
+      const ATransport: ITlsTransport; var ATransportBuffer: TBytes; AIsClient: Boolean;
+      const AResolveVerdict: TCertificateVerdictResolver); overload; static;
+    /// <summary>As above, handing the resolver ADeadlineMs as its time budget (0 = none set).</summary>
+    class procedure DriveHandshake(const AEngine: ITlsEngine;
+      const ATransport: ITlsTransport; var ATransportBuffer: TBytes; AIsClient: Boolean;
+      const AResolveVerdict: TCertificateVerdictResolver;
+      ADeadlineMs: Cardinal); overload; static;
+    /// <summary>One application read cycle: drains engine-buffered plaintext (which may have
+    /// arrived coalesced with the final handshake flight) before blocking on the transport.
+    /// Returns the count copied into ADest and, via AStatus, whether more may follow, the
+    /// peer closed cleanly, or the transport was truncated.</summary>
+    class function ReadApp(const AEngine: ITlsEngine;
+      const ATransport: ITlsTransport; var ATransportBuffer: TBytes; var ADest: TBytes;
+      AMaxLength: Int32; out AStatus: TTlsReadStatus): Int32; static;
+    /// <summary>Encrypts and sends application data, sealing and draining at most WriteChunk
+    /// bytes per iteration so a bulk write never holds its whole ciphertext in memory. At the
+    /// AEAD usage limit with no rekey available the engine's close_notify is still sent before
+    /// ERecordLimitTlsLibException propagates. A transport failure ends the connection: its
+    /// exception propagates and later calls raise the latched error.</summary>
+    class procedure WriteApp(const AEngine: ITlsEngine;
+      const ATransport: ITlsTransport; var ATransportBuffer: TBytes; const AData: TBytes;
+      AOffset, ALength: Int32); static;
+    /// <summary>Sends close_notify and flushes it; a transport failure raises as for Flush.</summary>
+    class procedure Close(const AEngine: ITlsEngine;
+      const ATransport: ITlsTransport; var ATransportBuffer: TBytes); static;
+    /// <summary>Sends a fatal alert (the engine goes terminal) and flushes it, best effort: used
+    /// when the local host refuses a connection that already completed its handshake.</summary>
+    class procedure Abort(const AEngine: ITlsEngine; const ATransport: ITlsTransport;
+      var ATransportBuffer: TBytes; ADescription: TTlsAlertDescription); static;
+  end;
+
+implementation
+
+resourcestring
+  SPeerFatalAlert = 'the peer sent a fatal alert';
+  STruncatedHandshake = 'the transport closed during the handshake without close_notify ' +
+    '(after %d handshake bytes from the peer)';
+  SClosedDuringHandshake = 'the peer closed the connection during the handshake';
+  SWriteAfterClose = 'a write was attempted after the connection was closed';
+  SEarlyDataUnread = 'accepted 0-RTT data is waiting: read it with ReadEarlyData before Read';
+
+{ TTlsStreamPump }
+
+class procedure TTlsStreamPump.RaiseIfFatal(const AEngine: ITlsEngine);
+var
+  LInfo: TTlsConnectionInfo;
+begin
+  if not AEngine.IsTerminal then
+    Exit;
+  if PeerClosedDuringHandshake(AEngine) then
+    raise ETlsTransportTruncated.CreateRes(@SClosedDuringHandshake);
+  // a client's ECH reject aborts with ech_required (RFC 9849 sec. 6.1.6); surface the
+  // retry_configs and the retry flag through a typed exception so the application can decide to
+  // reconnect. keyed on the abort itself, not EchStatus - a server reads Rejected after a benign
+  // GREASE handshake that completed, so a later fatal there must surface as its true error
+  LInfo := AEngine.ConnectionInfo;
+  if LInfo.EchRejectAborted then
+    raise EEchRejectedTlsLibException.Create(LInfo.EchRetryConfigs,
+      LInfo.EchIsRetryAttempt);
+  raise ETlsStreamError.Create(AEngine.LastError);
+end;
+
+class procedure TTlsStreamPump.Flush(const AEngine: ITlsEngine;
+  const ATransport: ITlsTransport; var ATransportBuffer: TBytes);
+var
+  LGot: Int32;
+begin
+  // this runs on every read cycle too; do not touch the transport buffer when there is
+  // nothing to send
+  if not AEngine.WantsWrite then
+    Exit;
+  if System.Length(ATransportBuffer) < TransportChunk then
+    SetLength(ATransportBuffer, TransportChunk);
+  try
+    repeat
+      LGot := AEngine.TakeOutgoing(ATransportBuffer, 0);
+      if LGot > 0 then
+        ATransport.Write(ATransportBuffer, 0, LGot);
+    until LGot = 0;
+  except
+    // Write reports no progress on a raise: nothing queued can follow it intact
+    on E: Exception do
+    begin
+      if AEngine.IsTerminal then
+        repeat
+          LGot := AEngine.TakeOutgoing(ATransportBuffer, 0);
+        until LGot = 0
+      else
+        AEngine.LatchTransportFailure(E.Message);
+      raise;
+    end;
+  end;
+end;
+
+class procedure TTlsStreamPump.FlushQuietly(const AEngine: ITlsEngine;
+  const ATransport: ITlsTransport; var ATransportBuffer: TBytes);
+begin
+  try
+    Flush(AEngine, ATransport, ATransportBuffer);
+  except
+    // best effort: the caller's own error or data takes precedence
+  end;
+end;
+
+class procedure TTlsStreamPump.FlushPending(const AEngine: ITlsEngine;
+  const ATransport: ITlsTransport; var ATransportBuffer: TBytes);
+begin
+  if AEngine.IsTerminal then
+    FlushQuietly(AEngine, ATransport, ATransportBuffer)
+  else
+    Flush(AEngine, ATransport, ATransportBuffer);
+end;
+
+class procedure TTlsStreamPump.FlushThenRaiseIfFatal(const AEngine: ITlsEngine;
+  const ATransport: ITlsTransport; var ATransportBuffer: TBytes);
+begin
+  FlushPending(AEngine, ATransport, ATransportBuffer);
+  RaiseIfFatal(AEngine);
+end;
+
+class function TTlsStreamPump.DrainEvents(const AEngine: ITlsEngine;
+  out APeerAlert: IPeerAlertEvent; out APeerClosed: Boolean;
+  out ACertEvent: ICertificateReceivedEvent): Boolean;
+var
+  LEvent: ITlsEvent;
+  LAlertEvent: IPeerAlertEvent;
+  LCertEvent: ICertificateReceivedEvent;
+begin
+  Result := False;
+  APeerAlert := nil;
+  APeerClosed := False;
+  ACertEvent := nil;
+  while AEngine.NextEvent(LEvent) do
+    case LEvent.Kind of
+      TTlsEventKind.PeerAlert:
+        // first alert wins; no event is ever queued after a terminal one, so a full drain and a
+        // stop-at-first-terminal dequeue the same set
+        if (APeerAlert = nil) and Supports(LEvent, IPeerAlertEvent, LAlertEvent) then
+        begin
+          APeerAlert := LAlertEvent;
+          Result := True;
+        end;
+      TTlsEventKind.Closed:
+        begin
+          APeerClosed := True;
+          Result := True;
+        end;
+      TTlsEventKind.CertificateReceived:
+        // capture the parked peer chain so a resolver can decide the verdict
+        if Supports(LEvent, ICertificateReceivedEvent, LCertEvent) then
+          ACertEvent := LCertEvent;
+    end;
+end;
+
+class function TTlsStreamPump.PeerClosedDuringHandshake(const AEngine: ITlsEngine): Boolean;
+begin
+  Result := AEngine.IsTerminal and (AEngine.LastError.Origin = TTlsErrorOrigin.Peer) and
+    (AEngine.LastError.AlertByte = TTlsAlertDescription.CloseNotify.ToByte);
+end;
+
+class function TTlsStreamPump.DrainEventsOrRaise(const AEngine: ITlsEngine;
+  out APeerClosed: Boolean; out ACertEvent: ICertificateReceivedEvent): Boolean;
+var
+  LAlertEvent: IPeerAlertEvent;
+begin
+  DrainEvents(AEngine, LAlertEvent, APeerClosed, ACertEvent);
+  if LAlertEvent <> nil then
+  begin
+    if LAlertEvent.Alert.HasKnownDescription then
+      raise ETlsStreamError.CreateRes(LAlertEvent.Alert.Description, @SPeerFatalAlert)
+    else
+      raise ETlsStreamError.CreateRes(TTlsAlertDescription.InternalError, @SPeerFatalAlert);
+  end;
+  Result := APeerClosed;
+end;
+
+class procedure TTlsStreamPump.ResolveVerdict(const AEngine: ITlsEngine;
+  const ACertEvent: ICertificateReceivedEvent;
+  const AResolveVerdict: TCertificateVerdictResolver; APeerRole: TPeerRole);
+begin
+  ResolveVerdict(AEngine, ACertEvent, AResolveVerdict, APeerRole, 0);
+end;
+
+class procedure TTlsStreamPump.ResolveVerdict(const AEngine: ITlsEngine;
+  const ACertEvent: ICertificateReceivedEvent;
+  const AResolveVerdict: TCertificateVerdictResolver; APeerRole: TPeerRole;
+  ADeadlineMs: Cardinal);
+var
+  LAccept: Boolean;
+  LAlert: TTlsAlertDescription;
+  LCtx: TCertificateVerdictContext;
+begin
+  // fail-closed: with no resolver (or no captured chain) the parked handshake is rejected
+  // with certificate_unknown (an unspecified acceptability problem, not a corrupt certificate)
+  LAccept := False;
+  LAlert := TTlsAlertDescription.CertificateUnknown;
+  if Assigned(AResolveVerdict) and (ACertEvent <> nil) then
+  begin
+    LCtx.PeerRole := APeerRole;
+    LCtx.Chain := ACertEvent.Chain;
+    LCtx.ValidatedPath := ACertEvent.ValidatedPath;
+    LCtx.HostName := ACertEvent.HostName;
+    LCtx.OcspStaple := ACertEvent.OcspStaple;
+    LCtx.DeadlineMs := ADeadlineMs;
+    LCtx.RevocationPosture := ACertEvent.RevocationPosture;
+    // a resolver that raises must not leave the handshake parked with no verdict: the peer gets an
+    // internal_error and the engine is terminal, so the caller surfaces the failure
+    try
+      LAccept := AResolveVerdict(LCtx, LAlert);
+    except
+      on Exception do
+      begin
+        LAccept := False;
+        LAlert := TTlsAlertDescription.InternalError;
+      end;
+    end;
+  end;
+  AEngine.SetCertificateVerdict(LAccept, LAlert);
+end;
+
+class procedure TTlsStreamPump.DriveHandshake(const AEngine: ITlsEngine;
+  const ATransport: ITlsTransport; var ATransportBuffer: TBytes; AIsClient: Boolean);
+begin
+  // no resolver: with async verdicts disabled (the default) the handshake never parks, so
+  // this is exactly the inline (non-async) path; if async was enabled without a resolver,
+  // a park fails closed
+  DriveHandshake(AEngine, ATransport, ATransportBuffer, AIsClient, nil);
+end;
+
+class procedure TTlsStreamPump.DriveHandshake(const AEngine: ITlsEngine;
+  const ATransport: ITlsTransport; var ATransportBuffer: TBytes; AIsClient: Boolean;
+  const AResolveVerdict: TCertificateVerdictResolver);
+begin
+  DriveHandshake(AEngine, ATransport, ATransportBuffer, AIsClient, AResolveVerdict, 0);
+end;
+
+class procedure TTlsStreamPump.DriveHandshake(const AEngine: ITlsEngine;
+  const ATransport: ITlsTransport; var ATransportBuffer: TBytes; AIsClient: Boolean;
+  const AResolveVerdict: TCertificateVerdictResolver; ADeadlineMs: Cardinal);
+var
+  LGot: Int32;
+  LTotal: Int64;
+  LPeerClosed: Boolean;
+  LCertEvent: ICertificateReceivedEvent;
+  LPeerRole: TPeerRole;
+begin
+  // our role fixes whose certificate a park concerns: a client verifies the server's chain,
+  // a server the mTLS client's
+  if AIsClient then
+    LPeerRole := TPeerRole.Server
+  else
+    LPeerRole := TPeerRole.Client;
+  // the client emits its opening flight now; a server has nothing to send until it
+  // reads the ClientHello
+  if AIsClient then
+    AEngine.StartHandshake;
+  LTotal := 0;
+  if System.Length(ATransportBuffer) < TransportChunk then
+    SetLength(ATransportBuffer, TransportChunk);
+  LCertEvent := nil;
+  FlushPending(AEngine, ATransport, ATransportBuffer);
+  while AEngine.IsHandshaking do
+  begin
+    // a parked verdict makes no progress on the wire; resolve it before blocking on a read
+    // that would never return (the peer already sent the rest of its flight)
+    if AEngine.AwaitingCertificateVerdict then
+    begin
+      ResolveVerdict(AEngine, LCertEvent, AResolveVerdict, LPeerRole, ADeadlineMs);
+      // send the resumed flight, or the abort alert of a rejected verdict, then surface the abort
+      FlushThenRaiseIfFatal(AEngine, ATransport, ATransportBuffer);
+      LCertEvent := nil;
+      Continue;
+    end;
+    LGot := ATransport.Read(ATransportBuffer, 0, TransportChunk);
+    if LGot = 0 then
+      raise ETlsTransportTruncated.CreateResFmt(@STruncatedHandshake, [LTotal]);
+    Inc(LTotal, LGot);
+    AEngine.ProcessInput(ATransportBuffer, 0, LGot);
+    FlushThenRaiseIfFatal(AEngine, ATransport, ATransportBuffer);
+    DrainEventsOrRaise(AEngine, LPeerClosed, LCertEvent);
+  end;
+  // StartHandshake itself can fail the engine (never entering the loop); surface that alert
+  RaiseIfFatal(AEngine);
+end;
+
+class function TTlsStreamPump.ReadApp(const AEngine: ITlsEngine;
+  const ATransport: ITlsTransport; var ATransportBuffer: TBytes; var ADest: TBytes;
+  AMaxLength: Int32; out AStatus: TTlsReadStatus): Int32;
+var
+  LGot: Int32;
+  LPeerClosed: Boolean;
+  LCertEvent: ICertificateReceivedEvent; // unused post-handshake; a verdict parks only mid-handshake
+begin
+  // 0-RTT bytes precede every 1-RTT byte; reading past them would reorder or lose them
+  if AEngine.PendingEarlyData > 0 then
+    raise EInvalidOperationTlsLibException.CreateRes(@SEarlyDataUnread);
+  // surface anything already buffered (app data can arrive coalesced with the peer's
+  // final handshake flight) before blocking on the transport
+  Result := AEngine.ReadAppData(ADest, 0, AMaxLength);
+  if Result > 0 then
+  begin
+    // output queued by an earlier engine call goes out now; a dead transport must not lose the bytes
+    FlushQuietly(AEngine, ATransport, ATransportBuffer);
+    AStatus := TTlsReadStatus.Data;
+    Exit;
+  end;
+  // DrainEvents still runs for its side effect (it raises on a peer fatal alert); the clean
+  // close is detected via the engine's persistent flag, not the one-shot Closed event, which
+  // the handshake driver may already have drained when a close_notify coalesced with the
+  // peer's final flight
+  DrainEventsOrRaise(AEngine, LPeerClosed, LCertEvent);
+  if AEngine.IsInboundClosed then
+  begin
+    AStatus := TTlsReadStatus.CleanEof;
+    Exit(0);
+  end;
+
+  if System.Length(ATransportBuffer) < TransportChunk then
+    SetLength(ATransportBuffer, TransportChunk);
+  repeat
+    // a terminal engine takes no more input: reading would block forever with its alert unsent
+    if AEngine.IsTerminal then
+    begin
+      FlushQuietly(AEngine, ATransport, ATransportBuffer);
+      RaiseIfFatal(AEngine);
+    end;
+    LGot := ATransport.Read(ATransportBuffer, 0, TransportChunk);
+    if LGot = 0 then
+    begin
+      // the transport closed. A prior close_notify would have surfaced above as CleanEof,
+      // so an EOF here with the connection still live is a possible truncation
+      AStatus := TTlsReadStatus.Truncated;
+      Exit(0);
+    end;
+    AEngine.ProcessInput(ATransportBuffer, 0, LGot);
+    // what the input provoked (a fatal alert, a no_renegotiation warning) must reach the peer now,
+    // since a read-only caller never writes. The engine and transport are single-threaded: a
+    // connection is not read and written from two threads at once
+    FlushThenRaiseIfFatal(AEngine, ATransport, ATransportBuffer);
+    Result := AEngine.ReadAppData(ADest, 0, AMaxLength);
+    if Result > 0 then
+    begin
+      AStatus := TTlsReadStatus.Data;
+      Exit;
+    end;
+    DrainEventsOrRaise(AEngine, LPeerClosed, LCertEvent);
+    if AEngine.IsInboundClosed then
+    begin
+      AStatus := TTlsReadStatus.CleanEof;
+      Exit(0);
+    end;
+    // no plaintext yet (e.g. a post-handshake ticket / KeyUpdate record): read again
+  until False;
+end;
+
+class procedure TTlsStreamPump.WriteApp(const AEngine: ITlsEngine;
+  const ATransport: ITlsTransport; var ATransportBuffer: TBytes; const AData: TBytes;
+  AOffset, ALength: Int32);
+var
+  LOffset, LRemaining, LChunk: Int32;
+  LSealFault: Boolean;
+begin
+  // a terminal engine reports its recorded failure first, not a closed-write error
+  if AEngine.IsTerminal then
+    FlushThenRaiseIfFatal(AEngine, ATransport, ATransportBuffer);
+  // the engine's Write raises once the write side is closed; pre-check so the stream reports a
+  // clear error rather than the raw engine exception (and never counts the bytes as sent)
+  if AEngine.WriteClosed then
+    raise EInvalidOperationTlsLibException.CreateRes(@SWriteAfterClose);
+  LOffset := AOffset;
+  LRemaining := ALength;
+  // the engine seals whatever it is handed in full, so a bulk write sealed whole would hold the
+  // entire ciphertext before the first send: seal and drain one bounded slice at a time
+  while LRemaining > 0 do
+  begin
+    LChunk := LRemaining;
+    if LChunk > WriteChunk then
+      LChunk := WriteChunk;
+    try
+      AEngine.Write(AData, LOffset, LChunk);
+    except
+      on Exception do
+      begin
+        // a failed seal may leave an alert queued - close_notify at the AEAD usage
+        // limit, or the fatal alert of a seal fault; deliver it (any slices sealed before are
+        // already on the wire) before surfacing the failure to the caller
+        LSealFault := AEngine.IsTerminal;
+        FlushQuietly(AEngine, ATransport, ATransportBuffer);
+        if LSealFault then
+          RaiseIfFatal(AEngine);
+        raise;
+      end;
+    end;
+    FlushThenRaiseIfFatal(AEngine, ATransport, ATransportBuffer);
+    Inc(LOffset, LChunk);
+    Dec(LRemaining, LChunk);
+  end;
+end;
+
+class procedure TTlsStreamPump.Close(const AEngine: ITlsEngine;
+  const ATransport: ITlsTransport; var ATransportBuffer: TBytes);
+begin
+  AEngine.SendClose;
+  Flush(AEngine, ATransport, ATransportBuffer);
+end;
+
+class procedure TTlsStreamPump.Abort(const AEngine: ITlsEngine;
+  const ATransport: ITlsTransport; var ATransportBuffer: TBytes;
+  ADescription: TTlsAlertDescription);
+begin
+  AEngine.SendAlert(ADescription);
+  // the connection is already being refused; a dead peer must not mask the reason
+  FlushQuietly(AEngine, ATransport, ATransportBuffer);
+end;
+
+end.

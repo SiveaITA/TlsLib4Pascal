@@ -26,6 +26,7 @@ uses
   TestFramework,
 {$ENDIF FPC}
   TlpTlsAlert,
+  TlpTlsError,
   TlpTlsLibExceptions,
   TlsLibTestBase;
 
@@ -39,9 +40,15 @@ type
   published
     procedure TestArgumentExceptionMessage;
     procedure TestCreateResFmt;
+    procedure TestStreamErrorCreateResCarriesAlertAndMessage;
+    procedure TestStreamErrorFromATransportErrorCarriesNoAlert;
+    procedure TestStreamErrorFromALocalErrorCarriesTheAlert;
+    procedure TestStreamErrorFromAPeerErrorCarriesTheAlert;
+    procedure TestStreamErrorFromAnUnknownOriginErrorCarriesTheAlert;
     procedure TestFatalAlertCarriesDescription;
     procedure TestDecodeErrorMapsToDecodeError;
     procedure TestHierarchy;
+    procedure TestReadTimeoutHierarchy;
   end;
 
 implementation
@@ -85,6 +92,91 @@ begin
       LMessage := E.Message;
   end;
   CheckEquals('boom', LMessage, 'CreateRes message');
+end;
+
+procedure TTestExceptions.TestStreamErrorCreateResCarriesAlertAndMessage;
+var
+  LPlain, LFmt, LNoAlert: ETlsStreamError;
+begin
+  LPlain := ETlsStreamError.CreateRes(TTlsAlertDescription.InternalError, @STestBoom);
+  LFmt := ETlsStreamError.CreateResFmt(TTlsAlertDescription.BadCertificate,
+    @STestValueFmt, [7]);
+  LNoAlert := ETlsStreamError.Create('boom');
+  try
+    CheckEquals('boom', LPlain.Message, 'CreateRes message');
+    CheckTrue(LPlain.HasAlert, 'CreateRes carries an alert');
+    CheckTrue(LPlain.Alert = TTlsAlertDescription.InternalError, 'CreateRes alert');
+    CheckEquals('value 7 out of range', LFmt.Message, 'CreateResFmt message');
+    CheckTrue(LFmt.Alert = TTlsAlertDescription.BadCertificate, 'CreateResFmt alert');
+    CheckFalse(LNoAlert.HasAlert, 'control: the message-only overload carries no alert');
+  finally
+    LNoAlert.Free;
+    LFmt.Free;
+    LPlain.Free;
+  end;
+end;
+
+procedure TTestExceptions.TestStreamErrorFromATransportErrorCarriesNoAlert;
+var
+  LError: TTlsError;
+  LStream: ETlsStreamError;
+begin
+  LError := TTlsError.CreateFatal(TTlsAlertDescription.DecodeError, 'socket gone',
+    TTlsErrorOrigin.Transport);
+  LStream := ETlsStreamError.Create(LError);
+  try
+    CheckFalse(LStream.HasAlert, 'a transport failure carries no alert');
+    CheckEquals('socket gone', LStream.Message, 'the transport message is kept');
+  finally
+    LStream.Free;
+  end;
+end;
+
+procedure TTestExceptions.TestStreamErrorFromALocalErrorCarriesTheAlert;
+var
+  LError: TTlsError;
+  LStream: ETlsStreamError;
+begin
+  LError := TTlsError.CreateFatal(TTlsAlertDescription.DecodeError, 'bad record',
+    TTlsErrorOrigin.Local);
+  LStream := ETlsStreamError.Create(LError);
+  try
+    CheckTrue(LStream.HasAlert, 'a local fatal error carries its alert');
+    CheckTrue(LStream.Alert = TTlsAlertDescription.DecodeError, 'the alert is the recorded one');
+    CheckEquals('bad record', LStream.Message, 'the message is kept');
+  finally
+    LStream.Free;
+  end;
+end;
+
+procedure TTestExceptions.TestStreamErrorFromAPeerErrorCarriesTheAlert;
+var
+  LError: TTlsError;
+  LStream: ETlsStreamError;
+begin
+  LError := TTlsError.CreatePeerFatal(TTlsAlertDescription.DecodeError.ToByte, 'peer said no');
+  LStream := ETlsStreamError.Create(LError);
+  try
+    CheckTrue(LStream.HasAlert, 'a peer alert is an alert');
+    CheckTrue(LStream.Alert = TTlsAlertDescription.DecodeError, 'the alert is the peer''s');
+  finally
+    LStream.Free;
+  end;
+end;
+
+procedure TTestExceptions.TestStreamErrorFromAnUnknownOriginErrorCarriesTheAlert;
+var
+  LError: TTlsError;
+  LStream: ETlsStreamError;
+begin
+  LError := TTlsError.CreateFatal(TTlsAlertDescription.DecodeError, 'unattributed');
+  LStream := ETlsStreamError.Create(LError);
+  try
+    CheckTrue(LStream.HasAlert, 'only a transport failure lacks an alert');
+    CheckTrue(LStream.Alert = TTlsAlertDescription.DecodeError, 'the alert is the recorded one');
+  finally
+    LStream.Free;
+  end;
 end;
 
 procedure TTestExceptions.TestCreateResFmt;
@@ -146,6 +238,28 @@ begin
     'EFatalAlert is-a EBase');
   CheckTrue(EArgumentTlsLibException.InheritsFrom(EBaseTlsLibException),
     'EArgument is-a EBase');
+end;
+
+procedure TTestExceptions.TestReadTimeoutHierarchy;
+var
+  LTimeout: ETlsReadTimeout;
+begin
+  // both timeouts are stream errors and neither is a truncation, but they are siblings: only a
+  // read timeout is retryable, so a handshake timeout must NOT be caught as one
+  CheckTrue(ETlsHandshakeTimeout.InheritsFrom(ETlsStreamError),
+    'ETlsHandshakeTimeout is-a ETlsStreamError');
+  CheckFalse(ETlsHandshakeTimeout.InheritsFrom(ETlsReadTimeout),
+    'a handshake timeout is not a retryable read timeout');
+  CheckTrue(ETlsReadTimeout.InheritsFrom(ETlsStreamError),
+    'ETlsReadTimeout is-a ETlsStreamError');
+  CheckFalse(ETlsReadTimeout.InheritsFrom(ETlsTransportTruncated),
+    'a read timeout is not a truncation');
+  LTimeout := ETlsReadTimeout.Create('idle');
+  try
+    CheckFalse(LTimeout.HasAlert, 'a read timeout carries no alert');
+  finally
+    LTimeout.Free;
+  end;
 end;
 
 initialization

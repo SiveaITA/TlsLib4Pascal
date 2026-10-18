@@ -19,6 +19,7 @@ interface
 
 uses
   TlpClock,
+  TlpArrayUtilities,
   SysUtils,
   Classes,
 {$IFDEF FPC}
@@ -29,19 +30,15 @@ uses
 {$ENDIF FPC}
   TlpTlsAlert,
   TlpTlsVersion,
-  TlpISecretBuffer,
-  TlpSecretBuffer,
-  TlpCryptoDomainTypes,
   TlpINamedGroup,
-  TlpIRecordProtection,
   TlpNegotiationTypes,
   TlpCipherSuiteRegistry,
   TlpCoreExtensions,
   TlpExtensionContext,
+  TlpExtensionVector,
   TlpITlsExtension,
   TlpExtensionBlockCodec,
   TlpRecordLayer,
-  TlpITlsEngine,
   TlpHandshakeMessage,
   TlpHandshakeMessages,
   TlpIHandshakeChannel,
@@ -50,78 +47,30 @@ uses
   TlpHandshakeEffect,
   TlpHandshakeDriver,
   TlpICertificateTrust,
-  TlpServerName,
   TlpTls13ClientStateMachine,
-  TlsLibTestBase;
+  MockNamedGroups,
+  MockSink,
+  MockRecordInstaller,
+  MockCertificateVerifiers,
+  TlsLibHandshakeTestBase;
 
 type
-  /// <summary>A verifier that trusts any chain (for tests not exercising trust).</summary>
-  TAcceptAllVerifier = class(TInterfacedObject, IServerCertificateVerifier)
-  public
-    function VerifyServerCertificate(const AChain: TArray<TBytes>;
-      const AServerName: TServerName; const AOcspStaple: TBytes;
-      out AValidatedChain: TArray<TBytes>;
-      out AAlert: TTlsAlertDescription): Boolean;
-  end;
-
-  /// <summary>A named group that yields a fixed shared secret (for RFC replay).</summary>
-  TReplayGroup = class(TInterfacedObject, INamedGroup)
-  strict private
-    FShared: TBytes;
-  public
-    constructor Create(const AShared: TBytes);
-    function Code: UInt16;
-    function Name: string;
-    function Kind: TNamedGroupKind;
-    function Composition: TNamedGroupComposition;
-    procedure GenerateKeyPair(out APriv: ISecretBuffer; out APubShare: TBytes);
-    procedure Encapsulate(const APeerPub: TBytes; out ACiphertext: TBytes;
-      out ASharedSecret: ISecretBuffer);
-    procedure Decapsulate(const APriv: ISecretBuffer; const ACiphertext: TBytes;
-      out ASharedSecret: ISecretBuffer);
-    function ValidatePeerShare(const AShare: TBytes): Boolean;
-  end;
-
-  /// <summary>Installs record protection straight onto a record layer (test seam).</summary>
-  TRecordLayerInstaller = class(TInterfacedObject, IRecordEpochInstaller)
-  strict private
-    FLayer: TRecordLayer;
-  public
-    constructor Create(const ALayer: TRecordLayer);
-    procedure InstallReadProtection(const AProtection: IRecordProtection);
-    procedure InstallWriteProtection(const AProtection: IRecordProtection);
-    procedure ArmReadProtectionOnChangeCipherSpec(const AProtection: IRecordProtection);
-    procedure RevertWriteToPlaintext;
-    procedure SetRecordSizeLimit(AOutboundPlaintext, AInboundPlaintext: Int32);
-    procedure SetEarlyDataSkip(AMaxBytes: Int32);
-    procedure SetEarlyDataLimit(AMaxBytes: Int32);
-    procedure SetEarlyReadEpoch(AActive: Boolean);
-  end;
-
-  TSilentSink = class(TInterfacedObject, IHandshakeSink)
-  public
-    procedure OnHandshakeEvent(AEvent: TTlsEventKind);
-    procedure OnAlpnSelected(const AProtocol: string);
-    procedure OnOcspStapleReceived(const AStaple: TBytes);
-    procedure OnHandshakeEstablished;
-    procedure OnHandshakeFailed(AAlert: TTlsAlertDescription);
-  end;
-
-  TTestTls13ClientReplay = class(TTlsLibAlgorithmTestCase)
+  TTestTls13ClientReplay = class(TTlsLibHandshakeTestCase)
   private
     FHs, FSched, FRec: TStringList;
     FLayer: TRecordLayer;
     FDriver: THandshakeDriver;
     FSm: IHandshakeMachine;
+    FDualVersion: Boolean;
     function Msg(const AName: string): TTlsHandshakeMessage;
-    function FindSendHandshake(const AEffects: TArray<THandshakeEffect>): TBytes;
-    /// <summary>The alert of the first Fail effect in AEffects, or False if none.</summary>
-    function FailAlertOf(const AEffects: TArray<THandshakeEffect>;
-      out AAlert: TTlsAlertDescription): Boolean;
-    function Filled(AByte: Byte; ACount: Int32): TBytes;
     procedure StartClient;
     procedure ArrangeThroughCertificate;
     procedure ArrangeThroughCertificateVerify;
+    /// <summary>The RFC 8448 Certificate with a second entry carrying AEntryExtensions.</summary>
+    function CertificateWithIntermediateExtensions(
+      const AEntryExtensions: TBytes): TTlsHandshakeMessage;
+    /// <summary>The RFC 8448 EncryptedExtensions with an empty early_data extension appended.</summary>
+    function EncryptedExtensionsWithEarlyData: TTlsHandshakeMessage;
     /// <summary>Synthesizes a framed ServerHello with the given fields (for hostile-input tests).</summary>
     function BuildServerHello(const ARandom, ASessionIdEcho: TBytes;
       ASuite, ASelectedVersion, AGroup: UInt16;
@@ -129,185 +78,46 @@ type
     /// <summary>Feeds AMessage to a freshly-started client and returns the fatal alert, or False.</summary>
     function ServerHelloAlert(const AMessage: TTlsHandshakeMessage;
       out AAlert: TTlsAlertDescription): Boolean;
-    /// <summary>A minimal well-formed NewSessionTicket message (RFC 8446 4.6.1).</summary>
+    /// <summary>A minimal well-formed NewSessionTicket message (RFC 9846 4.7.1).</summary>
     function BuildNewSessionTicket: TTlsHandshakeMessage;
   protected
     procedure SetUp; override;
-    procedure TearDown; override;
+    function TakeAll(const ALayer: TRecordLayer): TBytes;
   published
     procedure TestRfc8448ClientReplayByteExact;
     procedure TestBadCertificateVerifyFailsClosed;
     procedure TestBadServerFinishedFailsClosed;
     procedure TestServerHelloUnofferedSuiteRejected;
+    procedure TestServerHelloTls12SuiteRejected;
+    procedure TestServerHelloTls13LegacyVersionWithoutSupportedVersionsRejected;
+    procedure TestIntermediateUnsolicitedExtensionRejected;
+    procedure TestIntermediateDuplicateExtensionRejected;
+    procedure TestMalformedForbiddenServerHelloExtensionIsUnsupported;
+    procedure TestUnsolicitedEarlyDataInEncryptedExtensionsRejected;
     procedure TestServerHelloBadSessionIdEchoRejected;
     procedure TestServerHelloWrongVersionRejected;
     procedure TestServerHelloUnofferedGroupRejected;
+    procedure TestServerHelloMissingKeyShareRejected;
     procedure TestServerHelloDowngradeSentinelRejected;
     procedure TestPostHandshakeNewSessionTicketTolerated;
   end;
 
 implementation
 
-{ TAcceptAllVerifier }
-
-function TAcceptAllVerifier.VerifyServerCertificate(const AChain: TArray<TBytes>;
-  const AServerName: TServerName; const AOcspStaple: TBytes;
-  out AValidatedChain: TArray<TBytes>;
-  out AAlert: TTlsAlertDescription): Boolean;
-begin
-  AValidatedChain := AChain;
-  AAlert := TTlsAlertDescription.BadCertificate;
-  Result := True;
-end;
-
-{ TReplayGroup }
-
-constructor TReplayGroup.Create(const AShared: TBytes);
-begin
-  inherited Create;
-  FShared := AShared;
-end;
-
-function TReplayGroup.Code: UInt16;
-begin
-  Result := TNamedGroupCatalog.X25519;
-end;
-
-function TReplayGroup.Name: string;
-begin
-  Result := 'X25519';
-end;
-
-function TReplayGroup.Kind: TNamedGroupKind;
-begin
-  Result := TNamedGroupKind.Ecdhe;
-end;
-
-function TReplayGroup.Composition: TNamedGroupComposition;
-begin
-  Result := TNamedGroupComposition.From(TKeyAgreementAlgorithm.X25519);
-end;
-
-procedure TReplayGroup.GenerateKeyPair(out APriv: ISecretBuffer;
-  out APubShare: TBytes);
-begin
-  APriv := TSecretBuffer.Allocate(32);
-  APubShare := nil;
-  SetLength(APubShare, 32);
-end;
-
-procedure TReplayGroup.Encapsulate(const APeerPub: TBytes; out ACiphertext: TBytes;
-  out ASharedSecret: ISecretBuffer);
-begin
-  ACiphertext := nil;
-  ASharedSecret := TSecretBuffer.From(FShared);
-end;
-
-procedure TReplayGroup.Decapsulate(const APriv: ISecretBuffer;
-  const ACiphertext: TBytes; out ASharedSecret: ISecretBuffer);
-begin
-  ASharedSecret := TSecretBuffer.From(FShared);
-end;
-
-function TReplayGroup.ValidatePeerShare(const AShare: TBytes): Boolean;
-begin
-  Result := True;
-end;
-
-{ TRecordLayerInstaller }
-
-constructor TRecordLayerInstaller.Create(const ALayer: TRecordLayer);
-begin
-  inherited Create;
-  FLayer := ALayer;
-end;
-
-procedure TRecordLayerInstaller.InstallReadProtection(
-  const AProtection: IRecordProtection);
-begin
-  FLayer.SetReadProtection(AProtection);
-end;
-
-procedure TRecordLayerInstaller.InstallWriteProtection(
-  const AProtection: IRecordProtection);
-begin
-  FLayer.SetWriteProtection(AProtection);
-end;
-
-procedure TRecordLayerInstaller.ArmReadProtectionOnChangeCipherSpec(
-  const AProtection: IRecordProtection);
-begin
-  FLayer.ArmReadProtectionOnChangeCipherSpec(AProtection);
-end;
-
-procedure TRecordLayerInstaller.RevertWriteToPlaintext;
-begin
-  FLayer.RevertWriteToPlaintext;
-end;
-
-procedure TRecordLayerInstaller.SetEarlyReadEpoch(AActive: Boolean);
-begin
-  FLayer.SetEarlyReadAccepted(AActive);
-end;
-
-procedure TRecordLayerInstaller.SetRecordSizeLimit(AOutboundPlaintext,
-  AInboundPlaintext: Int32);
-begin
-  FLayer.SetRecordSizeLimit(AOutboundPlaintext, AInboundPlaintext);
-end;
-
-procedure TRecordLayerInstaller.SetEarlyDataSkip(AMaxBytes: Int32);
-begin
-  FLayer.SetEarlyDataSkip(AMaxBytes);
-end;
-
-procedure TRecordLayerInstaller.SetEarlyDataLimit(AMaxBytes: Int32);
-begin
-  // outbound 0-RTT capping is an engine concern; this record-layer seam ignores it
-end;
-
-{ TSilentSink }
-
-procedure TSilentSink.OnHandshakeEvent(AEvent: TTlsEventKind);
-begin
-end;
-
-procedure TSilentSink.OnOcspStapleReceived(const AStaple: TBytes);
-begin
-end;
-
-procedure TSilentSink.OnAlpnSelected(const AProtocol: string);
-begin
-end;
-
-procedure TSilentSink.OnHandshakeEstablished;
-begin
-end;
-
-procedure TSilentSink.OnHandshakeFailed(AAlert: TTlsAlertDescription);
-begin
-end;
-
 { TTestTls13ClientReplay }
 
 procedure TTestTls13ClientReplay.SetUp;
 begin
   inherited SetUp;
-  FHs := LoadVectorFields('Rfc8448/HandshakeMessages.txt');
-  FSched := LoadVectorFields('Rfc8448/Tls13KeySchedule.txt');
-  FRec := LoadVectorFields('Rfc8448/Tls13RecordFinished.txt');
+  FDriver := nil;
+  FSm := nil;
+  FDualVersion := False;
+  FHs := Own<TStringList>(LoadVectorFields('Rfc8448/HandshakeMessages.txt'));
+  FSched := Own<TStringList>(LoadVectorFields('Rfc8448/Tls13KeySchedule.txt'));
+  FRec := Own<TStringList>(LoadVectorFields('Rfc8448/Tls13RecordFinished.txt'));
   // FDriver wraps FLayer, so Own both: the base disposes newest-first, freeing the driver
   // before the layer it references
   FLayer := Own<TRecordLayer>(TRecordLayer.Create);
-end;
-
-procedure TTestTls13ClientReplay.TearDown;
-begin
-  // reassigned in SetUp before use, so a plain free is safe; FLayer/FDriver are Own'd (base frees)
-  FHs.Free;
-  FSched.Free;
-  FRec.Free;
-  inherited TearDown;
 end;
 
 function TTestTls13ClientReplay.Msg(const AName: string): TTlsHandshakeMessage;
@@ -325,45 +135,30 @@ begin
   end;
 end;
 
-function TTestTls13ClientReplay.FindSendHandshake(
-  const AEffects: TArray<THandshakeEffect>): TBytes;
-var
-  LEffect: THandshakeEffect;
-begin
-  Result := nil;
-  for LEffect in AEffects do
-    if LEffect.Kind = THandshakeEffectKind.SendHandshake then
-      Exit(LEffect.Bytes);
-end;
-
-function TTestTls13ClientReplay.FailAlertOf(
-  const AEffects: TArray<THandshakeEffect>;
-  out AAlert: TTlsAlertDescription): Boolean;
-var
-  LEffect: THandshakeEffect;
-begin
-  Result := False;
-  AAlert := TTlsAlertDescription.CloseNotify;
-  for LEffect in AEffects do
-    if LEffect.Kind = THandshakeEffectKind.Fail then
-    begin
-      AAlert := LEffect.Alert;
-      Exit(True);
-    end;
-end;
-
 procedure TTestTls13ClientReplay.StartClient;
 var
   LParams: TClientHandshakeParams;
 begin
   LParams := Default(TClientHandshakeParams);
   LParams.Clock := TSystemClock.Create;
-  LParams.Provider := Provider;
-  LParams.Group := TReplayGroup.Create(DecodeHex(FSched.Values['shared_secret']));
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.Group := TFixedSecretGroup.Create(Filled($00, 32),
+    DecodeHex(FSched.Values['shared_secret'])) as INamedGroup;
   LParams.GroupCode := TNamedGroupCatalog.X25519;
-  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Provider);
   LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
-  LParams.OfferedSuites := TArray<UInt16>.Create(TCipherSuites13.Aes128GcmSha256);
+  if FDualVersion then
+  begin
+    // a dual-version client also offers 1.2 suites, which a 1.3 hello must not select
+    LParams.CipherSuites := TCipherSuiteRegistry.CreateDualVersion(Crypto);
+    LParams.OfferedSuites := TArray<UInt16>.Create(TCipherSuites13.Aes128GcmSha256,
+      TCipherSuites12.EcdheRsaAes128GcmSha256);
+  end
+  else
+  begin
+    LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Crypto);
+    LParams.OfferedSuites := TArray<UInt16>.Create(TCipherSuites13.Aes128GcmSha256);
+  end;
   // the RFC 8448 server signs its CertificateVerify with rsa_pss_rsae_sha256, so the
   // client must have offered it for the verification to be accepted (the ClientHello
   // is overridden, so this does not affect the byte-exact replay)
@@ -371,17 +166,19 @@ begin
     TSignatureSchemes.EcdsaSecp256r1Sha256, TSignatureSchemes.RsaPssRsaeSha256);
   // the RFC 8448 leaf is not part of any test trust store; this replay exercises
   // the message flow, not trust, so accept any chain
-  LParams.CertificateVerifier := TAcceptAllVerifier.Create;
-  LParams.ClientHelloOverride := DecodeHex(FHs.Values['client_hello']);
+  LParams.CertificateVerifier := TFixedVerdictVerifier.CreateAccepting(False)
+    as IServerCertificateVerifier;
   FSm := TTls13ClientStateMachine.Create(LParams);
+  (FSm as ITls13ClientReplay).SetVerbatimClientHello(
+    DecodeHex(FHs.Values['client_hello']));
 
   FDriver := Own<THandshakeDriver>(THandshakeDriver.Create(
     THandshakeChannel.Create(FLayer) as IHandshakeChannel,
-    TRecordLayerInstaller.Create(FLayer) as IRecordEpochInstaller, Provider,
-    TSilentSink.Create as IHandshakeSink));
+    TRecordLayerInstaller.Create(FLayer) as IRecordEpochInstaller, Crypto,
+    TMockHandshakeSink.Create as IHandshakeSink));
 
   FDriver.ApplyAll(FSm.Start);
-  FLayer.TakeOutgoing; // discard the plaintext ClientHello
+  TakeAll(FLayer); // discard the plaintext ClientHello
 end;
 
 procedure TTestTls13ClientReplay.ArrangeThroughCertificate;
@@ -389,10 +186,25 @@ begin
   StartClient;
   FDriver.ApplyAll(FSm.ProcessMessage(Msg('server_hello')));
   // the middlebox change_cipher_spec goes out on the ServerHello, before the client's
-  // encrypted flight (RFC 8446 D.4); discard it so the flight capture stays byte-exact
-  FLayer.TakeOutgoing;
+  // encrypted flight (RFC 9846 E.4); discard it so the flight capture stays byte-exact
+  TakeAll(FLayer);
   FDriver.ApplyAll(FSm.ProcessMessage(Msg('encrypted_ext')));
   FDriver.ApplyAll(FSm.ProcessMessage(Msg('certificate')));
+end;
+
+function TTestTls13ClientReplay.TakeAll(const ALayer: TRecordLayer): TBytes;
+var
+  LChunk: TBytes;
+  LN: Int32;
+begin
+  Result := nil;
+  repeat
+    LChunk := nil;
+    SetLength(LChunk, 4096);
+    LN := ALayer.TakeOutgoing(LChunk, 0);
+    if LN > 0 then
+      Result := ConcatBytes(Result, System.Copy(LChunk, 0, LN));
+  until LN <= 0;
 end;
 
 function TTestTls13ClientReplay.BuildServerHello(const ARandom, ASessionIdEcho: TBytes;
@@ -486,12 +298,12 @@ begin
   LExpectedFinished := ConcatBytes(DecodeHex('14000020'),
     DecodeHex(FSched.Values['client_verify_data']));
   CheckEqualBytes('client Finished verify_data matches RFC 8448',
-    LExpectedFinished, FindSendHandshake(LEffects));
+    LExpectedFinished, FirstSendHandshake(LEffects));
 
   FDriver.ApplyAll(LEffects);
   // the emitted encrypted client Finished record is byte-exact vs RFC 8448
   CheckEqualBytes('the client emits the RFC 8448 client Finished record byte-exact',
-    DecodeHex(FRec.Values['record']), FLayer.TakeOutgoing);
+    DecodeHex(FRec.Values['record']), TakeAll(FLayer));
 end;
 
 procedure TTestTls13ClientReplay.TestBadServerFinishedFailsClosed;
@@ -521,14 +333,6 @@ begin
     'a bad server Finished is decrypt_error');
 end;
 
-function TTestTls13ClientReplay.Filled(AByte: Byte; ACount: Int32): TBytes;
-begin
-  Result := nil;
-  SetLength(Result, ACount);
-  if ACount > 0 then
-    FillChar(Result[0], ACount, AByte);
-end;
-
 procedure TTestTls13ClientReplay.TestServerHelloUnofferedSuiteRejected;
 var
   LAlert: TTlsAlertDescription;
@@ -540,6 +344,170 @@ begin
     'an unoffered cipher suite aborts the handshake');
   CheckTrue(LAlert = TTlsAlertDescription.IllegalParameter,
     'an unoffered cipher suite is illegal_parameter');
+end;
+
+procedure TTestTls13ClientReplay.TestServerHelloTls12SuiteRejected;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  // the dual-version client offered the 1.2 suite, but a 1.3 ServerHello may not select it
+  FDualVersion := True;
+  CheckTrue(ServerHelloAlert(BuildServerHello(Filled($01, 32), nil,
+    TCipherSuites12.EcdheRsaAes128GcmSha256, TlsWireVersionTls13,
+    TNamedGroupCatalog.X25519, Filled($02, 32)), LAlert),
+    'a TLS 1.2 suite in a TLS 1.3 ServerHello aborts the handshake');
+  CheckTrue(LAlert = TTlsAlertDescription.IllegalParameter,
+    'a TLS 1.2 suite in a TLS 1.3 ServerHello is illegal_parameter');
+end;
+
+procedure TTestTls13ClientReplay.TestServerHelloTls13LegacyVersionWithoutSupportedVersionsRejected;
+var
+  LHello: TTlsHandshakeMessage;
+  LAlert: TTlsAlertDescription;
+  LDual: Int32;
+begin
+  // TLS 1.3 is selected only through supported_versions (RFC 9846 4.3.1): a ServerHello that claims
+  // it through legacy_version 0x0304 alone is refused, whether or not the client also offers 1.2
+  // suites
+  for LDual := 0 to 1 do
+  begin
+    FDualVersion := LDual = 1;
+    LHello := BuildServerHello(Filled($01, 32), nil, TCipherSuites13.Aes128GcmSha256, 0,
+      TNamedGroupCatalog.X25519, Filled($02, 32));
+    LHello.Body := System.Copy(LHello.Body);
+    LHello.Raw := System.Copy(LHello.Raw);
+    LHello.Body[1] := $04;
+    LHello.Raw[5] := $04;
+    CheckTrue(ServerHelloAlert(LHello, LAlert),
+      Format('legacy_version 0x0304 without supported_versions aborts (dual-version %d)', [LDual]));
+    CheckTrue(LAlert = TTlsAlertDescription.ProtocolVersion,
+      'it is protocol_version');
+  end;
+end;
+
+function TTestTls13ClientReplay.CertificateWithIntermediateExtensions(
+  const AEntryExtensions: TBytes): TTlsHandshakeMessage;
+var
+  LCert: TTlsCertificate;
+  LFramed: TBytes;
+  LReader: THandshakeMessageReader;
+begin
+  LCert := THandshakeMessages.DecodeCertificate(Msg('certificate').Body);
+  SetLength(LCert.Entries, System.Length(LCert.Entries) + 1);
+  LCert.Entries[High(LCert.Entries)].CertData := LCert.Entries[0].CertData;
+  LCert.Entries[High(LCert.Entries)].Extensions := AEntryExtensions;
+  LFramed := THandshakeFraming.Frame(TTlsHandshakeType.Certificate,
+    THandshakeMessages.EncodeCertificate(LCert));
+  LReader := THandshakeMessageReader.Create;
+  try
+    LReader.Append(LFramed, 0, System.Length(LFramed));
+    LReader.NextMessage(Result);
+  finally
+    LReader.Free;
+  end;
+end;
+
+procedure TTestTls13ClientReplay.TestIntermediateUnsolicitedExtensionRejected;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  StartClient;
+  FDriver.ApplyAll(FSm.ProcessMessage(Msg('server_hello')));
+  TakeAll(FLayer);
+  FDriver.ApplyAll(FSm.ProcessMessage(Msg('encrypted_ext')));
+  // an extension type the client never offered on an intermediate entry (RFC 9846 4.5.1)
+  CheckTrue(FailAlertOf(FSm.ProcessMessage(
+    CertificateWithIntermediateExtensions(DecodeHex('0004aaaa0000'))), LAlert),
+    'an unsolicited extension on an intermediate entry aborts');
+  CheckTrue(LAlert = TTlsAlertDescription.UnsupportedExtension,
+    'an unsolicited intermediate-entry extension is unsupported_extension');
+end;
+
+function TTestTls13ClientReplay.EncryptedExtensionsWithEarlyData: TTlsHandshakeMessage;
+var
+  LBody, LFramed: TBytes;
+  LLength: Int32;
+  LReader: THandshakeMessageReader;
+begin
+  LBody := System.Copy(Msg('encrypted_ext').Body);
+  // the body is a 16-bit extension-block length then the extensions: grow it by the 4-byte
+  // early_data entry (type 42, empty data)
+  LLength := (Int32(LBody[0]) shl 8) or LBody[1];
+  Inc(LLength, 4);
+  LBody[0] := Byte(LLength shr 8);
+  LBody[1] := Byte(LLength);
+  LBody := TArrayUtilities.Concat(LBody, DecodeHex('002a0000'));
+  LFramed := THandshakeFraming.Frame(TTlsHandshakeType.EncryptedExtensions, LBody);
+  LReader := THandshakeMessageReader.Create;
+  try
+    LReader.Append(LFramed, 0, System.Length(LFramed));
+    LReader.NextMessage(Result);
+  finally
+    LReader.Free;
+  end;
+end;
+
+procedure TTestTls13ClientReplay.TestMalformedForbiddenServerHelloExtensionIsUnsupported;
+var
+  LSh: TTlsServerHello;
+  LVec: TExtensionVector;
+  LFramed: TBytes;
+  LReader: THandshakeMessageReader;
+  LMsg: TTlsHandshakeMessage;
+  LAlert: TTlsAlertDescription;
+begin
+  // record_size_limit was offered, but it is not allowed in a TLS 1.3 ServerHello (RFC 9846
+  // 4.2.3); with a body too short to decode the allow-list must still answer first, so the alert
+  // names the forbidden extension rather than the decoder's complaint
+  StartClient;
+  LSh := THandshakeMessages.DecodeServerHello(Msg('server_hello').Body);
+  LVec := TExtensionVector.Parse(LSh.Extensions);
+  LVec.Append(TExtensionEntry.Create(TExtensionTypes.RecordSizeLimit, TBytes.Create($00)));
+  LSh.Extensions := LVec.Encode;
+  LFramed := THandshakeFraming.Frame(TTlsHandshakeType.ServerHello,
+    THandshakeMessages.EncodeServerHello(LSh));
+  LReader := THandshakeMessageReader.Create;
+  try
+    LReader.Append(LFramed, 0, System.Length(LFramed));
+    LReader.NextMessage(LMsg);
+  finally
+    LReader.Free;
+  end;
+  CheckTrue(FailAlertOf(FSm.ProcessMessage(LMsg), LAlert),
+    'a forbidden ServerHello extension aborts');
+  CheckTrue(LAlert = TTlsAlertDescription.UnsupportedExtension,
+    'it is unsupported_extension, not the decoder''s error');
+end;
+
+procedure TTestTls13ClientReplay.TestUnsolicitedEarlyDataInEncryptedExtensionsRejected;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  // a full handshake never offered early_data, so one in EncryptedExtensions is an extension the
+  // client did not solicit (RFC 9846 4.3). The branch for 0-RTT offered but the PSK declined is a
+  // separate guard that needs a resumption rig to reach
+  StartClient;
+  FDriver.ApplyAll(FSm.ProcessMessage(Msg('server_hello')));
+  TakeAll(FLayer);
+  CheckTrue(FailAlertOf(FSm.ProcessMessage(EncryptedExtensionsWithEarlyData), LAlert),
+    'early_data in EncryptedExtensions without an accepted PSK aborts');
+  CheckTrue(LAlert = TTlsAlertDescription.UnsupportedExtension,
+    'it is unsupported_extension');
+end;
+
+procedure TTestTls13ClientReplay.TestIntermediateDuplicateExtensionRejected;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  StartClient;
+  FDriver.ApplyAll(FSm.ProcessMessage(Msg('server_hello')));
+  TakeAll(FLayer);
+  FDriver.ApplyAll(FSm.ProcessMessage(Msg('encrypted_ext')));
+  CheckTrue(FailAlertOf(FSm.ProcessMessage(
+    CertificateWithIntermediateExtensions(DecodeHex('0008aaaa0000aaaa0000'))), LAlert),
+    'a repeated extension on an intermediate entry aborts');
+  CheckTrue(LAlert = TTlsAlertDescription.IllegalParameter,
+    'a repeated intermediate-entry extension is illegal_parameter');
 end;
 
 procedure TTestTls13ClientReplay.TestServerHelloBadSessionIdEchoRejected;
@@ -564,8 +532,8 @@ begin
     TCipherSuites13.Aes128GcmSha256, TlsWireVersionTls12,
     TNamedGroupCatalog.X25519, Filled($02, 32)), LAlert),
     'a non-1.3 selected version aborts the handshake');
-  CheckTrue(LAlert = TTlsAlertDescription.ProtocolVersion,
-    'a non-1.3 selected version is protocol_version');
+  CheckTrue(LAlert = TTlsAlertDescription.UnsupportedExtension,
+    'a non-1.3 selected version is unsupported_extension');
 end;
 
 procedure TTestTls13ClientReplay.TestServerHelloUnofferedGroupRejected;
@@ -579,6 +547,20 @@ begin
     'an unoffered key_share group aborts the handshake');
   CheckTrue(LAlert = TTlsAlertDescription.IllegalParameter,
     'an unoffered key_share group is illegal_parameter');
+end;
+
+procedure TTestTls13ClientReplay.TestServerHelloMissingKeyShareRejected;
+var
+  LAlert: TTlsAlertDescription;
+begin
+  // a 1.3 ServerHello with no key_share for the asymmetric key exchange is missing_extension,
+  // not the wrong-group illegal_parameter (RFC 9846 4.3.8). A nil key exchange omits the extension.
+  CheckTrue(ServerHelloAlert(BuildServerHello(Filled($01, 32), nil,
+    TCipherSuites13.Aes128GcmSha256, TlsWireVersionTls13,
+    TNamedGroupCatalog.X25519, nil), LAlert),
+    'a missing key_share aborts the handshake');
+  CheckTrue(LAlert = TTlsAlertDescription.MissingExtension,
+    'a missing key_share is missing_extension');
 end;
 
 procedure TTestTls13ClientReplay.TestServerHelloDowngradeSentinelRejected;

@@ -24,7 +24,7 @@ uses
 
 type
   /// <summary>
-  /// A pre-shared key the client offers in a ClientHello (RFC 8446 4.2.11). An
+  /// A pre-shared key the client offers in a ClientHello (RFC 9846 4.3.11). An
   /// external PSK carries only its identity, secret and bound hash; a resumption PSK
   /// adds the bound suite, the ticket lifetime, the ticket_age_add obfuscator and its
   /// issue time so the client can compute obfuscated_ticket_age, plus the
@@ -46,9 +46,9 @@ type
     /// <summary>The 0-RTT byte budget the ticket authorized (0 = no early data).</summary>
     function MaxEarlyData: UInt32;
     /// <summary>The ALPN protocol negotiated on the session this PSK resumes (empty when none),
-    /// so an accepted 0-RTT offer can enforce that the server keeps the same protocol (RFC 8446
-    /// 4.2.11); external PSKs carry no ALPN.</summary>
-    function Alpn: string;
+    /// so an accepted 0-RTT offer can enforce that the server keeps the same protocol (RFC 9846
+    /// 4.3.10); external PSKs carry no ALPN.</summary>
+    function Alpn: TBytes;
     /// <summary>Which binder label the PSK uses: Resumption for a ticket, Imported for an
     /// RFC 9258 external PSK. Also selects whether an obfuscated_ticket_age is offered.</summary>
     function BinderKind: TPskBinderKind;
@@ -61,55 +61,94 @@ type
   end;
 
   /// <summary>
-  /// A session a client caches or a server stores for later resumption,
-  /// version-agnostic. A TLS 1.3 session carries the resumption-PSK secret and
-  /// the selected suite / group / ALPN; a TLS 1.2 session carries the master
-  /// secret, the session id and/or ticket, and whether Extended Master Secret was
-  /// in force. Fields for the other version are empty.
+  /// The version-agnostic core of a session a client caches or a server stores for
+  /// later resumption. The version-specific keying material and ticket fields live on
+  /// the <see cref="ITls13ResumableSession" /> / <see cref="ITls12ResumableSession" />
+  /// sub-interfaces; a consumer narrows to the one matching <see cref="Version" />.
   /// </summary>
   IResumableSession = interface(IInterface)
-    ['{7A18C6E4-9D52-4B37-8E60-1F4A2C9B5D08}']
+    ['{49C518BF-2C1E-4F7E-938D-63D653127E11}']
     /// <summary>The protocol version this session was established under.</summary>
     function Version: TTlsVersion;
     /// <summary>The negotiated cipher suite.</summary>
     function CipherSuite: UInt16;
     /// <summary>The hash bound to the suite.</summary>
     function Hash: THashAlgorithm;
-    /// <summary>The TLS 1.3 resumption PSK (nil for a TLS 1.2 session).</summary>
-    function ResumptionSecret: ISecretBuffer;
-    /// <summary>The TLS 1.3 named group used for the establishing (EC)DHE.</summary>
-    function NamedGroup: UInt16;
-    /// <summary>The negotiated ALPN protocol, or the empty string.</summary>
-    function Alpn: string;
+    /// <summary>The negotiated ALPN protocol name, or empty.</summary>
+    function Alpn: TBytes;
     /// <summary>The SNI host_name the session was established under (empty when none). A server
     /// binds it into the ticket and refuses a resumption whose ClientHello names a different host,
     /// so a ticket issued for one virtual host cannot resume as another.</summary>
     function ServerName: string;
-    /// <summary>The opaque ticket that identifies this session on resumption.</summary>
-    function TicketIdentity: TBytes;
     /// <summary>The ticket lifetime hint in seconds.</summary>
     function TicketLifetime: UInt32;
-    /// <summary>The ticket_age_add obfuscator.</summary>
-    function TicketAgeAdd: UInt32;
     /// <summary>Wall-clock issue time in milliseconds.</summary>
     function IssuedAtMillis: UInt64;
-    /// <summary>The 0-RTT byte budget the ticket authorized (0 = no early data).</summary>
-    function MaxEarlyData: UInt32;
-    /// <summary>The TLS 1.2 master secret (nil for a TLS 1.3 session).</summary>
-    function MasterSecret: ISecretBuffer;
-    /// <summary>The TLS 1.2 session id (empty when only a ticket is held).</summary>
-    function SessionId: TBytes;
-    /// <summary>The TLS 1.2 RFC 5077 session ticket (empty when only a session id is held).</summary>
-    function SessionTicket: TBytes;
-    /// <summary>Whether Extended Master Secret (RFC 7627) bound the TLS 1.2 session.</summary>
-    function ExtendedMasterSecret: Boolean;
+    /// <summary>Wall-clock time in milliseconds of the full handshake that authenticated the peer.
+    /// A resumption and every ticket renewed from it carry it unchanged, so a chain of resumptions
+    /// ends seven days after the authentication (RFC 9846 4.7.1), however often it is renewed. A
+    /// custom persistent cache must persist this value and rebuild a session with the long-form
+    /// constructor; the short form restarts the chain at the issue time, and 0 never resumes.</summary>
+    function AuthenticatedAtMillis: UInt64;
     /// <summary>The peer certificate chain verified when this session was established (leaf-first,
     /// as the peer sent it), empty when the peer presented none. A resumed handshake carries no
     /// Certificate, so the endpoint surfaces this stored chain instead; it is NOT re-verified on
     /// resumption.</summary>
     function PeerCertificates: TArray<TBytes>;
-    /// <summary>This session viewed as a TLS 1.3 PSK offer.</summary>
-    function AsPreSharedKey: IPreSharedKey;
+    /// <summary>The opaque scope the issuing server configuration sealed into the ticket to
+    /// partition resumption across configurations that share a ticket key or store; empty when
+    /// none. A server resumes a ticket only when this equals its own configured scope, so a
+    /// configuration never resumes a session another established under a different scope. Compared
+    /// byte-for-byte, never interpreted.</summary>
+    function ResumptionScope: TBytes;
+    /// <summary>The identity of the external pre-shared key (RFC 4279 / RFC 9258) that authenticated
+    /// the session; empty for a certificate-authenticated one. A server resumes it only while that
+    /// identity is still configured with the same secret, so removing or rotating a key ends the
+    /// sessions it authenticated.</summary>
+    function PskIdentity: TBytes;
+    /// <summary>A digest of the secret of the pre-shared key that authenticated the session (empty
+    /// for a certificate session), compared on resumption so a rotated secret does not resume.</summary>
+    function PskBinding: TBytes;
+    /// <summary>The signature scheme (IANA code) that verified the peer's CertificateVerify or
+    /// ServerKeyExchange when the session was established; 0 when the peer did not sign (a
+    /// pre-shared key, no client certificate). Reported again on a resumption.</summary>
+    function PeerSignatureScheme: UInt16;
+  end;
+
+  /// <summary>
+  /// A TLS 1.3 resumable session: the resumption-PSK secret and the ticket fields a
+  /// client needs to offer it as a pre_shared_key. Project it to an
+  /// <see cref="IPreSharedKey" /> with a plain <c>as</c> cast.
+  /// </summary>
+  ITls13ResumableSession = interface(IResumableSession)
+    ['{275BF83D-9B3F-4EF8-928E-816E549D00F4}']
+    /// <summary>The resumption PSK secret.</summary>
+    function ResumptionSecret: ISecretBuffer;
+    /// <summary>The opaque ticket that identifies this session on resumption.</summary>
+    function TicketIdentity: TBytes;
+    /// <summary>The ticket_age_add obfuscator.</summary>
+    function TicketAgeAdd: UInt32;
+    /// <summary>The 0-RTT byte budget the ticket authorized (0 = no early data).</summary>
+    function MaxEarlyData: UInt32;
+  end;
+
+  /// <summary>
+  /// A TLS 1.2 resumable session: the master secret, the session id and/or RFC 5077
+  /// ticket, and whether Extended Master Secret bound it.
+  /// </summary>
+  ITls12ResumableSession = interface(IResumableSession)
+    ['{FC3A7BB5-8D57-4B3F-95C0-F65CAA512328}']
+    /// <summary>The (EC)DHE group (IANA code) of the original handshake, reported again on a
+    /// resumption (an abbreviated handshake has no key exchange); 0 for a plain PSK session.</summary>
+    function NamedGroup: UInt16;
+    /// <summary>The master secret.</summary>
+    function MasterSecret: ISecretBuffer;
+    /// <summary>The session id (empty when only a ticket is held).</summary>
+    function SessionId: TBytes;
+    /// <summary>The RFC 5077 session ticket (empty when only a session id is held).</summary>
+    function SessionTicket: TBytes;
+    /// <summary>Whether Extended Master Secret (RFC 7627) bound the session.</summary>
+    function ExtendedMasterSecret: Boolean;
   end;
 
   /// <summary>
@@ -120,16 +159,28 @@ type
   /// dual-version client never downgrades on resumption when a 1.3 ticket is held.
   /// The cache also remembers, per server, the (EC)DHE group the server last
   /// selected (a key-exchange hint) so the next initial ClientHello can lead with
-  /// that group and avoid a HelloRetryRequest.
+  /// that group and avoid a HelloRetryRequest. The server-identity string a client
+  /// passes may carry the client configuration's opaque scope; an implementer must
+  /// treat the whole identity as opaque so a cache shared by two configurations
+  /// keeps their sessions apart.
   /// </summary>
   ISessionCache = interface(IInterface)
-    ['{2E5B9F30-7C41-4A68-9D12-6B0E3F8C4A57}']
+    ['{2D28B4D4-9ED3-459B-944C-F8A25576F3B4}']
     /// <summary>Caches a session under (server identity, SNI), evicting to stay bounded.</summary>
     procedure Store(const AServerIdentity, AServerName: string;
       const ASession: IResumableSession);
+    /// <summary>Drops ASession if still cached under (server identity, SNI): a connection that
+    /// ended in a fatal alert must not leave the sessions it stored resumable (RFC 5246 7.2.2,
+    /// RFC 9846 6). A session already taken or evicted is not an error. An implementation matches
+    /// the instance Store was given; a persistent one may match by session id or ticket. It must not
+    /// raise: an exception is ignored and the connection's remaining sessions may stay cached.</summary>
+    procedure Remove(const AServerIdentity, AServerName: string;
+      const ASession: IResumableSession);
     /// <summary>Pops one cached session for (server identity, SNI), preferring a TLS 1.3
-    /// session over a TLS 1.2 one; False if none.</summary>
-    function Take(const AServerIdentity, AServerName: string;
+    /// session over a TLS 1.2 one; False if none. A session whose ticket lifetime has already
+    /// elapsed at ANowMillis (Unix ms) is dropped rather than returned, so a stale head never
+    /// shadows a live ticket behind it; a zero lifetime is left to the caller's version rule.</summary>
+    function Take(const AServerIdentity, AServerName: string; ANowMillis: UInt64;
       out ASession: IResumableSession): Boolean;
     /// <summary>Remembers the (EC)DHE group the server selected for this server, so the
     /// next initial ClientHello can key_share it up front and skip a HelloRetryRequest.</summary>
@@ -145,8 +196,9 @@ type
   /// <summary>
   /// A server-side, bounded, stateful store of resumable sessions. A stored
   /// session is addressed by an opaque handle (the ticket blob or a TLS 1.2
-  /// session id); retrieval is single-use, which is what enforces true one-time
-  /// tickets and backs 0-RTT anti-replay.
+  /// session id). Take is single-use, which is what enforces true one-time tickets and
+  /// backs 0-RTT anti-replay; Peek reads without removing, so a handle that is merely
+  /// named in a ClientHello is not used up before the client proves it holds the secret.
   /// </summary>
   ISessionStore = interface(IInterface)
     ['{9C4A7E18-3D60-4B95-8A27-5E1B0F6C2D49}']
@@ -154,6 +206,8 @@ type
     function Put(const ASession: IResumableSession): TBytes;
     /// <summary>Stores a session under a caller-chosen id (e.g. a TLS 1.2 session id).</summary>
     procedure PutWithId(const AId: TBytes; const ASession: IResumableSession);
+    /// <summary>Returns the session for AId without removing it; False if absent.</summary>
+    function Peek(const AId: TBytes; out ASession: IResumableSession): Boolean;
     /// <summary>Removes and returns the session for AId; False if absent (single-use).</summary>
     function Take(const AId: TBytes; out ASession: IResumableSession): Boolean;
     /// <summary>Removes the session for AId if present.</summary>
@@ -170,6 +224,9 @@ type
   /// opening tickets. Each key is tagged by a fixed-length name carried in the
   /// clear at the front of a ticket so the opener can select it. Rotation
   /// promotes a fresh current key and retires the oldest beyond the window.
+  /// Each key must be a 32-byte AES-256-GCM key: that is the fixed AEAD the STEK
+  /// ticket strategy seals under, and a key of any other length is declined at seal/open
+  /// (a wrong key just falls the connection back to a full handshake, never a fault).
   /// </summary>
   ISessionTicketKeyManager = interface(IInterface)
     ['{5F1C8A24-6B39-4D70-9E58-0A2D7C4B6F13}']
@@ -177,10 +234,23 @@ type
     function CurrentKey(out AKeyName: TBytes; out AKey: ISecretBuffer): Boolean;
     /// <summary>The decrypt key for AKeyName within the accepted window; False if unknown/retired.</summary>
     function KeyByName(const AKeyName: TBytes; out AKey: ISecretBuffer): Boolean;
-    /// <summary>Promotes a fresh current key and retires the oldest beyond the window.</summary>
-    procedure Rotate;
     /// <summary>The fixed length in bytes of a key name.</summary>
     function KeyNameLength: Int32;
+  end;
+
+  /// <summary>A key manager that mints its own keys, so it can promote a fresh one on demand.</summary>
+  IRotatingTicketKeyManager = interface(ISessionTicketKeyManager)
+    ['{327AF39F-21E8-430E-B2C8-04FBF8E210C1}']
+    /// <summary>Promotes a fresh current key and retires the oldest beyond the window.</summary>
+    procedure Rotate;
+  end;
+
+  /// <summary>A key manager whose keys come from outside (a shared STEK across a server fleet).</summary>
+  IFleetTicketKeyManager = interface(ISessionTicketKeyManager)
+    ['{A48176EB-BBCD-49A9-BF06-69CBEB2D31BD}']
+    /// <summary>Installs a key as the current one; it also enters the decrypt window. The name and
+    /// key must be the manager's fixed lengths (KeyNameLength and an AES-256 key) or this raises.</summary>
+    procedure InstallKey(const AName: TBytes; const AKey: ISecretBuffer);
   end;
 
   /// <summary>
@@ -189,18 +259,26 @@ type
   /// session under a rotating key (no server storage); the stateful store strategy keeps
   /// opaque handles into an <see cref="ISessionStore" /> (true single-use). Open returns
   /// False on any parse/verify/lookup failure, so the server falls through to a full
-  /// handshake rather than failing.
+  /// handshake rather than failing. Open only recovers the session: a stateful ticket stays
+  /// usable until Consume, which the server calls once it has committed to resuming from it, so
+  /// an unauthenticated ClientHello that merely names a ticket cannot use it up.
   /// </summary>
   ISessionTicketStrategy = interface(IInterface)
     ['{8B2F4D07-6A19-4C53-9E84-3D5A0C7B62F1}']
     /// <summary>Produces the opaque ticket that identifies ASession on resumption.</summary>
     function Seal(const ASession: IResumableSession): TBytes;
-    /// <summary>Recovers the session ATicket identifies; False on any failure.</summary>
+    /// <summary>Recovers the session ATicket identifies without using it up; False on any
+    /// failure.</summary>
     function Open(const ATicket: TBytes; out ASession: IResumableSession): Boolean;
+    /// <summary>Marks ATicket used. False when it was already used (a stateful ticket is
+    /// single-use, which backs 0-RTT anti-replay), so the caller declines resumption; a stateless
+    /// ticket is always True. A server also calls it to withdraw the tickets a connection minted
+    /// once that connection ends in a fatal alert.</summary>
+    function Consume(const ATicket: TBytes): Boolean;
   end;
 
   /// <summary>
-  /// A bounded anti-replay register for 0-RTT early data (RFC 8446 8). It records
+  /// A bounded anti-replay register for 0-RTT early data (RFC 9846 8). It records
   /// a per-attempt unique value (accepting it once) and rejects any later attempt
   /// carrying the same value within its freshness window. Bounded by a
   /// configurable cap; entries past their expiry are pruned.

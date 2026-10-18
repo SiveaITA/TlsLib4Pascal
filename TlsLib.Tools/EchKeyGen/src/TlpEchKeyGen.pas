@@ -21,11 +21,25 @@ interface
 uses
   SysUtils,
   Classes,
+{$IF DEFINED(FPC) AND DEFINED(UNIX)}
+  BaseUnix,
+{$ELSEIF DEFINED(POSIX)}
+  Posix.SysStat,
+  Posix.Fcntl,
+  Posix.Unistd,
+  Posix.Errno,
+{$ELSEIF DEFINED(MSWINDOWS)}
+  Windows,
+{$ELSE}
+  {$MESSAGE ERROR 'the ECH key generator needs a Windows or POSIX target'}
+{$IFEND}
   TlpEchConfig,
   TlpCryptoDomainTypes,
+  TlpSecureMemory,
   TlpPem,
   TlpICryptoProvider,
   TlpDefaultCryptoProvider,
+  TlpInMemoryEchKeyStore,
   TlpDataEncoding,
   // this is a standalone tool, not part of the library, so it may reach CryptoLib
   // directly (like RootGen): the KEM produces the key pair and PKCS#8 encoding the
@@ -45,15 +59,16 @@ type
     Pem: TBytes;
     /// <summary>The raw ECHConfigList a client uses as its ECH configuration.</summary>
     EchConfigList: TBytes;
-    /// <summary>The DNS presentation line publishing the ECHConfigList in an HTTPS
-    /// record's "ech" SvcParam.</summary>
+    /// <summary>The DNS presentation line publishing the ECHConfigList in the origin's HTTPS
+    /// record "ech" SvcParam (the name clients connect to, RFC 9460 2.3 / 9; the "ech" key,
+    /// RFC 9848 sec. 3).</summary>
     DnsLine: string;
   end;
 
   /// <summary>
   /// Generates an Encrypted Client Hello key pair and the artifacts an operator needs:
   /// the RFC 9934 PEM for the server, the ECHConfigList for the client, and the DNS
-  /// line to publish (RFC 9849). A standalone tool, so it reaches HPKE key generation
+  /// line to publish (RFC 9848). A standalone tool, so it reaches HPKE key generation
   /// and PKCS#8 encoding through CryptoLib directly; the byte formats it emits are the
   /// ones the library's ECH server store and client policy consume.
   /// </summary>
@@ -64,70 +79,150 @@ type
     class function MapAead(const AName: string; out AAead: UInt16): Boolean; static;
     class function ParseSuite(const AText: string;
       out AKem, AKdf, AAead: UInt16): Boolean; static;
-    class procedure WriteFile(const APath: string; const AData: TBytes); static;
+    /// <summary>Creates APath exclusively and owner-only. Returns 0 and the handle, or the OS
+    /// error.</summary>
+    class function CreateKeyFile(const APath: string; out AHandle: THandle): Integer; static;
+    /// <summary>Closes a CreateKeyFile handle. Returns 0 or the OS error; a delayed write failure
+    /// surfaces here.</summary>
+    class function CloseKeyFile(AHandle: THandle): Integer; static;
+    /// <summary>Whether a CreateKeyFile error means the path is already taken.</summary>
+    class function IsExistsError(AError: Integer): Boolean; static;
   public
     /// <summary>
     /// Generates a single-config ECHConfigList for public_name APublicName under the
     /// HPKE suite (AKem, AKdf, AAead) with the operator-chosen config id AConfigId and
-    /// the padding hint AMaximumNameLength. AProvider frames the PEM (RFC 7468) so the
-    /// output matches what the server store reads. Raises for an unsupported KEM.
+    /// the padding hint AMaximumNameLength. ACryptoProvider frames the PEM (RFC 7468) so the
+    /// output matches what the server store reads. The DNS line is published at AOrigin
+    /// (the name clients connect to). Raises for an HPKE suite the provider cannot instantiate,
+    /// an invalid name, or a PEM that does not load back through the server key store; on a raise
+    /// no PEM is handed out and the in-memory private-key copies are wiped.
     /// </summary>
-    class function Generate(const AProvider: ICryptoProvider;
-      const APublicName: string; AConfigId: Byte; AKem, AKdf, AAead: UInt16;
+    class function Generate(const ACryptoProvider: ICryptoProvider;
+      const APublicName, AOrigin: string; AConfigId: Byte; AKem, AKdf, AAead: UInt16;
       AMaximumNameLength: Byte): TEchKeyGenResult; static;
+    /// <summary>
+    /// The maximum_name_length the command line uses when -max_name_len is absent: the longer of
+    /// 64 (a DNS label is at most 63) and the origin's length, so the one name the tool knows is
+    /// always fully padded (RFC 9849 sec. 6.1.3), capped at the field's 255.
+    /// </summary>
+    class function DefaultMaximumNameLength(const AOrigin: string): Byte; static;
     /// <summary>
     /// The command-line entry point: parses the arguments, generates the key material,
     /// writes the PEM to the -out file, and prints the DNS line. Returns a process exit
     /// code (0 on success). Both the Delphi and FPC program wrappers call this.
     /// </summary>
     class function RunConsole: Integer; static;
+    /// <summary>Writes AData to APath. The file is created exclusively, so an existing file or
+    /// symlink at APath is refused rather than overwritten or written through, and a failed write
+    /// leaves no file behind. The file is owner-only from creation, so the private key is never
+    /// readable by others: mode 0600 on POSIX, and on Windows a protected access list granting only
+    /// the file's owner. Public so a test can assert it.</summary>
+    class procedure WritePrivateFile(const APath: string; const AData: TBytes); static;
   end;
 
 implementation
 
+{$IFDEF MSWINDOWS}
+// declared by neither compiler's Windows unit
+function ConvertStringSecurityDescriptorToSecurityDescriptorW(AText: PWideChar; ARevision: DWORD;
+  out ADescriptor: Pointer; ASize: PDWORD): LongBool; stdcall;
+  external 'advapi32.dll' name 'ConvertStringSecurityDescriptorToSecurityDescriptorW';
+{$ENDIF MSWINDOWS}
+
+const
+  DefaultNameFloor = Int32(64);
+
+resourcestring
+  SKeyFileExists = 'the private key file "%s" already exists; it is never overwritten or ' +
+    'written through a symlink';
+  SKeyFileCreateFailed = 'cannot create the private key file "%s": %s';
+  SKeyFileWriteFailed = 'cannot write the private key file "%s": %s';
+
 { TEchKeyGenerator }
 
-class function TEchKeyGenerator.Generate(const AProvider: ICryptoProvider;
-  const APublicName: string; AConfigId: Byte; AKem, AKdf, AAead: UInt16;
+class function TEchKeyGenerator.Generate(const ACryptoProvider: ICryptoProvider;
+  const APublicName, AOrigin: string; AConfigId: Byte; AKem, AKdf, AAead: UInt16;
   AMaximumNameLength: Byte): TEchKeyGenResult;
 var
   LKem: IHpkeKem;
   LPair: IAsymmetricCipherKeyPair;
   LPrivateInfo: IPrivateKeyInfo;
-  LPublicKey, LPkcs8: TBytes;
+  LPublicKey, LPkcs8, LPem: TBytes;
   LSuite: TEchCipherSuite;
   LConfig: TEchConfig;
   LBlocks: TArray<TPemBlock>;
   LPublicNameBytes: TBytes;
+  LOrigin: string;
 begin
   LPublicNameBytes := TEncoding.ASCII.GetBytes(APublicName);
   if not TEchConfig.IsValidPublicName(LPublicNameBytes) then
     raise EArgumentException.Create('the public_name is not a valid LDH host name');
+  // the DNS record is queried at the origin (the name a client connects to and puts in the
+  // inner SNI), not the public_name; validate it as an LDH host, tolerating one trailing dot
+  LOrigin := AOrigin;
+  if (LOrigin <> '') and (LOrigin[System.Length(LOrigin)] = '.') then
+    LOrigin := System.Copy(LOrigin, 1, System.Length(LOrigin) - 1);
+  if not TEchConfig.IsValidPublicName(TEncoding.ASCII.GetBytes(LOrigin)) then
+    raise EArgumentException.Create('the origin is not a valid LDH host name');
+  // the tool's suite vocabulary is the provider's: a config the library could neither serve nor
+  // offer (an unknown KEM, an export-only AEAD) must fail here, not at server start-up after the
+  // DNS record is already published
+  if ACryptoProvider.Hpke.Suite(AKem, AKdf, AAead) = nil then
+    raise EArgumentException.Create('the HPKE suite is not one this provider can serve');
   LKem := TDhKem.Create(THpkeKemId(AKem)) as IHpkeKem;
   LPair := LKem.GeneratePrivateKey();
   LPublicKey := LKem.SerializePublicKey(LPair.&Public);
   LPrivateInfo := TPrivateKeyInfoFactory.CreatePrivateKeyInfo(LPair.&Private);
   LPkcs8 := LPrivateInfo.GetDerEncoded();
+  // wipe the private-key DER, its PEM block and an unreleased PEM; Result.Pem is set last
+  try
+    LSuite.KdfId := AKdf;
+    LSuite.AeadId := AAead;
+    LConfig := TEchConfig.Build(TEchConfig.SupportedVersion, AConfigId, AKem,
+      LPublicKey, TArray<TEchCipherSuite>.Create(LSuite), AMaximumNameLength,
+      LPublicNameBytes, nil);
+    Result.EchConfigList := TEchConfigList.Encode(TArray<TEchConfig>.Create(LConfig));
 
-  LSuite.KdfId := AKdf;
-  LSuite.AeadId := AAead;
-  LConfig := TEchConfig.Build(TEchConfig.SupportedVersion, AConfigId, AKem,
-    LPublicKey, TArray<TEchCipherSuite>.Create(LSuite), AMaximumNameLength,
-    LPublicNameBytes, nil);
-  Result.EchConfigList := TEchConfigList.Encode(TArray<TEchConfig>.Create(LConfig));
+    LBlocks := nil;
+    SetLength(LBlocks, 2);
+    LBlocks[0].PemType := 'PRIVATE KEY';
+    LBlocks[0].Content := LPkcs8;
+    LBlocks[1].PemType := 'ECHCONFIG';
+    LBlocks[1].Content := Result.EchConfigList;
+    LPem := TPem.WriteBlocks(LBlocks);
 
-  LBlocks := nil;
-  SetLength(LBlocks, 2);
-  LBlocks[0].PemType := 'PRIVATE KEY';
-  LBlocks[0].Content := LPkcs8;
-  LBlocks[1].PemType := 'ECHCONFIG';
-  LBlocks[1].Content := Result.EchConfigList;
-  Result.Pem := TPem.WriteBlocks(LBlocks);
+    // load the PEM back through the server key store before it is handed out: the PKCS#8 encoding,
+    // the config and the key pair must round-trip exactly as a server will read them
+    TInMemoryEchKeyStore.FromPem(LPem, ACryptoProvider);
 
-  // an HTTPS record in ServiceMode (priority 1) with the ECHConfigList in the "ech"
-  // SvcParam, base64 as the presentation format expects
-  Result.DnsLine := APublicName + '. HTTPS 1 . ech="' +
-    TDataEncoding.Base64Encode(Result.EchConfigList) + '"';
+    // an HTTPS record in ServiceMode (priority 1) with the ECHConfigList in the "ech"
+    // SvcParam, base64 as the presentation format expects. It is published at the origin the
+    // client connects to; the public_name lives only inside the ECHConfig, as the outer SNI.
+    Result.DnsLine := LOrigin + '. HTTPS 1 . ech="' +
+      TDataEncoding.Base64Encode(Result.EchConfigList) + '"';
+    // handed to the caller only after every step that can fail; the local is then nil
+    Result.Pem := LPem;
+    LPem := nil;
+  finally
+    TSecureMemory.WipeBytes(LPem);
+    TSecureMemory.WipeBytes(LPkcs8);
+    if System.Length(LBlocks) > 0 then
+      TSecureMemory.WipeBytes(LBlocks[0].Content);
+  end;
+end;
+
+class function TEchKeyGenerator.DefaultMaximumNameLength(const AOrigin: string): Byte;
+var
+  LLength: Int32;
+begin
+  LLength := System.Length(AOrigin);
+  if (LLength > 0) and (AOrigin[LLength] = '.') then
+    Dec(LLength);
+  if LLength < DefaultNameFloor then
+    LLength := DefaultNameFloor;
+  if LLength > High(Byte) then
+    LLength := High(Byte);
+  Result := Byte(LLength);
 end;
 
 class function TEchKeyGenerator.MapKem(const AName: string;
@@ -136,8 +231,6 @@ begin
   Result := True;
   if AName = 'x25519' then
     AKem := THpkeKem.DHKEM_X25519_HKDF_SHA256
-  else if AName = 'x448' then
-    AKem := THpkeKem.DHKEM_X448_HKDF_SHA512
   else if AName = 'p256' then
     AKem := THpkeKem.DHKEM_P256_HKDF_SHA256
   else if AName = 'p384' then
@@ -186,34 +279,137 @@ begin
     MapKdf(LParts[1], AKdf) and MapAead(LParts[2], AAead);
 end;
 
-class procedure TEchKeyGenerator.WriteFile(const APath: string;
+class function TEchKeyGenerator.CreateKeyFile(const APath: string;
+  out AHandle: THandle): Integer;
+var
+{$IF DEFINED(FPC) AND DEFINED(UNIX)}
+  LFd: LongInt;
+{$ELSEIF DEFINED(POSIX)}
+  LFd: Integer;
+  LPath: UTF8String;
+{$ELSE}
+  LPath: UnicodeString;
+  LHandle: THandle;
+  LAttributes: TSecurityAttributes;
+{$IFEND}
+begin
+  AHandle := 0;
+{$IF DEFINED(FPC) AND DEFINED(UNIX)}
+  // O_CREAT|O_EXCL refuses an existing file and, per POSIX, a symlink at the path (even a dangling
+  // one), and the 0600 mode is set by the create itself, so the key is never briefly readable
+  // by others
+  LFd := FpOpen(APath, O_WRONLY or O_CREAT or O_EXCL, S_IRUSR or S_IWUSR);
+  if LFd < 0 then
+    Exit(fpgeterrno);
+  AHandle := THandle(LFd);
+{$ELSEIF DEFINED(POSIX)}
+  LPath := UTF8String(APath);
+  LFd := open(PAnsiChar(LPath), O_WRONLY or O_CREAT or O_EXCL, S_IRUSR or S_IWUSR);
+  if LFd < 0 then
+    Exit(GetLastError);
+  AHandle := THandle(LFd);
+{$ELSE}
+  // CREATE_NEW refuses an existing file. The create applies a protected access list (nothing
+  // inherited from the directory) whose one entry gives the file's owner full access, so the key
+  // is never briefly readable by others; if the list cannot be built no file is made
+  LAttributes := Default(TSecurityAttributes);
+  LAttributes.nLength := SizeOf(LAttributes);
+  if not ConvertStringSecurityDescriptorToSecurityDescriptorW('D:P(A;;FA;;;OW)', 1,
+    LAttributes.lpSecurityDescriptor, nil) then
+    Exit(Integer(GetLastError));
+  try
+    LPath := UnicodeString(APath);
+    LHandle := CreateFileW(PWideChar(LPath), GENERIC_WRITE, 0, @LAttributes, CREATE_NEW,
+      FILE_ATTRIBUTE_NORMAL, 0);
+    if LHandle = INVALID_HANDLE_VALUE then
+      Exit(Integer(GetLastError));
+  finally
+    LocalFree(HLOCAL(LAttributes.lpSecurityDescriptor));
+  end;
+  AHandle := LHandle;
+{$IFEND}
+  Result := 0;
+end;
+
+class function TEchKeyGenerator.CloseKeyFile(AHandle: THandle): Integer;
+begin
+{$IF DEFINED(FPC) AND DEFINED(UNIX)}
+  if FpClose(AHandle) < 0 then
+    Exit(fpgeterrno);
+{$ELSEIF DEFINED(POSIX)}
+  if __close(Integer(AHandle)) < 0 then
+    Exit(GetLastError);
+{$ELSE}
+  if not CloseHandle(AHandle) then
+    Exit(Integer(GetLastError));
+{$IFEND}
+  Result := 0;
+end;
+
+class function TEchKeyGenerator.IsExistsError(AError: Integer): Boolean;
+begin
+{$IF DEFINED(FPC) AND DEFINED(UNIX)}
+  Result := AError = ESysEEXIST;
+{$ELSEIF DEFINED(POSIX)}
+  Result := AError = EEXIST;
+{$ELSE}
+  Result := AError = ERROR_FILE_EXISTS;
+{$IFEND}
+end;
+
+class procedure TEchKeyGenerator.WritePrivateFile(const APath: string;
   const AData: TBytes);
 var
-  LStream: TFileStream;
+  LHandle: THandle;
+  LError: Integer;
+  LStream: THandleStream;
 begin
-  LStream := TFileStream.Create(APath, fmCreate);
+  LError := CreateKeyFile(APath, LHandle);
+  if LError <> 0 then
+  begin
+    if IsExistsError(LError) then
+      raise EInOutError.CreateResFmt(@SKeyFileExists, [APath]);
+    raise EInOutError.CreateResFmt(@SKeyFileCreateFailed, [APath, SysErrorMessage(LError)]);
+  end;
+  // a failed write leaves nothing behind: a partial key file would block every rerun
   try
-    if System.Length(AData) > 0 then
-      LStream.WriteBuffer(AData[0], System.Length(AData));
-  finally
-    LStream.Free;
+    LStream := THandleStream.Create(LHandle);
+    try
+      if System.Length(AData) > 0 then
+        LStream.WriteBuffer(AData[0], System.Length(AData));
+    finally
+      LStream.Free;
+    end;
+  except
+    CloseKeyFile(LHandle);
+    SysUtils.DeleteFile(APath);
+    raise;
+  end;
+  // close can report a delayed write error
+  LError := CloseKeyFile(LHandle);
+  if LError <> 0 then
+  begin
+    SysUtils.DeleteFile(APath);
+    raise EInOutError.CreateResFmt(@SKeyFileWriteFailed, [APath, SysErrorMessage(LError)]);
   end;
 end;
 
 class function TEchKeyGenerator.RunConsole: Integer;
 var
-  LProvider: ICryptoProvider;
-  LPublicName, LOutPath, LSuite, LArg, LValue: string;
+  LCrypto: ICryptoProvider;
+  LPublicName, LOrigin, LOutPath, LSuite, LArg, LValue: string;
   LKem, LKdf, LAead: UInt16;
   LConfigId, LMaxNameLen: Int32;
-  LHasConfigId: Boolean;
+  LHasConfigId, LHasMaxNameLen: Boolean;
   LI: Int32;
   LResult: TEchKeyGenResult;
 begin
   LPublicName := '';
+  LOrigin := '';
   LOutPath := '';
   LSuite := 'x25519,hkdf-sha256,aes-128-gcm';
   LMaxNameLen := 0;
+  LHasMaxNameLen := False;
   LConfigId := 0;
   LHasConfigId := False;
   LI := 1;
@@ -226,12 +422,17 @@ begin
       LValue := '';
     if LArg = '-public_name' then
       LPublicName := LValue
+    else if LArg = '-origin' then
+      LOrigin := LValue
     else if LArg = '-out' then
       LOutPath := LValue
     else if LArg = '-suite' then
       LSuite := LValue
     else if LArg = '-max_name_len' then
-      LMaxNameLen := StrToIntDef(LValue, -1)
+    begin
+      LMaxNameLen := StrToIntDef(LValue, -1);
+      LHasMaxNameLen := True;
+    end
     else if LArg = '-config_id' then
     begin
       LConfigId := StrToIntDef(LValue, -1);
@@ -245,11 +446,13 @@ begin
     Inc(LI, 2);
   end;
 
-  if (LPublicName = '') or (LOutPath = '') then
+  if (LPublicName = '') or (LOrigin = '') or (LOutPath = '') then
   begin
-    WriteLn('usage: EchKeyGen -public_name <name> -out <file.pem> ' +
+    WriteLn('usage: EchKeyGen -public_name <name> -origin <name> -out <file.pem> ' +
       '[-suite kem,kdf,aead] [-max_name_len N] [-config_id N]');
-    WriteLn('  kem:  x25519 | x448 | p256 | p384 | p521');
+    WriteLn('  -max_name_len: default is the longer of 64 and the -origin length; 0 = longest ' +
+      'name unknown: no SNI padding, only the 32-byte rounding (RFC 9849 6.1.3)');
+    WriteLn('  kem:  x25519 | p256 | p384 | p521');
     WriteLn('  kdf:  hkdf-sha256 | hkdf-sha384 | hkdf-sha512');
     WriteLn('  aead: aes-128-gcm | aes-256-gcm | chacha20-poly1305');
     Exit(1);
@@ -264,6 +467,8 @@ begin
     WriteLn('error: -max_name_len must be between 0 and 255');
     Exit(2);
   end;
+  if not LHasMaxNameLen then
+    LMaxNameLen := DefaultMaximumNameLength(LOrigin);
   if LHasConfigId and ((LConfigId < 0) or (LConfigId > 255)) then
   begin
     WriteLn('error: -config_id must be between 0 and 255');
@@ -271,16 +476,21 @@ begin
   end;
 
   try
-    LProvider := TDefaultCryptoProvider.Create as ICryptoProvider;
+    LCrypto := TDefaultCryptoProvider.Create as ICryptoProvider;
     // the config id is an operator-chosen hint; default to a random byte (the server
     // matches an incoming ECH by it, so it need only be stable, not secret)
     if not LHasConfigId then
-      LConfigId := LProvider.Primitives.GetRandom.GenerateBytes(1)[0];
-    LResult := Generate(LProvider, LPublicName, Byte(LConfigId), LKem, LKdf, LAead,
+      LConfigId := LCrypto.Primitives.GetRandom.GenerateBytes(1)[0];
+    LResult := Generate(LCrypto, LPublicName, LOrigin, Byte(LConfigId), LKem, LKdf, LAead,
       Byte(LMaxNameLen));
-    WriteFile(LOutPath, LResult.Pem);
-    WriteLn(LResult.DnsLine);
-    Result := 0;
+    try
+      WritePrivateFile(LOutPath, LResult.Pem);
+      WriteLn(LResult.DnsLine);
+      Result := 0;
+    finally
+      // the PEM carries the private key; drop the in-memory copy once written to disk
+      TSecureMemory.WipeBytes(LResult.Pem);
+    end;
   except
     on E: Exception do
     begin

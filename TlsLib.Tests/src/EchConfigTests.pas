@@ -28,6 +28,7 @@ uses
 {$ENDIF FPC}
   TlpCryptoDomainTypes,
   TlpICryptoProvider,
+  TlpIKeyExchangePrivateKey,
   TlpTlsLibExceptions,
   TlpEchConfig,
   TlsLibTestBase;
@@ -52,7 +53,6 @@ type
     function Usable(const AConfig: TEchConfig): Boolean;
   protected
     procedure SetUp; override;
-    procedure TearDown; override;
   published
     procedure TestParseRealConfig;
     procedure TestParseEncodeRoundTrip;
@@ -64,6 +64,7 @@ type
     procedure TestSkipUnknownMandatoryExtension;
     procedure TestOptionalExtensionIsUsable;
     procedure TestSkipDuplicateExtension;
+    procedure TestDuplicateCheckAcrossWordBoundaries;
     procedure TestBadPublicNames;
     procedure TestGoodPublicNames;
     procedure TestMalformedListRaises;
@@ -78,13 +79,7 @@ implementation
 procedure TTestEchConfig.SetUp;
 begin
   inherited SetUp;
-  FVec := LoadVectorFields('Certs/Ech.txt');
-end;
-
-procedure TTestEchConfig.TearDown;
-begin
-  FVec.Free;
-  inherited TearDown;
+  FVec := Own<TStringList>(LoadVectorFields('Certs/Ech.txt'));
 end;
 
 function TTestEchConfig.ConfigList: TBytes;
@@ -94,11 +89,11 @@ end;
 
 function TTestEchConfig.Pk32: TBytes;
 var
-  LI: Int32;
+  LKey: IKeyExchangePrivateKey;
 begin
-  SetLength(Result, 32);
-  for LI := 0 to 31 do
-    Result[LI] := Byte(LI + 1);
+  // a real public key: arbitrary bytes are not always a valid one
+  Crypto.Primitives.CreateKeyAgreement(TKeyAgreementAlgorithm.X25519).GenerateKeyPair(LKey,
+    Result);
 end;
 
 function TTestEchConfig.Ascii(const AText: string): TBytes;
@@ -127,7 +122,7 @@ end;
 
 function TTestEchConfig.Usable(const AConfig: TEchConfig): Boolean;
 begin
-  Result := AConfig.IsUsable(Provider);
+  Result := AConfig.IsUsable(Crypto);
 end;
 
 procedure TTestEchConfig.TestParseRealConfig;
@@ -197,7 +192,7 @@ begin
   LGood := ConfigWith(THpkeKem.DHKEM_X25519_HKDF_SHA256,
     OneSuite(THpkeKdf.HKDF_SHA256, THpkeAead.AES_128_GCM), 'cover.example', nil);
   LList := TArray<TEchConfig>.Create(LStale, LGood);
-  CheckTrue(TEchConfigList.TrySelect(LList, Provider, LChosen, LSuite),
+  CheckTrue(TEchConfigList.TrySelect(LList, Crypto, LChosen, LSuite),
     'a usable config is selected');
   CheckEquals(Integer(TEchConfig.SupportedVersion), Integer(LChosen.Version),
     'the supported-version config was chosen');
@@ -234,7 +229,7 @@ begin
   LSuites[1].AeadId := THpkeAead.AES_128_GCM;
   LConfig := ConfigWith(THpkeKem.DHKEM_X25519_HKDF_SHA256, LSuites,
     'cover.example', nil);
-  CheckTrue(LConfig.TrySelectSuite(Provider, LSuite), 'a supported suite exists');
+  CheckTrue(LConfig.TrySelectSuite(Crypto, LSuite), 'a supported suite exists');
   CheckEquals(Integer(THpkeAead.AES_128_GCM), Integer(LSuite.Aead),
     'the real AEAD was selected, not export-only');
 end;
@@ -273,6 +268,34 @@ begin
   CheckFalse(Usable(ConfigWith(THpkeKem.DHKEM_X25519_HKDF_SHA256,
     OneSuite(THpkeKdf.HKDF_SHA256, THpkeAead.AES_128_GCM), 'cover.example', LExts)),
     'a duplicate extension type makes the config unusable');
+end;
+
+procedure TTestEchConfig.TestDuplicateCheckAcrossWordBoundaries;
+var
+  LExts: TArray<TEchConfigExtension>;
+  LTypes: array[0..3] of UInt16;
+  LI: Int32;
+begin
+  // the seen-set packs 32 types per word: adjacent types across a word edge are distinct, and
+  // a repeat at either edge or at the largest optional type is still a duplicate
+  LTypes[0] := $001F;
+  LTypes[1] := $0020;
+  LTypes[2] := $7FFF;
+  LTypes[3] := $0000;
+  SetLength(LExts, 4);
+  for LI := 0 to 3 do
+    LExts[LI].ExtType := LTypes[LI];
+  CheckTrue(Usable(ConfigWith(THpkeKem.DHKEM_X25519_HKDF_SHA256,
+    OneSuite(THpkeKdf.HKDF_SHA256, THpkeAead.AES_128_GCM), 'cover.example', LExts)),
+    'distinct types on both sides of a word edge are all accepted');
+  for LI := 0 to 3 do
+  begin
+    SetLength(LExts, 5);
+    LExts[4].ExtType := LTypes[LI];
+    CheckFalse(Usable(ConfigWith(THpkeKem.DHKEM_X25519_HKDF_SHA256,
+      OneSuite(THpkeKdf.HKDF_SHA256, THpkeAead.AES_128_GCM), 'cover.example', LExts)),
+      Format('a repeat of type $%.4x is a duplicate', [LTypes[LI]]));
+  end;
 end;
 
 procedure TTestEchConfig.TestBadPublicNames;

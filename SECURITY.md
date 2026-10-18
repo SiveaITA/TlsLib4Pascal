@@ -54,6 +54,13 @@ formal SLA. In general you can expect:
 - the default provider's **wiring and usage** of CryptoLib4Pascal (e.g. a nonce-reuse or
   parameter-validation mistake in how TlsLib4Pascal drives the primitives);
 - the extension framework, negotiation policy, and the session/resumption/0-RTT machinery;
+- Encrypted Client Hello (client modes, the server key store and trial decryption) and certificate
+  compression (the decompression bounds);
+- `TlsLib.Crypto.System`, the OS-native crypto overlay, which validates peer key shares and AEAD nonces;
+- `TlsLib.Net`, including the HTTP/OCSP/CRL fetcher that parses untrusted responder bytes and the
+  TCP connector/listener;
+- the `EchKeyGen` tool, which writes private-key files with exclusive create and an owner-only mode
+  or ACL;
 - the first-party integration adapters (mORMot, Indy, Synapse, fcl-net).
 
 Examples of the kind of thing we most want to hear about: authentication bypass or a fail-open trust
@@ -68,7 +75,7 @@ unbounded resource; secret material surviving in freed memory.
   please report those to that project. A *misuse* of a correct primitive by TlsLib4Pascal is in scope
   here.
 - **Deliberately-insecure configuration** via the loudly-named *dangerous* surface
-  (`WithDangerousInsecureSkipVerify`, disabling the name check, key logging) working as documented is
+  (`DangerousSkip`, disabling the name check, key logging) working as documented is
   not a vulnerability — that is opt-in, fail-loud behavior. A way to reach an insecure state *without*
   the dangerous surface is in scope.
 - Third-party host frameworks themselves (mORMot / Indy / Synapse / the FCL) — report framework bugs

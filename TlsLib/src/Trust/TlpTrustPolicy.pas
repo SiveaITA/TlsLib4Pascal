@@ -18,9 +18,13 @@ interface
 uses
   SysUtils,
   TlpTlsAlert,
-  TlpICryptoProvider,
+  TlpIPkixProvider,
   TlpIClock,
+  TlpPkixDomainTypes,
+  TlpDateTimeUtilities,
+  TlpTrustTypes,
   TlpICertificateTrust,
+  TlpITrustAnchorStore,
   TlpCertificateLimits,
   TlpCertificateStrengthPolicy;
 
@@ -28,35 +32,110 @@ type
   /// <summary>
   /// The revocation-checking posture for the stapled OCSP response (RFC 6960),
   /// consumed in-band from the handshake - no network. The posture governs only how an
-  /// unknown/indeterminate outcome is treated; a definitive, authenticated Revoked in
-  /// hand is always honored (the certificate is rejected) under every posture. Soft (the
-  /// default) accepts a missing or indeterminate staple; Hard rejects anything short of a
-  /// current Good staple (bad_certificate_status_response); Off does not require a stapled
+  /// unknown/indeterminate outcome is treated; a definitive, authenticated Revoked is
+  /// always rejected under every posture. Soft (the default) accepts a missing or
+  /// indeterminate staple; Hard rejects anything short of a
+  /// current Good staple (bad_certificate_status_response; a Good staple with no nextUpdate and a
+  /// thisUpdate at most 7 days old also counts as current); Off does not require a stapled
   /// OCSP response (a missing or indeterminate staple is accepted), but still rejects a
-  /// definitive Revoked. Must-staple (RFC 7633) is enforced at the TLS layer regardless
-  /// of this setting.
+  /// definitive Revoked. Must-staple (RFC 7633) is enforced at the TLS layer independently of
+  /// this setting, but only for an initial-handshake server certificate the client requested a
+  /// staple for (never a client certificate, never on a resumption).
   /// </summary>
   TRevocationPosture = (Soft, Hard, Off);
 
+  /// <summary>How a peer certificate is verified: the built-in PKIX pipeline over trust anchors
+  /// (WebPki), a platform or custom source that owns its roots (VerifierSource), a whole injected
+  /// verifier (Custom), or not at all (DangerousSkip). The kinds are exclusive, so a setting that
+  /// only one of them reads cannot be combined with another.</summary>
+  TVerificationKind = (WebPki, VerifierSource, Custom, DangerousSkip);
+
+  /// <summary>The result of a revocation check for one certificate: a definitive Good or Revoked,
+  /// or Indeterminate when no authoritative status was obtained (missing/expired/unreachable).</summary>
+  TLiveRevocationOutcome = (Good, Revoked, Indeterminate);
+
+  /// <summary>How current a Good OCSP response is: Fresh (within its nextUpdate window),
+  /// Unbounded (no nextUpdate but recent enough to accept inline, never to settle revocation -
+  /// RFC 6960 4.2.2.1 says newer information is then always available), or Stale.</summary>
+  TOcspFreshness = (Fresh, Unbounded, Stale);
+
   /// <summary>
-  /// An augment-only peer-certificate check the caller supplies: it runs after the
-  /// built-in pipeline (PKIX, revocation, endpoint identity, pinning) has already
-  /// passed and can only additionally reject (return False) - it can never turn a
-  /// rejected chain into an accepted one. AChain is the peer chain (leaf first, DER);
-  /// AHostName is the expected host (empty on the server side). This is how a host
+  /// The one revocation-decision table every verifier and resolver applies: a definitive Revoked
+  /// rejects under every posture (certificate_revoked); a Good accepts; an Indeterminate accepts
+  /// unless the posture is Hard and the decision is not deferred to a live check, in which case it
+  /// rejects (bad_certificate_status_response). Deferral to a live check is expressed by evaluating
+  /// at an effective posture of Soft, so the handshake reaches the park where the live result is
+  /// decided at the configured posture.
+  /// </summary>
+  TRevocationDecision = class sealed(TObject)
+  public
+    /// <summary>A Good response without nextUpdate is accepted inline only if its thisUpdate is
+    /// within this age; beyond it the response is Stale.</summary>
+    const OcspUnboundedMaxAgeMs = Int64(7) * 24 * 60 * 60 * 1000;
+    /// <summary>Classifies a Good OCSP response by its window. All times are Unix milliseconds;
+    /// ANextUpdateMs = 0 means the response carried no nextUpdate. A thisUpdate up to
+    /// TRevocationWindow.ThisUpdateSkewMs ahead of ANowMs is tolerated; nextUpdate is strict.</summary>
+    class function OcspFreshness(ANowMs, AThisUpdateMs,
+      ANextUpdateMs: Int64): TOcspFreshness; static;
+    /// <summary>The stricter of two postures (Hard over Soft over Off): a decision made at both a
+    /// configured and a resolver's own posture holds to whichever demands more.</summary>
+    class function Stricter(AFirst, ASecond: TRevocationPosture): TRevocationPosture; static;
+    /// <summary>The posture an inline evaluation runs at: Hard becomes Soft while the indeterminate
+    /// case is deferred to a live check; otherwise the configured posture.</summary>
+    class function EffectivePosture(APosture: TRevocationPosture;
+      ADeferToLive: Boolean): TRevocationPosture; static;
+    /// <summary>True to accept; False with AAlert (certificate_revoked for Revoked,
+    /// bad_certificate_status_response for an undeferred Indeterminate under Hard). AAlert is
+    /// untouched on True.</summary>
+    class function Decide(AOutcome: TLiveRevocationOutcome; APosture: TRevocationPosture;
+      ADeferToLive: Boolean; out AAlert: TTlsAlertDescription): Boolean; static;
+    /// <summary>True when a Hard posture can only be satisfied by a live-revocation verdict: an
+    /// indeterminate outcome (no staple) is decided inline by posture unless deferred to a live
+    /// check, so an undeferred Hard rejects every staple-less peer.</summary>
+    class function HardNeedsLiveRevocation(APosture: TRevocationPosture;
+      ADeferToLive: Boolean): Boolean; static;
+  end;
+
+  /// <summary>The verdict a stapled OCSP response (RFC 6960) yields, classified for the posture
+  /// decision: a fresh Good, a Good carrying no nextUpdate but still within the unbounded age, a
+  /// definitive Revoked, or Indeterminate (no/unauthenticated staple, an Unknown status, or a
+  /// stale Good).</summary>
+  TStapleVerdict = (GoodFresh, GoodUnbounded, Revoked, Indeterminate);
+
+  /// <summary>Renders the stapled-OCSP verdict in-band and network-free: authenticates the staple
+  /// against the chain's issuer and classifies a Good response by its freshness window. Shared by
+  /// the built-in verifier and the OS delegates so both read a staple the same way.</summary>
+  TOcspStaplePolicy = class sealed(TObject)
+  public
+    class function Verdict(const APkix: IPkixProvider; const AClock: ITlsClock;
+      const AChain: TArray<TBytes>; const AStaple: TBytes): TStapleVerdict; static;
+  end;
+
+  /// <summary>
+  /// An augment-only peer-certificate check the caller supplies: it runs last, after the
+  /// built-in pipeline (PKIX, revocation, endpoint identity) and pinning have already
+  /// passed, and can only additionally reject (return False) - it can never turn a
+  /// rejected chain into an accepted one. APresented is the chain the peer sent (leaf first,
+  /// DER), extra certificates included. AValidated is the leaf-first path the verifier
+  /// reported as validated; it is nil when no validation ran (under InsecureSkipVerify), so a
+  /// rule about issuance reads AValidated and a caller that skipped validation vets APresented
+  /// itself. AHostName is the expected host (empty on the server side). This is how a host
   /// framework's own verify hook is bridged without loosening our trust decision.
   /// </summary>
-  TTlsCertificateVerifyCallback = function(const AChain: TArray<TBytes>;
+  TTlsCertificateVerifyCallback = function(const APresented, AValidated: TArray<TBytes>;
     const AHostName: string): Boolean of object;
 
   /// <summary>
   /// The escape hatches that deliberately weaken or extend trust, grouped so they read
   /// as one loud, opt-in surface. InsecureSkipVerify makes an otherwise-untrusted chain
-  /// pass (it bypasses PKIX, revocation, endpoint identity, and pinning) and must never
+  /// pass (it bypasses PKIX, revocation and endpoint identity; configured pins still apply,
+  /// matched against the leaf only) and must never
   /// ship in production - it exists for tests and pinned/self-signed development peers.
   /// VerifyCallback is the augment-only hook (it can only additionally reject). When both
   /// are set the callback still runs, so a caller can skip the built-in pipeline yet keep
-  /// a bespoke reject rule.
+  /// a bespoke reject rule. An OS-native trust delegate applies only VerifyCallback: it never
+  /// honours InsecureSkipVerify (it will not bypass the platform engine it was chosen for), so
+  /// the bypass takes effect only with the built-in verifier.
   /// </summary>
   TDangerousTrust = record
     InsecureSkipVerify: Boolean;
@@ -67,40 +146,87 @@ type
   end;
 
   /// <summary>
-  /// The asynchronous certificate-verdict setting. When Enabled, the engine runs its
-  /// built-in trust pipeline synchronously (as always) and, only if that pipeline
-  /// accepts the peer chain, parks the handshake and raises a CertificateReceived event
-  /// so a host can decide out-of-band (e.g. live OCSP/CRL, an operator prompt) and resume
-  /// with SetCertificateVerdict. This is augment-only: the host verdict can only
-  /// additionally reject, never resurrect a chain the pipeline already rejected. The park
-  /// is fail-closed - no verdict, a rejection, or an expired deadline aborts the handshake.
-  /// DeadlineMs is advisory to the driver (the sans-IO engine owns no timer); 0 means the
-  /// host imposes no engine-suggested deadline. Disabled (the default) keeps the verdict
-  /// inline.
+  /// The one augment-only reject rule every verifier applies after its own decision: an assigned
+  /// VerifyCallback that returns False rejects the chain. A custom rejection is an acceptability
+  /// problem rather than a corrupt certificate, so the alert is certificate_unknown (RFC 9846 6.2).
+  /// </summary>
+  TVerifyCallbackGate = class sealed(TObject)
+  public
+    /// <summary>True when ACallback is unassigned or accepts the presented chain and the path
+    /// AVerified validated (nil when its Outcome is Unvalidated); else False with AAlert set (left
+    /// untouched on True).</summary>
+    class function Admits(const ACallback: TTlsCertificateVerifyCallback;
+      const APresented: TArray<TBytes>; const AVerified: TVerifiedChain;
+      const AHostName: string; out AAlert: TTlsAlertDescription): Boolean; static;
+  end;
+
+  /// <summary>Whose certificate a parked verdict concerns. Server: we are the client and the chain
+  /// is the server's, matched against HostName. Client: we are the server and the chain is an mTLS
+  /// client's, with no host identity to match. A resolver that evaluates a role-specific trust
+  /// engine (an OS-native live check binds the server-auth or client-auth EKU) must branch on this
+  /// rather than assume a role - the same process may run both a client and an mTLS server. Unknown
+  /// is the zero value so a hand-built context that forgets to set the role fails a role-specific
+  /// resolver's check closed rather than defaulting to a wrong role.</summary>
+  TPeerRole = (Unknown, Server, Client);
+
+  /// <summary>
+  /// The asynchronous certificate-verdict setting. When Deferral is not None, the engine runs
+  /// its built-in trust pipeline synchronously and, only if that pipeline accepts
+  /// the peer chain, parks the handshake so a host or a live-revocation resolver can decide
+  /// out-of-band and resume with SetCertificateVerdict. This is augment-only: the verdict can
+  /// only additionally reject, never resurrect a chain the pipeline already rejected. The park
+  /// is fail-closed - no verdict or a rejection aborts the handshake. DeadlineMs is the time
+  /// budget a resolver built from this config is given (the Windows live resolver bounds its URL
+  /// retrieval by it; Apple exposes no per-evaluation timeout, so there it is informational);
+  /// neither the engine nor the stream drivers enforce it - a resolver that cannot decide within
+  /// its budget returns False. None (the default) keeps the verdict inline.
   /// </summary>
   TAsyncCertificateVerdict = record
-    Enabled: Boolean;
+    Deferral: TVerdictDeferral;
     DeadlineMs: Cardinal;
   end;
 
   /// <summary>
-  /// What an out-of-band verdict resolver receives for a parked peer certificate: the chain
-  /// (leaf first, DER) the built-in pipeline already accepted, the expected host (empty on the
-  /// server side), and the handshake OCSP staple (empty when none) so a live check can skip a
-  /// fetch the server already answered in-band.
+  /// What an out-of-band verdict resolver receives for a parked peer certificate: whose chain it
+  /// is (PeerRole); the chain as the peer presented it (Chain, leaf first, DER); the leaf-first path
+  /// the built-in pipeline validated (ValidatedPath, with the leaf's issuer at index 1 and the
+  /// anchor where nameable); the expected host (empty on the server side); and the handshake OCSP
+  /// staple (empty when none) so a live check can skip a fetch the server already answered in-band.
+  /// A revocation check should authenticate against RevocationPath (ValidatedPath when the pipeline
+  /// produced one, else the presented Chain), so the responder is bound to the issuer PKIX already
+  /// authenticated rather than a re-guess (under InsecureSkipVerify nothing was, so it binds to the
+  /// peer's own Chain[1]). A client certificate may also carry a staple (RFC 9846
+  /// 4.5.1.1 lets a server request status_request of a client), so the staple is not a role signal -
+  /// branch on PeerRole. A caller that hand-builds this record MUST set PeerRole (a role-specific
+  /// resolver refuses the unset Unknown value); ValidatedPath may be left empty, and RevocationPath
+  /// then falls back to Chain.
   /// </summary>
   TCertificateVerdictContext = record
+    PeerRole: TPeerRole;
     Chain: TArray<TBytes>;
+    ValidatedPath: TArray<TBytes>;
     HostName: string;
     OcspStaple: TBytes;
+    /// <summary>The time budget in milliseconds the host gave the resolver for this park; 0 means
+    /// none was set. A resolver that fetches over the network keeps within it.</summary>
+    DeadlineMs: Cardinal;
+    /// <summary>The revocation posture the configuration asked for. A resolver decides at the
+    /// stricter of its own posture and this one, so a Hard configuration is never relaxed by a
+    /// resolver built Soft. Soft is the zero value, so a hand-built context lifts a resolver
+    /// built Off unless it sets Off.</summary>
+    RevocationPosture: TRevocationPosture;
+    /// <summary>The path a revocation check should authenticate against: the validated path when
+    /// the pipeline produced one, else the presented chain (never the reverse, so a hand-built
+    /// context that set only Chain keeps its meaning).</summary>
+    function RevocationPath: TArray<TBytes>;
   end;
 
   /// <summary>
-  /// Decides a parked peer-certificate verdict out-of-band (RFC 8446 deferred-verdict seam).
-  /// Return True to continue the handshake, False to abort it; on False, ARejectAlert selects
-  /// the abort alert (default bad_certificate; a definitive live-revocation reject sets
-  /// certificate_revoked). The resolver owns any deadline: a check that cannot decide in time
-  /// returns False (fail-closed). Reached only when async certificate verdicts are enabled.
+  /// Decides a parked peer-certificate verdict out-of-band. Return True to continue the
+  /// handshake, False to abort it; on False, ARejectAlert selects the abort alert (default
+  /// bad_certificate; a definitive live-revocation reject sets certificate_revoked). The resolver
+  /// owns the deadline, within the budget the context carries: a check that cannot decide in time
+  /// returns False (fail-closed). Reached only when a verdict-deferral mode is set.
   /// </summary>
   TCertificateVerdictResolver = function(const ACtx: TCertificateVerdictContext;
     out ARejectAlert: TTlsAlertDescription): Boolean of object;
@@ -108,23 +234,29 @@ type
   /// <summary>
   /// The trust parameters the engine gathers once from the frozen config and hands a
   /// verifier source to build the server-certificate verifier for a connection. The clock
-  /// and posture are carried here so a source constructs its verifier with them injected
-  /// (the built-in and the OS-native delegate alike), rather than receiving a pre-built
-  /// verifier that could not see the connection's clock or revocation posture. SPKI pinning
-  /// is applied by a decorator over the source output, so no pins appear here.
+  /// and posture are carried here so a source injects them when it constructs its verifier
+  /// (the built-in and the OS-native delegate alike). SPKI pinning is applied by a decorator
+  /// over the source output, so no pins appear here. The factory builds one verifier per
+  /// occasion (an initial-handshake verifier and, for reverify-on-resume, a second
+  /// Occasion=Resumption verifier), so must-staple binds only where a Certificate is
+  /// actually on the wire.
   /// </summary>
   TServerTrustContext = record
-    Provider: ICryptoProvider;
+    Pkix: IPkixProvider;
     Clock: ITlsClock;
     TrustStore: ITrustAnchorStore;
     CheckHostName: Boolean;
     ChainLimits: TCertificateChainLimits;
     RevocationPosture: TRevocationPosture;
     Dangerous: TDangerousTrust;
-    AsyncVerdictEnabled: Boolean;
+    Deferral: TVerdictDeferral;
     Intermediates: TArray<TBytes>;
     StrengthPolicy: TCertificateStrengthPolicy;
     AdvertisedSignatureSchemes: TArray<UInt16>;
+    /// <summary>Whether the client offered status_request on this connection: must-staple is
+    /// enforced only when it did (RFC 7633 4.3.3 binds the requirement to the client's ask).</summary>
+    StatusRequestOffered: Boolean;
+    Occasion: TVerificationOccasion;
   end;
 
   /// <summary>
@@ -136,13 +268,13 @@ type
   /// the OS/public-web-PKI roots.
   /// </summary>
   TClientTrustContext = record
-    Provider: ICryptoProvider;
+    Pkix: IPkixProvider;
     Clock: ITlsClock;
     TrustStore: ITrustAnchorStore;
     ChainLimits: TCertificateChainLimits;
     RevocationPosture: TRevocationPosture;
     Dangerous: TDangerousTrust;
-    AsyncVerdictEnabled: Boolean;
+    Deferral: TVerdictDeferral;
     Intermediates: TArray<TBytes>;
     StrengthPolicy: TCertificateStrengthPolicy;
     AdvertisedSignatureSchemes: TArray<UInt16>;
@@ -155,6 +287,138 @@ class operator TDangerousTrust.Initialize({$IFDEF FPC}var{$ELSE}out{$ENDIF}
 begin
   AOptions.InsecureSkipVerify := False;
   AOptions.VerifyCallback := nil;
+end;
+
+class function TVerifyCallbackGate.Admits(const ACallback: TTlsCertificateVerifyCallback;
+  const APresented: TArray<TBytes>; const AVerified: TVerifiedChain;
+  const AHostName: string; out AAlert: TTlsAlertDescription): Boolean;
+begin
+  Result := (not Assigned(ACallback)) or
+    ACallback(APresented, AVerified.ValidatedPath, AHostName);
+  if not Result then
+    AAlert := TTlsAlertDescription.CertificateUnknown;
+end;
+
+function TCertificateVerdictContext.RevocationPath: TArray<TBytes>;
+begin
+  // prefer the pipeline-validated path (issuer authenticated at index 1); fall back to the
+  // presented chain so a hand-built context that set only Chain still resolves; that chain is
+  // unauthenticated, so the revocation primitives check that the issuer signed the leaf
+  if System.Length(ValidatedPath) > 0 then
+    Result := ValidatedPath
+  else
+    Result := Chain;
+end;
+
+{ TRevocationDecision }
+
+class function TRevocationDecision.OcspFreshness(ANowMs, AThisUpdateMs,
+  ANextUpdateMs: Int64): TOcspFreshness;
+begin
+  if ANowMs + TRevocationWindow.ThisUpdateSkewMs < AThisUpdateMs then
+    Result := TOcspFreshness.Stale // not yet valid
+  else if ANextUpdateMs <> 0 then
+  begin
+    if ANowMs < ANextUpdateMs then
+      Result := TOcspFreshness.Fresh
+    else
+      Result := TOcspFreshness.Stale;
+  end
+  else if (ANowMs - AThisUpdateMs) <= OcspUnboundedMaxAgeMs then
+    Result := TOcspFreshness.Unbounded
+  else
+    Result := TOcspFreshness.Stale;
+end;
+
+class function TRevocationDecision.Stricter(AFirst,
+  ASecond: TRevocationPosture): TRevocationPosture;
+begin
+  if (AFirst = TRevocationPosture.Hard) or (ASecond = TRevocationPosture.Hard) then
+    Result := TRevocationPosture.Hard
+  else if (AFirst = TRevocationPosture.Soft) or (ASecond = TRevocationPosture.Soft) then
+    Result := TRevocationPosture.Soft
+  else
+    Result := TRevocationPosture.Off;
+end;
+
+class function TRevocationDecision.EffectivePosture(APosture: TRevocationPosture;
+  ADeferToLive: Boolean): TRevocationPosture;
+begin
+  if ADeferToLive and (APosture = TRevocationPosture.Hard) then
+    Result := TRevocationPosture.Soft
+  else
+    Result := APosture;
+end;
+
+class function TRevocationDecision.Decide(AOutcome: TLiveRevocationOutcome;
+  APosture: TRevocationPosture; ADeferToLive: Boolean;
+  out AAlert: TTlsAlertDescription): Boolean;
+begin
+  case AOutcome of
+    TLiveRevocationOutcome.Revoked:
+      begin
+        AAlert := TTlsAlertDescription.CertificateRevoked;
+        Result := False;
+      end;
+    TLiveRevocationOutcome.Good:
+      Result := True;
+  else
+    // Indeterminate: reject only under an effective Hard posture (a Hard check not deferred to a
+    // live one); Soft/Off, or a deferred Hard, accept and let the live check (if any) decide
+    Result := EffectivePosture(APosture, ADeferToLive) <> TRevocationPosture.Hard;
+    if not Result then
+      AAlert := TTlsAlertDescription.BadCertificateStatusResponse;
+  end;
+end;
+
+class function TRevocationDecision.HardNeedsLiveRevocation(APosture: TRevocationPosture;
+  ADeferToLive: Boolean): Boolean;
+begin
+  Result := (APosture = TRevocationPosture.Hard) and (not ADeferToLive);
+end;
+
+{ TOcspStaplePolicy }
+
+class function TOcspStaplePolicy.Verdict(const APkix: IPkixProvider;
+  const AClock: ITlsClock; const AChain: TArray<TBytes>;
+  const AStaple: TBytes): TStapleVerdict;
+var
+  LStatus: TOcspStatus;
+  LThisUpdate, LNextUpdate: TDateTime;
+  LNowMs, LNextMs: Int64;
+begin
+  Result := TStapleVerdict.Indeterminate;
+  // a public entry point: without a provider or a clock no verdict can be rendered
+  if (APkix = nil) or (AClock = nil) then
+    Exit;
+  // a staple needs the issuer (the next chain entry) to authenticate it
+  if (System.Length(AStaple) = 0) or (System.Length(AChain) < 2) then
+    Exit;
+  if not APkix.Revocation.ValidateOcspStaple(AChain[0], AChain[1], AStaple,
+    TDateTimeUtilities.UnixMsToDateTime(Int64(AClock.NowUnixMillis)), LStatus,
+    LThisUpdate, LNextUpdate) then
+    Exit;
+  if LStatus = TOcspStatus.Revoked then
+  begin
+    Result := TStapleVerdict.Revoked;
+    Exit;
+  end;
+  if LStatus = TOcspStatus.Good then
+  begin
+    LNowMs := Int64(AClock.NowUnixMillis);
+    if LNextUpdate = 0 then
+      LNextMs := 0 // no nextUpdate carried
+    else
+      LNextMs := TDateTimeUtilities.DateTimeToUnixMs(LNextUpdate);
+    case TRevocationDecision.OcspFreshness(LNowMs,
+      TDateTimeUtilities.DateTimeToUnixMs(LThisUpdate), LNextMs) of
+      TOcspFreshness.Fresh:
+        Result := TStapleVerdict.GoodFresh;
+      TOcspFreshness.Unbounded:
+        Result := TStapleVerdict.GoodUnbounded;
+    end;
+  end;
+  // an Unknown status, or a Good one outside its window, stays Indeterminate
 end;
 
 end.

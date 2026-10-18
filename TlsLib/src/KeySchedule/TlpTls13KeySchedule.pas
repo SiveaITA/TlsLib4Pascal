@@ -22,14 +22,17 @@ uses
   TlpSecretBuffer,
   TlpICryptoProvider,
   TlpIKeySchedule,
+  TlpIKeyLog,
+  TlpKeyLog,
   TlpTrafficKeys,
   TlpHkdfLabel,
   TlpTlsLibExceptions,
+  TlpExporterArgs,
   TlpSecureMemory;
 
 type
   /// <summary>
-  /// The TLS 1.3 key schedule (RFC 8446 7.1): the Early -> Handshake -> Master
+  /// The TLS 1.3 key schedule (RFC 9846 7.1): the Early -> Handshake -> Main
   /// HKDF-Extract tree, the per-epoch traffic secrets derived from a transcript
   /// hash handed in, the (key, iv) for each, and the Finished MAC. Pure derivation
   /// - a driver installs the results into the record layer. Every secret is an
@@ -39,7 +42,7 @@ type
     ITls13KeySchedule)
   strict private
   var
-    FProvider: ICryptoProvider;
+    FCrypto: ICryptoProvider;
     FHkdf: IHkdf;
     FHash: THashAlgorithm;
     FKeyLength: Int32;
@@ -57,6 +60,12 @@ type
     FClientApTraffic: ISecretBuffer;
     FServerApTraffic: ISecretBuffer;
     FExporterMaster: ISecretBuffer;
+    FEarlyExporterMaster: ISecretBuffer;
+    FResumptionMaster: ISecretBuffer;
+    FHandshakeSecretsReleased: Boolean;
+    FKeyLog: IKeyLog;
+    FClientRandom: TBytes;
+    procedure LogSecret(const ALabel: string; const ASecret: ISecretBuffer);
     function ZeroSecret: ISecretBuffer;
     function HashOf(const AData: TBytes): TBytes;
     procedure EnsureEarlySecret;
@@ -64,34 +73,12 @@ type
     procedure EnsureMasterSecret;
     function HandshakeTrafficSecret(ADirection: TTlsDirection): ISecretBuffer;
     function EpochSecret(AEpoch: TTlsEpoch; ADirection: TTlsDirection): ISecretBuffer;
-    function ExpandKey(const ASecret: ISecretBuffer; const ALabel: string;
-      ALength: Int32): ISecretBuffer;
-    class function EchConfirmation(const AHkdf: IHkdf; const ALabel: string;
-      const AInnerRandom, ATranscriptHash: TBytes): TBytes; static;
+    function ExportFrom(const AMaster: ISecretBuffer; const ALabel: string;
+      const AContext: TBytes; ALength: Int32): TBytes;
   public
     /// <summary>AHash is the suite hash; AKeyLength the AEAD key size.</summary>
-    constructor Create(const AProvider: ICryptoProvider; AHash: THashAlgorithm;
+    constructor Create(const ACryptoProvider: ICryptoProvider; AHash: THashAlgorithm;
       AKeyLength: Int32);
-
-    /// <summary>
-    /// The ECH ServerHello accept confirmation (RFC 9849 sec. 7.2): the 8 bytes the
-    /// backend writes over ServerHello.random[24..32] and the client recomputes.
-    /// AInnerRandom is ClientHelloInner.random; ATranscriptEchConf is
-    /// Transcript-Hash(ClientHelloInner...ServerHello) with those 8 random bytes zeroed.
-    /// A class function because on the server the key schedule does not yet exist when
-    /// the ServerHello is built; AHkdf carries the negotiated suite's hash.
-    /// </summary>
-    class function EchAcceptConfirmation(const AHkdf: IHkdf;
-      const AInnerRandom, ATranscriptEchConf: TBytes): TBytes; static;
-    /// <summary>
-    /// The ECH HelloRetryRequest accept confirmation (RFC 9849 sec. 7.2.1): the 8 bytes
-    /// written over the HRR encrypted_client_hello payload. AInnerRandom is
-    /// ClientHelloInner1.random; ATranscriptHrrEchConf is
-    /// Transcript-Hash(message_hash(ClientHelloInner1)...HelloRetryRequest) with the
-    /// HRR ech payload zeroed.
-    /// </summary>
-    class function EchHrrAcceptConfirmation(const AHkdf: IHkdf;
-      const AInnerRandom, ATranscriptHrrEchConf: TBytes): TBytes; static;
 
     // IKeySchedule
     function TrafficKeys(AEpoch: TTlsEpoch; ADirection: TTlsDirection): ITrafficKeys;
@@ -99,18 +86,28 @@ type
       const ATranscriptHash: TBytes): TBytes;
     function VerifyFinished(ADirection: TTlsDirection;
       const ATranscriptHash, APeerVerifyData: TBytes): Boolean;
+    function ExportKeyingMaterial(const ALabel: string;
+      ALength: Int32): TBytes; overload;
     function ExportKeyingMaterial(const ALabel: string; const AContext: TBytes;
-      AUseContext: Boolean; ALength: Int32): TBytes;
+      ALength: Int32): TBytes; overload;
 
     // ITls13KeySchedule
+    function CanExportEarly: Boolean;
+    function ExportEarlyKeyingMaterial(const ALabel: string; const AContext: TBytes;
+      ALength: Int32): TBytes;
+    procedure ForgetEarlyExporter;
     procedure SetPsk(const APsk: ISecretBuffer);
     procedure SetSharedSecret(const ASharedSecret: ISecretBuffer);
     procedure DeriveEpochSecrets(AEpoch: TTlsEpoch; const ATranscriptHash: TBytes);
     function FinishedKey(ADirection: TTlsDirection): ISecretBuffer;
     procedure AdvanceKeyUpdate(ADirection: TTlsDirection);
-    function HasExporterSecret: Boolean;
-    function ResumptionMasterSecret(const ATranscriptHash: TBytes): ISecretBuffer;
-    function ResumptionPsk(const ATranscriptHash, ATicketNonce: TBytes): ISecretBuffer;
+    procedure ForgetHandshakeSecrets;
+    procedure SetKeyLog(const AKeyLog: IKeyLog; const AClientRandom: TBytes);
+    function CanExport: Boolean;
+    procedure ForgetResumptionMasterSecret;
+    procedure DeriveResumptionMasterSecret(const ATranscriptHash: TBytes);
+    function ResumptionMasterSecret: ISecretBuffer;
+    function ResumptionPsk(const ATicketNonce: TBytes): ISecretBuffer;
     function BinderKey(AKind: TPskBinderKind): ISecretBuffer;
     function ComputeBinder(AKind: TPskBinderKind;
       const ATruncatedTranscriptHash: TBytes): TBytes;
@@ -125,23 +122,55 @@ const
 
 resourcestring
   SEpochNotDerived = 'the requested epoch secrets have not been derived';
+  SHandshakeSecretsReleased = 'the handshake secrets have been released';
+  SPskAfterEarlySecret = 'the pre-shared key must be set before the early secret is derived';
+  SSharedSecretAfterHandshake =
+    'the shared secret must be set before the handshake secret is derived';
+  SResumptionMasterNotDerived = 'the resumption secret has not been derived';
+  SForgetBeforeApplication =
+    'the application epoch must be derived before releasing the handshake secrets';
+  STranscriptHashLength =
+    'the transcript hash length does not match the schedule hash length';
 
 { TTls13KeySchedule }
 
-constructor TTls13KeySchedule.Create(const AProvider: ICryptoProvider;
+constructor TTls13KeySchedule.Create(const ACryptoProvider: ICryptoProvider;
   AHash: THashAlgorithm; AKeyLength: Int32);
 var
   LHash: IHash;
 begin
   inherited Create;
-  FProvider := AProvider;
+  FCrypto := ACryptoProvider;
   FHash := AHash;
   FKeyLength := AKeyLength;
   FIvLength := Tls13IvLength;
-  FHkdf := AProvider.Primitives.CreateHkdf(AHash);
-  LHash := AProvider.Primitives.CreateHash(AHash);
+  FHkdf := ACryptoProvider.Primitives.CreateHkdf(AHash);
+  LHash := ACryptoProvider.Primitives.CreateHash(AHash);
   FHashLength := LHash.HashSize;
   FHashEmpty := LHash.DoFinal; // hash of the empty input
+end;
+
+procedure TTls13KeySchedule.LogSecret(const ALabel: string;
+  const ASecret: ISecretBuffer);
+var
+  LCopy: TBytes;
+begin
+  if (FKeyLog = nil) or (ASecret = nil) then
+    Exit;
+  // the log is a deliberate secret exposure; read a copy only when a sink is present and wipe it
+  LCopy := ASecret.ToBytes;
+  try
+    FKeyLog.Log(ALabel, FClientRandom, LCopy);
+  finally
+    TSecureMemory.WipeBytes(LCopy);
+  end;
+end;
+
+procedure TTls13KeySchedule.SetKeyLog(const AKeyLog: IKeyLog;
+  const AClientRandom: TBytes);
+begin
+  FKeyLog := AKeyLog;
+  FClientRandom := System.Copy(AClientRandom);
 end;
 
 function TTls13KeySchedule.ZeroSecret: ISecretBuffer;
@@ -154,7 +183,7 @@ var
   LHash: IHash;
 begin
   Result := nil;
-  LHash := FProvider.Primitives.CreateHash(FHash);
+  LHash := FCrypto.Primitives.CreateHash(FHash);
   if System.Length(AData) > 0 then
     LHash.Update(AData, 0, System.Length(AData));
   Result := LHash.DoFinal;
@@ -166,47 +195,50 @@ var
 begin
   if FEarlySecret <> nil then
     Exit;
+  if FHandshakeSecretsReleased then
+    raise EInvalidOperationTlsLibException.CreateRes(@SHandshakeSecretsReleased);
   if FPsk <> nil then
     LIkm := FPsk
   else
     LIkm := ZeroSecret;
   // an empty salt is treated as HashLen zeros by the provider
   FEarlySecret := FHkdf.Extract(nil, LIkm);
+  // the PSK is consumed by this one Extract; release it (the binder key derives from the early
+  // secret, not the PSK)
+  FPsk := nil;
 end;
 
 procedure TTls13KeySchedule.EnsureHandshakeSecret;
 var
-  LSalt: TBytes;
-  LIkm: ISecretBuffer;
+  LSalt, LIkm: ISecretBuffer;
 begin
   if FHandshakeSecret <> nil then
     Exit;
+  if FHandshakeSecretsReleased then
+    raise EInvalidOperationTlsLibException.CreateRes(@SHandshakeSecretsReleased);
   EnsureEarlySecret;
-  LSalt := THkdfLabel.DeriveSecret(FHkdf, FEarlySecret, 'derived', FHashEmpty).ToBytes;
-  try
-    if FSharedSecret <> nil then
-      LIkm := FSharedSecret
-    else
-      LIkm := ZeroSecret;
-    FHandshakeSecret := FHkdf.Extract(LSalt, LIkm);
-  finally
-    TSecureMemory.WipeBytes(LSalt);
-  end;
+  // the derived-secret salt is a wiped buffer end to end - no bare-bytes copy to scrub
+  LSalt := THkdfLabel.DeriveSecret(FHkdf, FEarlySecret, 'derived', FHashEmpty);
+  if FSharedSecret <> nil then
+    LIkm := FSharedSecret
+  else
+    LIkm := ZeroSecret;
+  FHandshakeSecret := FHkdf.Extract(LSalt, LIkm);
+  // the asymmetric shared secret is consumed by this one Extract; release it
+  FSharedSecret := nil;
 end;
 
 procedure TTls13KeySchedule.EnsureMasterSecret;
 var
-  LSalt: TBytes;
+  LSalt: ISecretBuffer;
 begin
   if FMasterSecret <> nil then
     Exit;
+  if FHandshakeSecretsReleased then
+    raise EInvalidOperationTlsLibException.CreateRes(@SHandshakeSecretsReleased);
   EnsureHandshakeSecret;
-  LSalt := THkdfLabel.DeriveSecret(FHkdf, FHandshakeSecret, 'derived', FHashEmpty).ToBytes;
-  try
-    FMasterSecret := FHkdf.Extract(LSalt, ZeroSecret);
-  finally
-    TSecureMemory.WipeBytes(LSalt);
-  end;
+  LSalt := THkdfLabel.DeriveSecret(FHkdf, FHandshakeSecret, 'derived', FHashEmpty);
+  FMasterSecret := FHkdf.Extract(LSalt, ZeroSecret);
 end;
 
 function TTls13KeySchedule.HandshakeTrafficSecret(ADirection: TTlsDirection): ISecretBuffer;
@@ -238,59 +270,42 @@ begin
   end;
 end;
 
-function TTls13KeySchedule.ExpandKey(const ASecret: ISecretBuffer;
-  const ALabel: string; ALength: Int32): ISecretBuffer;
-begin
-  Result := THkdfLabel.HkdfExpandLabel(FHkdf, ASecret, ALabel, nil, ALength);
-end;
-
-class function TTls13KeySchedule.EchConfirmation(const AHkdf: IHkdf;
-  const ALabel: string; const AInnerRandom, ATranscriptHash: TBytes): TBytes;
-const
-  ConfirmationLength = Int32(8);
-var
-  LPrk: ISecretBuffer;
-begin
-  // HKDF-Extract(0, ClientHelloInner.random): a HashLen-zero salt over the inner
-  // random as IKM (the random is public; the seam types IKM as a secret)
-  LPrk := AHkdf.Extract(nil, TSecretBuffer.From(AInnerRandom));
-  Result := THkdfLabel.HkdfExpandLabel(AHkdf, LPrk, ALabel, ATranscriptHash,
-    ConfirmationLength).ToBytes;
-end;
-
-class function TTls13KeySchedule.EchAcceptConfirmation(const AHkdf: IHkdf;
-  const AInnerRandom, ATranscriptEchConf: TBytes): TBytes;
-begin
-  Result := EchConfirmation(AHkdf, 'ech accept confirmation', AInnerRandom,
-    ATranscriptEchConf);
-end;
-
-class function TTls13KeySchedule.EchHrrAcceptConfirmation(const AHkdf: IHkdf;
-  const AInnerRandom, ATranscriptHrrEchConf: TBytes): TBytes;
-begin
-  Result := EchConfirmation(AHkdf, 'hrr ech accept confirmation', AInnerRandom,
-    ATranscriptHrrEchConf);
-end;
-
 procedure TTls13KeySchedule.SetPsk(const APsk: ISecretBuffer);
 begin
+  if FHandshakeSecretsReleased then
+    raise EInvalidOperationTlsLibException.CreateRes(@SHandshakeSecretsReleased);
+  // setting the PSK after the early secret is derived would silently not take effect
+  if FEarlySecret <> nil then
+    raise EInvalidOperationTlsLibException.CreateRes(@SPskAfterEarlySecret);
   FPsk := APsk;
 end;
 
 procedure TTls13KeySchedule.SetSharedSecret(const ASharedSecret: ISecretBuffer);
 begin
+  if FHandshakeSecretsReleased then
+    raise EInvalidOperationTlsLibException.CreateRes(@SHandshakeSecretsReleased);
+  if FHandshakeSecret <> nil then
+    raise EInvalidOperationTlsLibException.CreateRes(@SSharedSecretAfterHandshake);
   FSharedSecret := ASharedSecret;
 end;
 
 procedure TTls13KeySchedule.DeriveEpochSecrets(AEpoch: TTlsEpoch;
   const ATranscriptHash: TBytes);
 begin
+  // Derive-Secret takes the output length from the context; a wrong-length transcript would mint a
+  // wrong-length secret with no error, so reject it here where the expected length is known
+  if System.Length(ATranscriptHash) <> FHashLength then
+    raise EArgumentTlsLibException.CreateRes(@STranscriptHashLength);
   case AEpoch of
     TTlsEpoch.EarlyData:
       begin
         EnsureEarlySecret;
         FClientEarlyTraffic := THkdfLabel.DeriveSecret(FHkdf, FEarlySecret,
           'c e traffic', ATranscriptHash);
+        FEarlyExporterMaster := THkdfLabel.DeriveSecret(FHkdf, FEarlySecret,
+          'e exp master', ATranscriptHash);
+        LogSecret(KeyLogLabelClientEarlyTraffic, FClientEarlyTraffic);
+        LogSecret(KeyLogLabelEarlyExporter, FEarlyExporterMaster);
       end;
     TTlsEpoch.Handshake:
       begin
@@ -299,6 +314,8 @@ begin
           'c hs traffic', ATranscriptHash);
         FServerHsTraffic := THkdfLabel.DeriveSecret(FHkdf, FHandshakeSecret,
           's hs traffic', ATranscriptHash);
+        LogSecret(KeyLogLabelClientHandshakeTraffic, FClientHsTraffic);
+        LogSecret(KeyLogLabelServerHandshakeTraffic, FServerHsTraffic);
       end;
     TTlsEpoch.Application:
       begin
@@ -309,6 +326,9 @@ begin
           's ap traffic', ATranscriptHash);
         FExporterMaster := THkdfLabel.DeriveSecret(FHkdf, FMasterSecret,
           'exp master', ATranscriptHash);
+        LogSecret(KeyLogLabelClientTraffic0, FClientApTraffic);
+        LogSecret(KeyLogLabelServerTraffic0, FServerApTraffic);
+        LogSecret(KeyLogLabelExporter, FExporterMaster);
       end;
   end;
 end;
@@ -321,8 +341,8 @@ begin
   LSecret := EpochSecret(AEpoch, ADirection);
   if LSecret = nil then
     raise EInvalidOperationTlsLibException.CreateRes(@SEpochNotDerived);
-  Result := TTrafficKeys.Create(ExpandKey(LSecret, 'key', FKeyLength),
-    ExpandKey(LSecret, 'iv', FIvLength));
+  Result := TTrafficKeys.Create(THkdfLabel.HkdfExpandLabel(FHkdf, LSecret, 'key', nil, FKeyLength),
+    THkdfLabel.HkdfExpandLabel(FHkdf, LSecret, 'iv', nil, FIvLength));
 end;
 
 function TTls13KeySchedule.FinishedKey(ADirection: TTlsDirection): ISecretBuffer;
@@ -332,7 +352,7 @@ begin
   LSecret := HandshakeTrafficSecret(ADirection);
   if LSecret = nil then
     raise EInvalidOperationTlsLibException.CreateRes(@SEpochNotDerived);
-  Result := ExpandKey(LSecret, 'finished', FHashLength);
+  Result := THkdfLabel.HkdfExpandLabel(FHkdf, LSecret, 'finished', nil, FHashLength);
 end;
 
 function TTls13KeySchedule.ComputeVerifyData(ADirection: TTlsDirection;
@@ -341,7 +361,7 @@ var
   LHmac: IHmac;
 begin
   Result := nil;
-  LHmac := FProvider.Primitives.CreateHmac(FHash);
+  LHmac := FCrypto.Primitives.CreateHmac(FHash);
   LHmac.Init(FinishedKey(ADirection));
   LHmac.Update(ATranscriptHash, 0, System.Length(ATranscriptHash));
   Result := LHmac.DoFinal;
@@ -371,49 +391,104 @@ begin
   if LOld = nil then
     raise EInvalidOperationTlsLibException.CreateRes(@SEpochNotDerived);
   if ADirection = TTlsDirection.ClientWrite then
-    FClientApTraffic := ExpandKey(LOld, 'traffic upd', FHashLength)
+    FClientApTraffic := THkdfLabel.HkdfExpandLabel(FHkdf, LOld, 'traffic upd', nil, FHashLength)
   else
-    FServerApTraffic := ExpandKey(LOld, 'traffic upd', FHashLength);
+    FServerApTraffic := THkdfLabel.HkdfExpandLabel(FHkdf, LOld, 'traffic upd', nil, FHashLength);
 end;
 
 function TTls13KeySchedule.ExportKeyingMaterial(const ALabel: string;
-  const AContext: TBytes; AUseContext: Boolean; ALength: Int32): TBytes;
+  ALength: Int32): TBytes;
+begin
+  Result := ExportFrom(FExporterMaster, ALabel, nil, ALength);
+end;
+
+function TTls13KeySchedule.ExportKeyingMaterial(const ALabel: string;
+  const AContext: TBytes; ALength: Int32): TBytes;
+begin
+  Result := ExportFrom(FExporterMaster, ALabel, AContext, ALength);
+end;
+
+function TTls13KeySchedule.ExportFrom(const AMaster: ISecretBuffer;
+  const ALabel: string; const AContext: TBytes; ALength: Int32): TBytes;
 var
   LDerived: ISecretBuffer;
   LContextHash: TBytes;
 begin
   Result := nil;
-  if FExporterMaster = nil then
+  TExporterArgs.Guard(ALabel, ALength);
+  if AMaster = nil then
     raise EInvalidOperationTlsLibException.CreateRes(@SEpochNotDerived);
-  // TLS 1.3 always hashes a context value; no context is exactly an empty context, so the
-  // AUseContext distinction that matters in TLS 1.2 has no effect here (RFC 8446 7.5)
-  LDerived := THkdfLabel.DeriveSecret(FHkdf, FExporterMaster, ALabel, FHashEmpty);
+  // TLS 1.3 always hashes a context value; no context is exactly an empty context (RFC 9846 7.5)
+  LDerived := THkdfLabel.DeriveSecret(FHkdf, AMaster, ALabel, FHashEmpty);
   LContextHash := HashOf(AContext);
   Result := THkdfLabel.HkdfExpandLabel(FHkdf, LDerived, 'exporter', LContextHash,
     ALength).ToBytes;
 end;
 
-function TTls13KeySchedule.HasExporterSecret: Boolean;
+function TTls13KeySchedule.ExportEarlyKeyingMaterial(const ALabel: string;
+  const AContext: TBytes; ALength: Int32): TBytes;
+begin
+  Result := ExportFrom(FEarlyExporterMaster, ALabel, AContext, ALength);
+end;
+
+procedure TTls13KeySchedule.ForgetEarlyExporter;
+begin
+  FEarlyExporterMaster := nil;
+end;
+
+function TTls13KeySchedule.CanExportEarly: Boolean;
+begin
+  // set when the early epoch secrets are derived (a 0-RTT handshake); never on TLS 1.2
+  Result := FEarlyExporterMaster <> nil;
+end;
+
+procedure TTls13KeySchedule.ForgetHandshakeSecrets;
+begin
+  if FExporterMaster = nil then
+    raise EInvalidOperationTlsLibException.CreateRes(@SForgetBeforeApplication);
+  FPsk := nil;
+  FSharedSecret := nil;
+  FEarlySecret := nil;
+  FHandshakeSecret := nil;
+  FMasterSecret := nil;
+  FClientEarlyTraffic := nil;
+  FClientHsTraffic := nil;
+  FServerHsTraffic := nil;
+  FHandshakeSecretsReleased := True;
+end;
+
+function TTls13KeySchedule.CanExport: Boolean;
 begin
   // set when the Application epoch secrets are derived (a KeyUpdate never touches it)
   Result := FExporterMaster <> nil;
 end;
 
-function TTls13KeySchedule.ResumptionMasterSecret(
-  const ATranscriptHash: TBytes): ISecretBuffer;
+procedure TTls13KeySchedule.ForgetResumptionMasterSecret;
 begin
+  FResumptionMaster := nil;
+end;
+
+procedure TTls13KeySchedule.DeriveResumptionMasterSecret(
+  const ATranscriptHash: TBytes);
+begin
+  if System.Length(ATranscriptHash) <> FHashLength then
+    raise EArgumentTlsLibException.CreateRes(@STranscriptHashLength);
   EnsureMasterSecret;
-  Result := THkdfLabel.DeriveSecret(FHkdf, FMasterSecret, 'res master',
+  FResumptionMaster := THkdfLabel.DeriveSecret(FHkdf, FMasterSecret, 'res master',
     ATranscriptHash);
 end;
 
-function TTls13KeySchedule.ResumptionPsk(
-  const ATranscriptHash, ATicketNonce: TBytes): ISecretBuffer;
-var
-  LResMaster: ISecretBuffer;
+function TTls13KeySchedule.ResumptionMasterSecret: ISecretBuffer;
 begin
-  LResMaster := ResumptionMasterSecret(ATranscriptHash);
-  Result := THkdfLabel.HkdfExpandLabel(FHkdf, LResMaster, 'resumption',
+  if FResumptionMaster = nil then
+    raise EInvalidOperationTlsLibException.CreateRes(@SResumptionMasterNotDerived);
+  Result := FResumptionMaster;
+end;
+
+function TTls13KeySchedule.ResumptionPsk(
+  const ATicketNonce: TBytes): ISecretBuffer;
+begin
+  Result := THkdfLabel.HkdfExpandLabel(FHkdf, ResumptionMasterSecret, 'resumption',
     ATicketNonce, FHashLength);
 end;
 
@@ -444,7 +519,7 @@ begin
   LBinderKey := BinderKey(AKind);
   LFinishedKey := THkdfLabel.HkdfExpandLabel(FHkdf, LBinderKey, 'finished', nil,
     FHashLength);
-  LHmac := FProvider.Primitives.CreateHmac(FHash);
+  LHmac := FCrypto.Primitives.CreateHmac(FHash);
   LHmac.Init(LFinishedKey);
   LHmac.Update(ATruncatedTranscriptHash, 0,
     System.Length(ATruncatedTranscriptHash));

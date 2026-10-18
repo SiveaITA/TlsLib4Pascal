@@ -28,16 +28,27 @@ type
   /// The default in-memory <see cref="ISessionStore" />: a bounded, stateful
   /// server store. A stored session is addressed by an opaque handle (a fresh
   /// random blob from <see cref="Put" />, or a caller id via
-  /// <see cref="PutWithId" />) and retrieval removes it, enforcing single-use.
+  /// <see cref="PutWithId" />); Take removes it (single-use) and Peek reads it without removing.
   /// When the cap is reached the oldest entry is evicted. Guarded by an internal
   /// lock, so one instance is safe to share across connections/threads.
   /// </summary>
   TInMemorySessionStore = class sealed(TInterfacedObject, ISessionStore)
   strict private
+  type
+    // Seq ties an order slot to the Put that made it, so a re-put id's stale slot cannot evict it
+    TEntry = record
+      Session: IResumableSession;
+      Seq: UInt64;
+    end;
+    TOrderSlot = record
+      Key: string;
+      Seq: UInt64;
+    end;
   var
     FRandom: IRandom;
-    FByKey: TDictionary<string, IResumableSession>;
-    FOrder: TQueue<string>;
+    FByKey: TDictionary<string, TEntry>;
+    FOrder: TQueue<TOrderSlot>;
+    FNextSeq: UInt64;
     FCapacity: Int32;
     FLock: TCriticalSection;
     class function KeyOf(const AId: TBytes): string; static;
@@ -50,11 +61,13 @@ type
     procedure CompactOrder;
   public
     /// <summary>A store holding up to ACapacity sessions (default when 0 or less).</summary>
-    constructor Create(const ARandom: IRandom; ACapacity: Int32 = 0);
+    constructor Create(const ARandom: IRandom); overload;
+    constructor Create(const ARandom: IRandom; ACapacity: Int32); overload;
     destructor Destroy; override;
 
     function Put(const ASession: IResumableSession): TBytes;
     procedure PutWithId(const AId: TBytes; const ASession: IResumableSession);
+    function Peek(const AId: TBytes; out ASession: IResumableSession): Boolean;
     function Take(const AId: TBytes; out ASession: IResumableSession): Boolean;
     procedure Remove(const AId: TBytes);
     procedure Clear;
@@ -72,6 +85,11 @@ const
 
 { TInMemorySessionStore }
 
+constructor TInMemorySessionStore.Create(const ARandom: IRandom);
+begin
+  Create(ARandom, 0);
+end;
+
 constructor TInMemorySessionStore.Create(const ARandom: IRandom; ACapacity: Int32);
 begin
   inherited Create;
@@ -80,18 +98,14 @@ begin
     FCapacity := ACapacity
   else
     FCapacity := DefaultSessionStoreCapacity;
-  FByKey := TDictionary<string, IResumableSession>.Create;
-  FOrder := TQueue<string>.Create;
+  FByKey := TDictionary<string, TEntry>.Create;
+  FOrder := TQueue<TOrderSlot>.Create;
   FLock := TCriticalSection.Create;
 end;
 
 destructor TInMemorySessionStore.Destroy;
 begin
-  if FByKey <> nil then
-  begin
-    FByKey.Clear;
-    FByKey.Free;
-  end;
+  FByKey.Free;
   FOrder.Free;
   FLock.Free;
   inherited Destroy;
@@ -105,38 +119,36 @@ end;
 
 procedure TInMemorySessionStore.EvictToCapacity;
 var
-  LKey: string;
+  LSlot: TOrderSlot;
+  LEntry: TEntry;
 begin
   while (FByKey.Count > FCapacity) and (FOrder.Count > 0) do
   begin
-    LKey := FOrder.Dequeue;
-    FByKey.Remove(LKey); // stale order entries (already taken) drop harmlessly
+    LSlot := FOrder.Dequeue;
+    // a slot left by a taken or re-put entry no longer matches and drops harmlessly
+    if FByKey.TryGetValue(LSlot.Key, LEntry) and (LEntry.Seq = LSlot.Seq) then
+      FByKey.Remove(LSlot.Key);
   end;
 end;
 
 procedure TInMemorySessionStore.CompactOrder;
 var
-  LKey: string;
-  LKept: TQueue<string>;
-  LSeen: TDictionary<string, Boolean>;
+  LSlot: TOrderSlot;
+  LEntry: TEntry;
+  LKept: TQueue<TOrderSlot>;
 begin
-  LKept := TQueue<string>.Create;
-  LSeen := TDictionary<string, Boolean>.Create;
+  LKept := TQueue<TOrderSlot>.Create;
   try
     while FOrder.Count > 0 do
     begin
-      LKey := FOrder.Dequeue;
-      if FByKey.ContainsKey(LKey) and not LSeen.ContainsKey(LKey) then
-      begin
-        LKept.Enqueue(LKey);
-        LSeen.Add(LKey, True);
-      end;
+      LSlot := FOrder.Dequeue;
+      if FByKey.TryGetValue(LSlot.Key, LEntry) and (LEntry.Seq = LSlot.Seq) then
+        LKept.Enqueue(LSlot);
     end;
     while LKept.Count > 0 do
       FOrder.Enqueue(LKept.Dequeue);
   finally
     LKept.Free;
-    LSeen.Free;
   end;
 end;
 
@@ -153,19 +165,42 @@ procedure TInMemorySessionStore.PutWithId(const AId: TBytes;
   const ASession: IResumableSession);
 var
   LKey: string;
+  LEntry: TEntry;
+  LSlot: TOrderSlot;
 begin
   if ASession = nil then
     Exit;
   LKey := KeyOf(AId);
   FLock.Enter;
   try
-    FByKey.AddOrSetValue(LKey, ASession);
-    FOrder.Enqueue(LKey);
+    Inc(FNextSeq);
+    LEntry.Session := ASession;
+    LEntry.Seq := FNextSeq;
+    LSlot.Key := LKey;
+    LSlot.Seq := FNextSeq;
+    FByKey.AddOrSetValue(LKey, LEntry);
+    FOrder.Enqueue(LSlot);
     EvictToCapacity;
     // FOrder gains a (possibly soon-dead) entry per Put; single-use Take keeps FByKey small
     // so EvictToCapacity may never fire - bound FOrder by compacting away dead/dup entries
-    if FOrder.Count > FCapacity * OrderSlackFactor then
+    if Int64(FOrder.Count) > Int64(FCapacity) * OrderSlackFactor then
       CompactOrder;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TInMemorySessionStore.Peek(const AId: TBytes;
+  out ASession: IResumableSession): Boolean;
+var
+  LEntry: TEntry;
+begin
+  ASession := nil;
+  FLock.Enter;
+  try
+    Result := FByKey.TryGetValue(KeyOf(AId), LEntry);
+    if Result then
+      ASession := LEntry.Session;
   finally
     FLock.Leave;
   end;
@@ -175,14 +210,18 @@ function TInMemorySessionStore.Take(const AId: TBytes;
   out ASession: IResumableSession): Boolean;
 var
   LKey: string;
+  LEntry: TEntry;
 begin
   ASession := nil;
   LKey := KeyOf(AId);
   FLock.Enter;
   try
-    Result := FByKey.TryGetValue(LKey, ASession);
+    Result := FByKey.TryGetValue(LKey, LEntry);
     if Result then
+    begin
+      ASession := LEntry.Session;
       FByKey.Remove(LKey);
+    end;
   finally
     FLock.Leave;
   end;

@@ -21,6 +21,7 @@ uses
   TlpIClock,
   TlpClock,
   TlpDateTimeUtilities,
+  MockClock,
   SysUtils,
   Classes,
 {$IFDEF FPC}
@@ -31,11 +32,14 @@ uses
 {$ENDIF FPC}
   TlpTlsAlert,
   TlpCryptoDomainTypes,
+  TlpPkixDomainTypes,
   TlpICryptoProvider,
   TlpICertificateTrust,
+  TlpITrustAnchorStore,
+  TlpTrustAnchorStore,
+  TlpTrustTypes,
   TlpServerName,
   TlpCertificateVerifier,
-  TlpCertificateLimits,
   TlpTrustPolicy,
   TlsLibTestBase;
 
@@ -48,11 +52,27 @@ type
   TTestOcspStapling = class(TTlsLibAlgorithmTestCase)
   private
     FVec: TStringList;
+    // a CA-signed Good response with no nextUpdate (and one with, for contrast)
+    FNoNext: TStringList;
+    // a delegated responder issued by CA A, with a staple naming CA A or CA B in its CertID
+    FMatch: TStringList;
     function V(const AName: string): TBytes;
+    function N(const AName: string): TBytes;
+    function M(const AName: string): TBytes;
+    // a Hard verifier anchored at CA A whose clock is one hour after the control's thisUpdate
+    function MatchVerifier: IServerCertificateVerifier;
+    function NoNextChain: TArray<TBytes>;
+    // the response's thisUpdate in Unix ms, read back from the parsed vector so the clock the
+    // tests pin is derived from the data rather than hard-coded
+    function StapleThisUpdateMs(const ALeaf, AIssuer, AResponse: TBytes): Int64;
+    function ClockedVerifierFor(const AAnchor: TBytes; APosture: TRevocationPosture;
+      ADeferral: TVerdictDeferral; AClockMs: Int64): IServerCertificateVerifier;
     function Chain: TArray<TBytes>;
     function ChainFor(const ALeafName: string): TArray<TBytes>;
     function VerifierFor(APosture: TRevocationPosture;
-      AAsyncResolver: Boolean = False): IServerCertificateVerifier;
+      ADeferral: TVerdictDeferral; AStatusRequestOffered: Boolean;
+      AOccasion: TVerificationOccasion)
+      : IServerCertificateVerifier;
     function VerifyStaple(APosture: TRevocationPosture; const AStaple: TBytes;
       out AAlert: TTlsAlertDescription): Boolean;
     function VerifyChain(APosture: TRevocationPosture; const AChain: TArray<TBytes>;
@@ -63,11 +83,10 @@ type
       out AAlert: TTlsAlertDescription): Boolean;
     // a verifier trusting the root and seeded with AIntermediates for path building
     function IntermediateVerifierFor(APosture: TRevocationPosture;
-      const AIntermediates: TArray<TBytes>; const APins: TArray<TBytes> = nil)
+      const AIntermediates: TArray<TBytes>; const APins: TArray<TBytes>)
       : IServerCertificateVerifier;
   protected
     procedure SetUp; override;
-    procedure TearDown; override;
   published
     // provider verdict seam (ValidateOcspStaple / CertificateTlsFeatures)
     procedure TestValidateStapleGood;
@@ -75,12 +94,25 @@ type
     procedure TestValidateStapleDelegatedResponder;
     procedure TestValidateStapleUnauthorizedSigner;
     procedure TestValidateStapleWrongIssuer;
+    // the CertID issuer match is the only guard against a delegated responder's staple for another CA
+    procedure TestValidateStapleDelegatedMatchingCertIdAccepted;
+    procedure TestValidateStapleDelegatedCertIdNamesOtherCaRefused;
+    procedure TestDelegatedMatchingCertIdStapleHardCompletes;
+    procedure TestDelegatedCertIdNamesOtherCaStapleHardAborts;
+    // one hash wrong at a time, so a comparison of only the name hash or only the key hash is caught
+    procedure TestValidateStapleDelegatedCertIdKeyHashDiffersRefused;
+    procedure TestValidateStapleDelegatedCertIdNameHashDiffersRefused;
+    procedure TestDelegatedCertIdKeyHashDiffersStapleHardAborts;
+    procedure TestDelegatedCertIdNameHashDiffersStapleHardAborts;
     procedure TestValidateStapleMalformed;
     procedure TestTlsFeaturesAbsentIsEmpty;
     procedure TestTlsFeaturesMustStaple;
     procedure TestTlsFeaturesMalformedRejected;
     // trust pipeline revocation posture
     procedure TestGoodStapleCompletes;
+    // a definitive Good staple settles revocation inline (RevocationSettledInline), so a live
+    // park is redundant; an indeterminate outcome stays Trusted so the live park still runs
+    procedure TestGoodStapleUnderLiveRevocationSettlesInline;
     procedure TestRevokedStapleAbortsCertificateRevoked;
     procedure TestDelegatedGoodStapleCompletes;
     procedure TestStaleStapleSoftCompletes;
@@ -96,12 +128,22 @@ type
     procedure TestNoStapleHardWithResolverDefers;
     procedure TestRevokedStapleAbortsEvenWithResolver;
     procedure TestMustStapleMissingStapleAbortsEvenWithResolver;
+    // a host-decision park is augment-only: it does NOT defer the revocation gate, so a no-staple
+    // leaf under Hard is still rejected inline (only LiveRevocation defers)
+    procedure TestNoStapleHardHostDecisionRejectsInline;
     // must-staple (RFC 7633) + TLS Feature well-formedness
     procedure TestMustStapleWithGoodStapleCompletes;
     procedure TestMustStapleMissingStapleAbortsUnderSoft;
     procedure TestMustStapleMissingStapleAbortsUnderOff;
     procedure TestMustStapleNonMatchingStapleAborts;
     procedure TestMalformedTlsFeatureAbortsBadCertificate;
+    // RFC 7633 4.3.3: must-staple binds only when the client asked for a staple; by local policy
+    // it also binds only to an initial-handshake server certificate - not on resumption, not for a
+    // client certificate; a MALFORMED TLS Feature stays fatal regardless
+    procedure TestMustStapleNotRequestedAcceptsUnderSoft;
+    procedure TestMustStapleNotRequestedAcceptsUnderOff;
+    procedure TestMustStapleNotEnforcedOnResumption;
+    procedure TestMalformedTlsFeatureAbortsEvenWhenNotRequested;
     // SPKI public-key pinning
     procedure TestPinningMatchCompletes;
     procedure TestPinningPresentedIssuerMatchCompletes;
@@ -112,6 +154,13 @@ type
     // issuer must be available to the staple step (not just the bare leaf)
     procedure TestLeafOnlyGoodStapleHardCompletesViaConfiguredIssuer;
     procedure TestLeafOnlyPinOnConfiguredIssuerMatchesOverValidatedPath;
+    // a Good response without nextUpdate (RFC 6960 4.2.2.1: newer information is available at
+    // any time) is accepted inline only within a bounded age, and never settles revocation - a
+    // configured live park still runs. One with nextUpdate is Fresh inside its window and settles.
+    procedure TestStapleVerdictWithoutNextUpdateIsGoodUnbounded;
+    procedure TestGoodStapleWithoutNextUpdateAcceptsButDoesNotSettle;
+    procedure TestGoodStapleWithNextUpdateSettles;
+    procedure TestGoodStapleWithoutNextUpdateBeyondMaxAgeIsIndeterminate;
   end;
 
 implementation
@@ -121,18 +170,65 @@ implementation
 procedure TTestOcspStapling.SetUp;
 begin
   inherited SetUp;
-  FVec := LoadVectorFields('Certs/OcspStapling.txt');
+  FVec := Own<TStringList>(LoadVectorFields('Certs/OcspStapling.txt'));
+  FNoNext := Own<TStringList>(LoadVectorFields('Certs/OcspNoNextUpdate.txt'));
+  FMatch := Own<TStringList>(LoadVectorFields('Certs/OcspIssuerMatch.txt'));
 end;
 
-procedure TTestOcspStapling.TearDown;
+function TTestOcspStapling.M(const AName: string): TBytes;
 begin
-  FVec.Free;
-  inherited TearDown;
+  Result := DecodeHex(FMatch.Values[AName]);
+end;
+
+function TTestOcspStapling.MatchVerifier: IServerCertificateVerifier;
+var
+  LThisMs: Int64;
+begin
+  LThisMs := StapleThisUpdateMs(M('leaf_cert'), M('ca_a_cert'), M('ocsp_delegated_good'));
+  Result := ClockedVerifierFor(M('ca_a_cert'), TRevocationPosture.Hard, TVerdictDeferral.None,
+    LThisMs + 3600 * 1000);
 end;
 
 function TTestOcspStapling.V(const AName: string): TBytes;
 begin
   Result := DecodeHex(FVec.Values[AName]);
+end;
+
+function TTestOcspStapling.N(const AName: string): TBytes;
+begin
+  Result := DecodeHex(FNoNext.Values[AName]);
+end;
+
+function TTestOcspStapling.NoNextChain: TArray<TBytes>;
+begin
+  Result := TArray<TBytes>.Create(N('leaf_cert'), N('ca_cert'));
+end;
+
+function TTestOcspStapling.StapleThisUpdateMs(const ALeaf, AIssuer,
+  AResponse: TBytes): Int64;
+var
+  LStatus: TOcspStatus;
+  LThis, LNext: TDateTime;
+begin
+  CheckTrue(Pkix.Revocation.ValidateOcspStaple(ALeaf, AIssuer, AResponse,
+    NowUtc, LStatus, LThis, LNext),
+    'the issuer-authorised response about the leaf is authoritative');
+  CheckEquals(Ord(TOcspStatus.Good), Ord(LStatus), 'the status is Good');
+  Result := TDateTimeUtilities.DateTimeToUnixMs(LThis);
+end;
+
+function TTestOcspStapling.ClockedVerifierFor(const AAnchor: TBytes;
+  APosture: TRevocationPosture; ADeferral: TVerdictDeferral;
+  AClockMs: Int64): IServerCertificateVerifier;
+var
+  LOptions: TCertificateVerifierOptions;
+begin
+  LOptions.RevocationPosture := APosture;
+  LOptions.Deferral := ADeferral;
+  LOptions.StatusRequestOffered := True;
+  Result := TCertificateVerifier.Create(Pkix, TMockClock.Create(UInt64(AClockMs)) as ITlsClock,
+    TTrustAnchorStore.Create(TArray<TBytes>.Create(AAnchor)) as ITrustAnchorStore, False,
+    LOptions) as IServerCertificateVerifier;
 end;
 
 function TTestOcspStapling.Chain: TArray<TBytes>;
@@ -142,17 +238,21 @@ begin
 end;
 
 function TTestOcspStapling.VerifierFor(APosture: TRevocationPosture;
-  AAsyncResolver: Boolean): IServerCertificateVerifier;
+  ADeferral: TVerdictDeferral; AStatusRequestOffered: Boolean;
+  AOccasion: TVerificationOccasion): IServerCertificateVerifier;
 var
-  LNoDangerous: TDangerousTrust;
+  LOptions: TCertificateVerifierOptions;
 begin
-  // AAsyncResolver models an out-of-band verdict resolver (live OCSP/CRL) running at the park;
-  // when set, an indeterminate stapled outcome is deferred to it instead of decided inline
-  LNoDangerous := Default(TDangerousTrust);
-  Result := TCertificateVerifier.Create(Provider, TSystemClock.Create as ITlsClock,
+  // LiveRevocation defers an indeterminate stapled outcome to the out-of-band resolver at the
+  // park; AStatusRequestOffered/AOccasion model whether the client asked to staple and whether
+  // this is the initial handshake (must-staple binds only there)
+  LOptions.RevocationPosture := APosture;
+  LOptions.Deferral := ADeferral;
+  LOptions.StatusRequestOffered := AStatusRequestOffered;
+  LOptions.Occasion := AOccasion;
+  Result := TCertificateVerifier.Create(Pkix, TSystemClock.Create as ITlsClock,
     TTrustAnchorStore.Create(TArray<TBytes>.Create(V('root_cert')))
-    as ITrustAnchorStore, False, TCertificateChainLimits.Defaults, APosture,
-    LNoDangerous, AAsyncResolver) as IServerCertificateVerifier;
+    as ITrustAnchorStore, False, LOptions) as IServerCertificateVerifier;
 end;
 
 function TTestOcspStapling.ChainFor(const ALeafName: string): TArray<TBytes>;
@@ -163,20 +263,22 @@ end;
 function TTestOcspStapling.VerifyStaple(APosture: TRevocationPosture;
   const AStaple: TBytes; out AAlert: TTlsAlertDescription): Boolean;
 var
-  LValidated: TArray<TBytes>;
+  LVerified: TVerifiedChain;
 begin
-  Result := VerifierFor(APosture).VerifyServerCertificate(Chain, TServerName.DnsName(''),
-    AStaple, LValidated, AAlert);
+  Result := VerifierFor(APosture, TVerdictDeferral.None, True,
+    TVerificationOccasion.InitialHandshake).VerifyServerCertificate(Chain,
+    TServerName.DnsName(''), AStaple, LVerified, AAlert);
 end;
 
 function TTestOcspStapling.VerifyChain(APosture: TRevocationPosture;
   const AChain: TArray<TBytes>; const AStaple: TBytes;
   out AAlert: TTlsAlertDescription): Boolean;
 var
-  LValidated: TArray<TBytes>;
+  LVerified: TVerifiedChain;
 begin
-  Result := VerifierFor(APosture).VerifyServerCertificate(AChain, TServerName.DnsName(''),
-    AStaple, LValidated, AAlert);
+  Result := VerifierFor(APosture, TVerdictDeferral.None, True,
+    TVerificationOccasion.InitialHandshake).VerifyServerCertificate(AChain,
+    TServerName.DnsName(''), AStaple, LVerified, AAlert);
 end;
 
 function TTestOcspStapling.LeafSpkiPin: TBytes;
@@ -184,8 +286,8 @@ var
   LSpki: TBytes;
   LHash: IHash;
 begin
-  LSpki := Provider.Certificates.PublicKeyInfo(V('leaf_cert'));
-  LHash := Provider.Primitives.CreateHash(THashAlgorithm.SHA_256);
+  LSpki := Pkix.Certificates.PublicKeyInfo(V('leaf_cert'));
+  LHash := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256);
   LHash.Update(LSpki, 0, System.Length(LSpki));
   Result := LHash.DoFinal;
 end;
@@ -195,8 +297,8 @@ var
   LSpki: TBytes;
   LHash: IHash;
 begin
-  LSpki := Provider.Certificates.PublicKeyInfo(V('issuer_cert'));
-  LHash := Provider.Primitives.CreateHash(THashAlgorithm.SHA_256);
+  LSpki := Pkix.Certificates.PublicKeyInfo(V('issuer_cert'));
+  LHash := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256);
   LHash.Update(LSpki, 0, System.Length(LSpki));
   Result := LHash.DoFinal;
 end;
@@ -204,16 +306,17 @@ end;
 function TTestOcspStapling.IntermediateVerifierFor(APosture: TRevocationPosture;
   const AIntermediates: TArray<TBytes>; const APins: TArray<TBytes>): IServerCertificateVerifier;
 var
-  LNoDangerous: TDangerousTrust;
+  LOptions: TCertificateVerifierOptions;
 begin
-  LNoDangerous := Default(TDangerousTrust);
-  Result := TCertificateVerifier.Create(Provider, TSystemClock.Create as ITlsClock,
+  LOptions.RevocationPosture := APosture;
+  LOptions.Intermediates := AIntermediates;
+  LOptions.StatusRequestOffered := True;
+  Result := TCertificateVerifier.Create(Pkix, TSystemClock.Create as ITlsClock,
     TTrustAnchorStore.Create(TArray<TBytes>.Create(V('root_cert')))
-    as ITrustAnchorStore, False, TCertificateChainLimits.Defaults, APosture,
-    LNoDangerous, False, AIntermediates) as IServerCertificateVerifier;
+    as ITrustAnchorStore, False, LOptions) as IServerCertificateVerifier;
   // pinning composes as a decorator over the built-in verifier, as the engine wires it
   if System.Length(APins) > 0 then
-    Result := TPinningVerifier.Create(Result, APins, Provider)
+    Result := TPinningVerifier.Create(Result, APins, Crypto, Pkix)
       as IServerCertificateVerifier;
 end;
 
@@ -221,17 +324,18 @@ function TTestOcspStapling.VerifyWithPins(const APins: TArray<TBytes>;
   out AAlert: TTlsAlertDescription): Boolean;
 var
   LVerifier: IServerCertificateVerifier;
-  LValidated: TArray<TBytes>;
+  LVerified: TVerifiedChain;
+  LOptions: TCertificateVerifierOptions;
 begin
   // revocation Off isolates the pinning step from the stapled-OCSP step
-  LVerifier := TCertificateVerifier.Create(Provider, TSystemClock.Create as ITlsClock,
+  LOptions.RevocationPosture := TRevocationPosture.Off;
+  LVerifier := TCertificateVerifier.Create(Pkix, TSystemClock.Create as ITlsClock,
     TTrustAnchorStore.Create(TArray<TBytes>.Create(V('root_cert')))
-    as ITrustAnchorStore, False, TCertificateChainLimits.Defaults,
-    TRevocationPosture.Off) as IServerCertificateVerifier;
-  LVerifier := TPinningVerifier.Create(LVerifier, APins, Provider)
+    as ITrustAnchorStore, False, LOptions) as IServerCertificateVerifier;
+  LVerifier := TPinningVerifier.Create(LVerifier, APins, Crypto, Pkix)
     as IServerCertificateVerifier;
   Result := LVerifier.VerifyServerCertificate(Chain, TServerName.DnsName(''), nil,
-    LValidated, AAlert);
+    LVerified, AAlert);
 end;
 
 procedure TTestOcspStapling.TestValidateStapleGood;
@@ -239,8 +343,8 @@ var
   LStatus: TOcspStatus;
   LThis, LNext: TDateTime;
 begin
-  CheckTrue(Provider.Revocation.ValidateOcspStaple(V('leaf_cert'), V('issuer_cert'),
-    V('ocsp_good'), TDateTimeUtilities.ToUniversalTime(Now), LStatus, LThis, LNext),
+  CheckTrue(Pkix.Revocation.ValidateOcspStaple(V('leaf_cert'), V('issuer_cert'),
+    V('ocsp_good'), NowUtc, LStatus, LThis, LNext),
     'an issuer-signed response about the leaf is authoritative');
   CheckEquals(Ord(TOcspStatus.Good), Ord(LStatus), 'the status is Good');
   CheckTrue(LNext > LThis, 'the validity window is well ordered');
@@ -251,8 +355,8 @@ var
   LStatus: TOcspStatus;
   LThis, LNext: TDateTime;
 begin
-  CheckTrue(Provider.Revocation.ValidateOcspStaple(V('leaf_cert'), V('issuer_cert'),
-    V('ocsp_revoked'), TDateTimeUtilities.ToUniversalTime(Now), LStatus, LThis,
+  CheckTrue(Pkix.Revocation.ValidateOcspStaple(V('leaf_cert'), V('issuer_cert'),
+    V('ocsp_revoked'), NowUtc, LStatus, LThis,
     LNext), 'a revoked response is authoritative');
   CheckEquals(Ord(TOcspStatus.Revoked), Ord(LStatus), 'the status is Revoked');
 end;
@@ -263,8 +367,8 @@ var
   LThis, LNext: TDateTime;
 begin
   // signed by an id-kp-OCSPSigning responder the issuer delegated to (RFC 6960 4.2.2.2)
-  CheckTrue(Provider.Revocation.ValidateOcspStaple(V('leaf_cert'), V('issuer_cert'),
-    V('ocsp_good_delegated'), TDateTimeUtilities.ToUniversalTime(Now), LStatus,
+  CheckTrue(Pkix.Revocation.ValidateOcspStaple(V('leaf_cert'), V('issuer_cert'),
+    V('ocsp_good_delegated'), NowUtc, LStatus,
     LThis, LNext), 'a delegated responder is authoritative');
   CheckEquals(Ord(TOcspStatus.Good), Ord(LStatus), 'the status is Good');
 end;
@@ -275,8 +379,8 @@ var
   LThis, LNext: TDateTime;
 begin
   // signed by an unrelated CA the issuer never delegated to
-  CheckFalse(Provider.Revocation.ValidateOcspStaple(V('leaf_cert'), V('issuer_cert'),
-    V('ocsp_unauthorized'), TDateTimeUtilities.ToUniversalTime(Now), LStatus,
+  CheckFalse(Pkix.Revocation.ValidateOcspStaple(V('leaf_cert'), V('issuer_cert'),
+    V('ocsp_unauthorized'), NowUtc, LStatus,
     LThis, LNext), 'an unauthorized signer leaves the status indeterminate');
 end;
 
@@ -285,10 +389,109 @@ var
   LStatus: TOcspStatus;
   LThis, LNext: TDateTime;
 begin
-  // the CertID names the real issuer, so it does not match an unrelated one
-  CheckFalse(Provider.Revocation.ValidateOcspStaple(V('leaf_cert'), V('other_ca_cert'),
-    V('ocsp_good'), TDateTimeUtilities.ToUniversalTime(Now), LStatus, LThis, LNext),
-    'a response whose CertID does not match the issuer is indeterminate');
+  // refused at the issuer-signed-leaf guard
+  CheckFalse(Pkix.Revocation.ValidateOcspStaple(V('leaf_cert'), V('other_ca_cert'),
+    V('ocsp_good'), NowUtc, LStatus, LThis, LNext),
+    'a staple checked against an unrelated issuer is indeterminate');
+end;
+
+procedure TTestOcspStapling.TestValidateStapleDelegatedMatchingCertIdAccepted;
+var
+  LStatus: TOcspStatus;
+  LThis, LNext: TDateTime;
+begin
+  // control: the delegate is valid and the CertID names CA A, so the staple is authoritative
+  CheckTrue(Pkix.Revocation.ValidateOcspStaple(M('leaf_cert'), M('ca_a_cert'),
+    M('ocsp_delegated_good'), NowUtc, LStatus, LThis, LNext),
+    'a delegated staple whose CertID names the real issuer is authoritative');
+  CheckEquals(Ord(TOcspStatus.Good), Ord(LStatus), 'the status is Good');
+end;
+
+procedure TTestOcspStapling.TestValidateStapleDelegatedCertIdNamesOtherCaRefused;
+var
+  LStatus: TOcspStatus;
+  LThis, LNext: TDateTime;
+begin
+  // only the CertID issuer hashes differ from the control
+  CheckFalse(Pkix.Revocation.ValidateOcspStaple(M('leaf_cert'), M('ca_a_cert'),
+    M('ocsp_delegated_wrong_certid'), NowUtc, LStatus, LThis, LNext),
+    'a staple whose CertID names another issuer says nothing about this leaf');
+  CheckEquals(Ord(TOcspStatus.Unknown), Ord(LStatus), 'the status stays Unknown');
+end;
+
+procedure TTestOcspStapling.TestValidateStapleDelegatedCertIdKeyHashDiffersRefused;
+var
+  LStatus: TOcspStatus;
+  LThis, LNext: TDateTime;
+begin
+  // CA A's name under another key: the name hash matches, so only the key hash can refuse it
+  CheckFalse(Pkix.Revocation.ValidateOcspStaple(M('leaf_cert'), M('ca_a_cert'),
+    M('ocsp_delegated_wrong_key_hash'), NowUtc, LStatus, LThis, LNext),
+    'a CertID whose issuer key hash differs is not about this issuer');
+  CheckEquals(Ord(TOcspStatus.Unknown), Ord(LStatus), 'the status stays Unknown');
+end;
+
+procedure TTestOcspStapling.TestValidateStapleDelegatedCertIdNameHashDiffersRefused;
+var
+  LStatus: TOcspStatus;
+  LThis, LNext: TDateTime;
+begin
+  // CA A's key under another name: the key hash matches, so only the name hash can refuse it
+  CheckFalse(Pkix.Revocation.ValidateOcspStaple(M('leaf_cert'), M('ca_a_cert'),
+    M('ocsp_delegated_wrong_name_hash'), NowUtc, LStatus, LThis, LNext),
+    'a CertID whose issuer name hash differs is not about this issuer');
+  CheckEquals(Ord(TOcspStatus.Unknown), Ord(LStatus), 'the status stays Unknown');
+end;
+
+procedure TTestOcspStapling.TestDelegatedMatchingCertIdStapleHardCompletes;
+var
+  LAlert: TTlsAlertDescription;
+  LVerified: TVerifiedChain;
+begin
+  // Hard rejects an indeterminate staple, so acceptance proves the control authenticated
+  CheckTrue(MatchVerifier.VerifyServerCertificate(
+    TArray<TBytes>.Create(M('leaf_cert'), M('ca_a_cert')), TServerName.DnsName(''),
+    M('ocsp_delegated_good'), LVerified, LAlert),
+    'a delegated Good staple naming the real issuer validates under Hard');
+end;
+
+procedure TTestOcspStapling.TestDelegatedCertIdNamesOtherCaStapleHardAborts;
+var
+  LAlert: TTlsAlertDescription;
+  LVerified: TVerifiedChain;
+begin
+  CheckFalse(MatchVerifier.VerifyServerCertificate(
+    TArray<TBytes>.Create(M('leaf_cert'), M('ca_a_cert')), TServerName.DnsName(''),
+    M('ocsp_delegated_wrong_certid'), LVerified, LAlert),
+    'a staple whose CertID names another issuer is indeterminate, which Hard rejects');
+  CheckEquals(Ord(TTlsAlertDescription.BadCertificateStatusResponse), Ord(LAlert),
+    'the alert is bad_certificate_status_response');
+end;
+
+procedure TTestOcspStapling.TestDelegatedCertIdKeyHashDiffersStapleHardAborts;
+var
+  LAlert: TTlsAlertDescription;
+  LVerified: TVerifiedChain;
+begin
+  CheckFalse(MatchVerifier.VerifyServerCertificate(
+    TArray<TBytes>.Create(M('leaf_cert'), M('ca_a_cert')), TServerName.DnsName(''),
+    M('ocsp_delegated_wrong_key_hash'), LVerified, LAlert),
+    'a staple whose CertID key hash differs is indeterminate, which Hard rejects');
+  CheckEquals(Ord(TTlsAlertDescription.BadCertificateStatusResponse), Ord(LAlert),
+    'the alert is bad_certificate_status_response');
+end;
+
+procedure TTestOcspStapling.TestDelegatedCertIdNameHashDiffersStapleHardAborts;
+var
+  LAlert: TTlsAlertDescription;
+  LVerified: TVerifiedChain;
+begin
+  CheckFalse(MatchVerifier.VerifyServerCertificate(
+    TArray<TBytes>.Create(M('leaf_cert'), M('ca_a_cert')), TServerName.DnsName(''),
+    M('ocsp_delegated_wrong_name_hash'), LVerified, LAlert),
+    'a staple whose CertID name hash differs is indeterminate, which Hard rejects');
+  CheckEquals(Ord(TTlsAlertDescription.BadCertificateStatusResponse), Ord(LAlert),
+    'the alert is bad_certificate_status_response');
 end;
 
 procedure TTestOcspStapling.TestValidateStapleMalformed;
@@ -296,8 +499,8 @@ var
   LStatus: TOcspStatus;
   LThis, LNext: TDateTime;
 begin
-  CheckFalse(Provider.Revocation.ValidateOcspStaple(V('leaf_cert'), V('issuer_cert'),
-    TBytes.Create(1, 2, 3, 4), TDateTimeUtilities.ToUniversalTime(Now), LStatus,
+  CheckFalse(Pkix.Revocation.ValidateOcspStaple(V('leaf_cert'), V('issuer_cert'),
+    TBytes.Create(1, 2, 3, 4), NowUtc, LStatus,
     LThis, LNext), 'an unparseable response returns False, never raises');
 end;
 
@@ -305,7 +508,7 @@ procedure TTestOcspStapling.TestTlsFeaturesAbsentIsEmpty;
 var
   LFeatures: TArray<UInt16>;
 begin
-  CheckTrue(Provider.Certificates.TlsFeatures(V('leaf_cert'), LFeatures),
+  CheckTrue(Pkix.Certificates.TlsFeatures(V('leaf_cert'), LFeatures),
     'a certificate without the TLS Feature extension is well formed');
   CheckEquals(0, System.Length(LFeatures), 'it carries no features');
 end;
@@ -314,7 +517,7 @@ procedure TTestOcspStapling.TestTlsFeaturesMustStaple;
 var
   LFeatures: TArray<UInt16>;
 begin
-  CheckTrue(Provider.Certificates.TlsFeatures(V('muststaple_leaf_cert'), LFeatures),
+  CheckTrue(Pkix.Certificates.TlsFeatures(V('muststaple_leaf_cert'), LFeatures),
     'a well-formed TLS Feature extension parses');
   CheckEquals(1, System.Length(LFeatures), 'it lists one feature');
   CheckEquals(5, LFeatures[0], 'the feature is status_request (5)');
@@ -325,7 +528,7 @@ var
   LFeatures: TArray<UInt16>;
 begin
   // the extension value is a bare INTEGER, not a SEQUENCE OF INTEGER
-  CheckFalse(Provider.Certificates.TlsFeatures(V('badfeature_leaf_cert'), LFeatures),
+  CheckFalse(Pkix.Certificates.TlsFeatures(V('badfeature_leaf_cert'), LFeatures),
     'a non-SEQUENCE TLS Feature value is rejected as malformed');
 end;
 
@@ -333,8 +536,35 @@ procedure TTestOcspStapling.TestGoodStapleCompletes;
 var
   LAlert: TTlsAlertDescription;
 begin
-  CheckTrue(VerifyStaple(TRevocationPosture.Soft, V('ocsp_good'), LAlert),
-    'a current Good staple lets the chain validate');
+  // Hard rejects an indeterminate staple, so acceptance proves the Good staple authenticated
+  CheckTrue(VerifyStaple(TRevocationPosture.Hard, V('ocsp_good'), LAlert),
+    'a current Good staple lets the chain validate under Hard');
+end;
+
+procedure TTestOcspStapling.TestGoodStapleUnderLiveRevocationSettlesInline;
+var
+  LVerifier: IServerCertificateVerifier;
+  LVerified: TVerifiedChain;
+  LAlert: TTlsAlertDescription;
+  LStatusRequestOffered: Boolean;
+begin
+  // under a live-revocation deferral a definitive Good staple settles revocation inline, so the
+  // verifier reports RevocationSettledInline and the caller may skip the redundant live park
+  LStatusRequestOffered := True;
+  LVerifier := VerifierFor(TRevocationPosture.Hard, TVerdictDeferral.LiveRevocation,
+    LStatusRequestOffered, TVerificationOccasion.InitialHandshake);
+  CheckTrue(LVerifier.VerifyServerCertificate(Chain, TServerName.DnsName(''), V('ocsp_good'),
+    LVerified, LAlert), 'a Good staple accepts under Hard + live revocation');
+  CheckEquals(Ord(TVerificationOutcome.RevocationSettledInline), Ord(LVerified.Outcome),
+    'a definitive Good staple settles revocation inline (the live park would be redundant)');
+
+  // an indeterminate outcome (no staple) is instead deferred to the park, staying Trusted so the
+  // live-revocation park still runs
+  CheckTrue(LVerifier.VerifyServerCertificate(Chain, TServerName.DnsName(''), nil,
+    LVerified, LAlert),
+    'an unstapled leaf is deferred to the live park under Hard + live revocation');
+  CheckEquals(Ord(TVerificationOutcome.Trusted), Ord(LVerified.Outcome),
+    'an indeterminate outcome stays Trusted so the live park runs');
 end;
 
 procedure TTestOcspStapling.TestRevokedStapleAbortsCertificateRevoked;
@@ -351,8 +581,9 @@ procedure TTestOcspStapling.TestDelegatedGoodStapleCompletes;
 var
   LAlert: TTlsAlertDescription;
 begin
-  CheckTrue(VerifyStaple(TRevocationPosture.Soft, V('ocsp_good_delegated'), LAlert),
-    'a Good staple from a delegated responder lets the chain validate');
+  // Hard rejects an indeterminate staple, so acceptance proves the delegated signer authenticated
+  CheckTrue(VerifyStaple(TRevocationPosture.Hard, V('ocsp_good_delegated'), LAlert),
+    'a Good staple from a delegated responder lets the chain validate under Hard');
 end;
 
 procedure TTestOcspStapling.TestStaleStapleSoftCompletes;
@@ -404,23 +635,25 @@ end;
 procedure TTestOcspStapling.TestNoStapleHardWithResolverDefers;
 var
   LAlert: TTlsAlertDescription;
-  LValidated: TArray<TBytes>;
+  LVerified: TVerifiedChain;
 begin
   // with a live verdict resolver, a no-staple leaf under Hard is accepted here (deferred) so the
   // handshake reaches the park where the resolver decides - not rejected inline
-  CheckTrue(VerifierFor(TRevocationPosture.Hard, {AAsyncResolver=} True)
-    .VerifyServerCertificate(Chain, TServerName.DnsName(''), nil, LValidated, LAlert),
+  CheckTrue(VerifierFor(TRevocationPosture.Hard, TVerdictDeferral.LiveRevocation,
+    True, TVerificationOccasion.InitialHandshake)
+    .VerifyServerCertificate(Chain, TServerName.DnsName(''), nil, LVerified, LAlert),
     'a missing staple under Hard is deferred to the resolver, not rejected inline');
 end;
 
 procedure TTestOcspStapling.TestRevokedStapleAbortsEvenWithResolver;
 var
   LAlert: TTlsAlertDescription;
-  LValidated: TArray<TBytes>;
+  LVerified: TVerifiedChain;
 begin
   // a definitive stapled Revoked is authoritative and short-circuits before any deferral
-  CheckFalse(VerifierFor(TRevocationPosture.Hard, {AAsyncResolver=} True)
-    .VerifyServerCertificate(Chain, TServerName.DnsName(''), V('ocsp_revoked'), LValidated, LAlert),
+  CheckFalse(VerifierFor(TRevocationPosture.Hard, TVerdictDeferral.LiveRevocation,
+    True, TVerificationOccasion.InitialHandshake)
+    .VerifyServerCertificate(Chain, TServerName.DnsName(''), V('ocsp_revoked'), LVerified, LAlert),
     'a revoked staple aborts even when a resolver is present');
   CheckEquals(Ord(TTlsAlertDescription.CertificateRevoked), Ord(LAlert),
     'the alert is certificate_revoked');
@@ -429,13 +662,14 @@ end;
 procedure TTestOcspStapling.TestMustStapleMissingStapleAbortsEvenWithResolver;
 var
   LAlert: TTlsAlertDescription;
-  LValidated: TArray<TBytes>;
+  LVerified: TVerifiedChain;
 begin
   // RFC 7633: a must-staple leaf demands a current Good staple; a live fetch does not satisfy it,
   // so it is rejected inline even with a resolver present (the deferral never applies)
-  CheckFalse(VerifierFor(TRevocationPosture.Hard, {AAsyncResolver=} True)
+  CheckFalse(VerifierFor(TRevocationPosture.Hard, TVerdictDeferral.LiveRevocation,
+    True, TVerificationOccasion.InitialHandshake)
     .VerifyServerCertificate(ChainFor('muststaple_leaf_cert'), TServerName.DnsName(''), nil,
-    LValidated, LAlert),
+    LVerified, LAlert),
     'a must-staple leaf with no staple aborts even with a resolver present');
   CheckEquals(Ord(TTlsAlertDescription.BadCertificateStatusResponse), Ord(LAlert),
     'the alert is bad_certificate_status_response');
@@ -517,6 +751,83 @@ begin
     'the alert is bad_certificate');
 end;
 
+procedure TTestOcspStapling.TestNoStapleHardHostDecisionRejectsInline;
+var
+  LAlert: TTlsAlertDescription;
+  LVerified: TVerifiedChain;
+begin
+  // a host-decision park does not defer the revocation gate, so a no-staple leaf under Hard is
+  // rejected inline exactly as with no deferral (only LiveRevocation would defer it)
+  CheckFalse(VerifierFor(TRevocationPosture.Hard, TVerdictDeferral.HostDecision,
+    True, TVerificationOccasion.InitialHandshake)
+    .VerifyServerCertificate(Chain, TServerName.DnsName(''), nil, LVerified, LAlert),
+    'a missing staple under Hard + host-decision is rejected inline, not deferred');
+  CheckEquals(Ord(TTlsAlertDescription.BadCertificateStatusResponse), Ord(LAlert),
+    'the alert is bad_certificate_status_response');
+end;
+
+procedure TTestOcspStapling.TestMustStapleNotRequestedAcceptsUnderSoft;
+var
+  LAlert: TTlsAlertDescription;
+  LVerified: TVerifiedChain;
+  LStatusRequestOffered: Boolean;
+begin
+  // the client never offered status_request, so a must-staple leaf is not required to staple
+  LStatusRequestOffered := False;
+  CheckTrue(VerifierFor(TRevocationPosture.Soft, TVerdictDeferral.None,
+    LStatusRequestOffered, TVerificationOccasion.InitialHandshake)
+    .VerifyServerCertificate(ChainFor('muststaple_leaf_cert'),
+    TServerName.DnsName(''), nil, LVerified, LAlert),
+    'an unrequested must-staple leaf is accepted under soft-fail');
+end;
+
+procedure TTestOcspStapling.TestMustStapleNotRequestedAcceptsUnderOff;
+var
+  LAlert: TTlsAlertDescription;
+  LVerified: TVerifiedChain;
+  LStatusRequestOffered: Boolean;
+begin
+  LStatusRequestOffered := False;
+  CheckTrue(VerifierFor(TRevocationPosture.Off, TVerdictDeferral.None,
+    LStatusRequestOffered, TVerificationOccasion.InitialHandshake)
+    .VerifyServerCertificate(ChainFor('muststaple_leaf_cert'),
+    TServerName.DnsName(''), nil, LVerified, LAlert),
+    'an unrequested must-staple leaf is accepted under Off');
+end;
+
+procedure TTestOcspStapling.TestMustStapleNotEnforcedOnResumption;
+var
+  LAlert: TTlsAlertDescription;
+  LVerified: TVerifiedChain;
+  LStatusRequestOffered: Boolean;
+begin
+  // no Certificate is on the wire on a resumption, so must-staple never fires even when the
+  // client offered status_request
+  LStatusRequestOffered := True;
+  CheckTrue(VerifierFor(TRevocationPosture.Soft, TVerdictDeferral.None,
+    LStatusRequestOffered, TVerificationOccasion.Resumption)
+    .VerifyServerCertificate(ChainFor('muststaple_leaf_cert'),
+    TServerName.DnsName(''), nil, LVerified, LAlert),
+    'must-staple is not enforced on a resumption');
+end;
+
+procedure TTestOcspStapling.TestMalformedTlsFeatureAbortsEvenWhenNotRequested;
+var
+  LAlert: TTlsAlertDescription;
+  LVerified: TVerifiedChain;
+  LStatusRequestOffered: Boolean;
+begin
+  // TLS Feature well-formedness is a hard invariant independent of request/occasion
+  LStatusRequestOffered := False;
+  CheckFalse(VerifierFor(TRevocationPosture.Off, TVerdictDeferral.None,
+    LStatusRequestOffered, TVerificationOccasion.Resumption)
+    .VerifyServerCertificate(ChainFor('badfeature_leaf_cert'),
+    TServerName.DnsName(''), nil, LVerified, LAlert),
+    'a malformed TLS Feature is fatal even when stapling was not requested');
+  CheckEquals(Ord(TTlsAlertDescription.BadCertificate), Ord(LAlert),
+    'the alert is bad_certificate');
+end;
+
 procedure TTestOcspStapling.TestPinningMatchCompletes;
 var
   LAlert: TTlsAlertDescription;
@@ -538,32 +849,31 @@ end;
 
 procedure TTestOcspStapling.TestInsecureSkipVerifyStillEnforcesPins;
 var
-  LDangerous: TDangerousTrust;
+  LOptions: TCertificateVerifierOptions;
   LInner, LVerifier: IServerCertificateVerifier;
   LAlert: TTlsAlertDescription;
   LWrongPin: TBytes;
-  LValidated: TArray<TBytes>;
+  LVerified: TVerifiedChain;
 begin
   // InsecureSkipVerify bypasses PKIX, but a configured LEAF pin still applies (pin-only trust): a
   // wrong pin rejects even the otherwise-accept-anything inner verifier. Under skip-verify the
   // validated chain is the leaf alone, so only a leaf pin is meaningful.
-  LDangerous := Default(TDangerousTrust);
-  LDangerous.InsecureSkipVerify := True;
-  LInner := TCertificateVerifier.Create(Provider, TSystemClock.Create as ITlsClock,
-    TTrustAnchorStore.Create(nil) as ITrustAnchorStore, False,
-    TCertificateChainLimits.Defaults, TRevocationPosture.Off, LDangerous, False)
+  LOptions.Dangerous.InsecureSkipVerify := True;
+  LOptions.RevocationPosture := TRevocationPosture.Off;
+  LInner := TCertificateVerifier.Create(Pkix, TSystemClock.Create as ITlsClock,
+    TTrustAnchorStore.Create(nil) as ITrustAnchorStore, False, LOptions)
     as IServerCertificateVerifier;
   LWrongPin := LeafSpkiPin;
   LWrongPin[0] := LWrongPin[0] xor $FF;
-  LVerifier := TPinningVerifier.Create(LInner, TArray<TBytes>.Create(LWrongPin), Provider)
+  LVerifier := TPinningVerifier.Create(LInner, TArray<TBytes>.Create(LWrongPin), Crypto, Pkix)
     as IServerCertificateVerifier;
   CheckFalse(LVerifier.VerifyServerCertificate(Chain, TServerName.DnsName(''), nil,
-    LValidated, LAlert),
+    LVerified, LAlert),
     'a wrong pin rejects even under InsecureSkipVerify');
-  LVerifier := TPinningVerifier.Create(LInner, TArray<TBytes>.Create(LeafSpkiPin), Provider)
+  LVerifier := TPinningVerifier.Create(LInner, TArray<TBytes>.Create(LeafSpkiPin), Crypto, Pkix)
     as IServerCertificateVerifier;
   CheckTrue(LVerifier.VerifyServerCertificate(Chain, TServerName.DnsName(''), nil,
-    LValidated, LAlert),
+    LVerified, LAlert),
     'the matching leaf pin accepts under InsecureSkipVerify (pin-only trust)');
 end;
 
@@ -584,58 +894,138 @@ end;
 procedure TTestOcspStapling.TestLeafOnlyGoodStapleHardCompletesViaConfiguredIssuer;
 var
   LAlert: TTlsAlertDescription;
-  LValidated: TArray<TBytes>;
+  LVerified: TVerifiedChain;
 begin
   // the peer sends only its leaf; the issuer that signs the staple is supplied as a configured
   // intermediate. Under Hard posture a good staple must still be authenticated - which is only
   // possible because path building hands the recovered issuer to the revocation step.
   CheckTrue(IntermediateVerifierFor(TRevocationPosture.Hard,
-    TArray<TBytes>.Create(V('issuer_cert'))).VerifyServerCertificate(
+    TArray<TBytes>.Create(V('issuer_cert')), nil).VerifyServerCertificate(
     TArray<TBytes>.Create(V('leaf_cert')), TServerName.DnsName(''), V('ocsp_good'),
-    LValidated, LAlert),
+    LVerified, LAlert),
     'a good staple authenticates against the configured issuer for a leaf-only peer');
 end;
 
 procedure TTestOcspStapling.TestLeafOnlyPinOnConfiguredIssuerMatchesOverValidatedPath;
 var
   LAlert: TTlsAlertDescription;
-  LValidated: TArray<TBytes>;
+  LVerified: TVerifiedChain;
 begin
-  // pinning is over the VALIDATED path (RFC 7469 6): when the peer sends only its leaf, path
+  // pinning is over the VALIDATED path (RFC 7469 2.6): when the peer sends only its leaf, path
   // building recovers the configured issuer into the validated chain, so a pin on that issuer
   // matches even though the peer did not present it. Revocation Off isolates the pinning step.
   CheckTrue(IntermediateVerifierFor(TRevocationPosture.Off,
     TArray<TBytes>.Create(V('issuer_cert')),
     TArray<TBytes>.Create(IssuerSpkiPin)).VerifyServerCertificate(
-    TArray<TBytes>.Create(V('leaf_cert')), TServerName.DnsName(''), nil, LValidated, LAlert),
+    TArray<TBytes>.Create(V('leaf_cert')), TServerName.DnsName(''), nil, LVerified, LAlert),
     'a pin on a recovered issuer matches over the validated path for a leaf-only peer');
 end;
 
 procedure TTestOcspStapling.TestSkipVerifyLeafPinRejectsPrependedAttackerLeaf;
 var
-  LDangerous: TDangerousTrust;
+  LOptions: TCertificateVerifierOptions;
   LInner, LVerifier: IServerCertificateVerifier;
   LAlert: TTlsAlertDescription;
-  LValidated: TArray<TBytes>;
+  LVerified: TVerifiedChain;
 begin
   // the pin-bypass guard for skip-verify: an attacker sends [attackerLeaf, pinnedLeaf]. Under
   // InsecureSkipVerify the validated chain is the leaf (index 0, the attacker's) alone, so a pin
   // on the genuine leaf (at index 1) does NOT match - the connection is rejected. Matching over
   // the presented chain would wrongly accept it.
-  LDangerous := Default(TDangerousTrust);
-  LDangerous.InsecureSkipVerify := True;
-  LInner := TCertificateVerifier.Create(Provider, TSystemClock.Create as ITlsClock,
-    TTrustAnchorStore.Create(nil) as ITrustAnchorStore, False,
-    TCertificateChainLimits.Defaults, TRevocationPosture.Off, LDangerous, False)
+  LOptions.Dangerous.InsecureSkipVerify := True;
+  LOptions.RevocationPosture := TRevocationPosture.Off;
+  LInner := TCertificateVerifier.Create(Pkix, TSystemClock.Create as ITlsClock,
+    TTrustAnchorStore.Create(nil) as ITrustAnchorStore, False, LOptions)
     as IServerCertificateVerifier;
-  LVerifier := TPinningVerifier.Create(LInner, TArray<TBytes>.Create(LeafSpkiPin), Provider)
+  LVerifier := TPinningVerifier.Create(LInner, TArray<TBytes>.Create(LeafSpkiPin), Crypto, Pkix)
     as IServerCertificateVerifier;
   CheckFalse(LVerifier.VerifyServerCertificate(
     TArray<TBytes>.Create(V('issuer_cert'), V('leaf_cert')), TServerName.DnsName(''), nil,
-    LValidated, LAlert),
+    LVerified, LAlert),
     'a leaf pin does not match a genuine leaf appended behind an attacker leaf under skip-verify');
   CheckEquals(Ord(TTlsAlertDescription.BadCertificate), Ord(LAlert),
     'the alert is bad_certificate');
+end;
+
+procedure TTestOcspStapling.TestStapleVerdictWithoutNextUpdateIsGoodUnbounded;
+var
+  LStatus: TOcspStatus;
+  LThis, LNext: TDateTime;
+  LThisMs: Int64;
+begin
+  // the vector really carries no nextUpdate (the provider reports it as 0)
+  CheckTrue(Pkix.Revocation.ValidateOcspStaple(N('leaf_cert'), N('ca_cert'),
+    N('ocsp_good_nonext'), NowUtc, LStatus, LThis, LNext),
+    'the no-nextUpdate response is authoritative');
+  CheckTrue(LNext = 0, 'the response carries no nextUpdate');
+  LThisMs := TDateTimeUtilities.DateTimeToUnixMs(LThis);
+  CheckEquals(Ord(TStapleVerdict.GoodUnbounded),
+    Ord(TOcspStaplePolicy.Verdict(Pkix,
+    TMockClock.Create(UInt64(LThisMs + 3600 * 1000)) as ITlsClock, NoNextChain,
+    N('ocsp_good_nonext'))), 'a recent Good without nextUpdate is GoodUnbounded, never GoodFresh');
+  CheckEquals(Ord(TStapleVerdict.Indeterminate),
+    Ord(TOcspStaplePolicy.Verdict(Pkix,
+    TMockClock.Create(UInt64(LThisMs + TRevocationDecision.OcspUnboundedMaxAgeMs + 1))
+    as ITlsClock, NoNextChain, N('ocsp_good_nonext'))),
+    'past the max age a Good without nextUpdate is Indeterminate');
+  CheckEquals(Ord(TStapleVerdict.GoodFresh),
+    Ord(TOcspStaplePolicy.Verdict(Pkix,
+    TMockClock.Create(UInt64(LThisMs + 3600 * 1000)) as ITlsClock, NoNextChain,
+    N('ocsp_good_withnext'))), 'the same response with nextUpdate is GoodFresh inside its window');
+end;
+
+procedure TTestOcspStapling.TestGoodStapleWithoutNextUpdateAcceptsButDoesNotSettle;
+var
+  LAlert: TTlsAlertDescription;
+  LVerified: TVerifiedChain;
+begin
+  // Hard + live revocation, one hour after thisUpdate: the staple satisfies the inline gate, but
+  // the outcome stays Trusted so the configured live park still runs - a replayed old Good must
+  // not stand in for the live check that would report a later revocation
+  CheckTrue(ClockedVerifierFor(N('ca_cert'), TRevocationPosture.Hard,
+    TVerdictDeferral.LiveRevocation, StapleThisUpdateMs(N('leaf_cert'), N('ca_cert'),
+    N('ocsp_good_nonext')) + 3600 * 1000).VerifyServerCertificate(
+    NoNextChain, TServerName.DnsName(''), N('ocsp_good_nonext'), LVerified, LAlert),
+    'a recent Good staple without nextUpdate is accepted under Hard + live revocation');
+  CheckEquals(Ord(TVerificationOutcome.Trusted), Ord(LVerified.Outcome),
+    'a Good staple without nextUpdate does not settle revocation inline');
+end;
+
+procedure TTestOcspStapling.TestGoodStapleWithNextUpdateSettles;
+var
+  LAlert: TTlsAlertDescription;
+  LVerified: TVerifiedChain;
+begin
+  // the contrast: the same responder's Good WITH nextUpdate is Fresh and settles inline
+  CheckTrue(ClockedVerifierFor(N('ca_cert'), TRevocationPosture.Hard,
+    TVerdictDeferral.LiveRevocation, StapleThisUpdateMs(N('leaf_cert'), N('ca_cert'),
+    N('ocsp_good_withnext')) + 3600 * 1000).VerifyServerCertificate(
+    NoNextChain, TServerName.DnsName(''), N('ocsp_good_withnext'), LVerified, LAlert),
+    'a Good staple with nextUpdate is accepted under Hard + live revocation');
+  CheckEquals(Ord(TVerificationOutcome.RevocationSettledInline), Ord(LVerified.Outcome),
+    'a Good staple inside its nextUpdate window settles revocation inline');
+end;
+
+procedure TTestOcspStapling.TestGoodStapleWithoutNextUpdateBeyondMaxAgeIsIndeterminate;
+var
+  LAlert: TTlsAlertDescription;
+  LVerified: TVerifiedChain;
+  LClockMs: Int64;
+begin
+  // eight days after thisUpdate the no-nextUpdate Good is past the max age: Indeterminate, which
+  // Hard rejects and Soft accepts
+  LClockMs := StapleThisUpdateMs(N('leaf_cert'), N('ca_cert'), N('ocsp_good_nonext')) +
+    Int64(8) * 24 * 3600 * 1000;
+  CheckFalse(ClockedVerifierFor(N('ca_cert'), TRevocationPosture.Hard, TVerdictDeferral.None,
+    LClockMs).VerifyServerCertificate(NoNextChain, TServerName.DnsName(''), N('ocsp_good_nonext'),
+    LVerified, LAlert), 'Hard rejects a Good without nextUpdate that is past the max age');
+  CheckEquals(Ord(TTlsAlertDescription.BadCertificateStatusResponse), Ord(LAlert),
+    'the alert is bad_certificate_status_response');
+  CheckTrue(ClockedVerifierFor(N('ca_cert'), TRevocationPosture.Soft, TVerdictDeferral.None,
+    LClockMs).VerifyServerCertificate(NoNextChain, TServerName.DnsName(''), N('ocsp_good_nonext'),
+    LVerified, LAlert), 'Soft accepts the indeterminate outcome');
+  CheckEquals(Ord(TVerificationOutcome.Trusted), Ord(LVerified.Outcome),
+    'an indeterminate outcome never settles');
 end;
 
 initialization

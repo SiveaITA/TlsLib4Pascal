@@ -22,6 +22,8 @@ uses
   TlpIWireWriter,
   TlpWireWriter,
   TlpWireVectorMarker,
+  TlpExtensionVector,
+  TlpCoreExtensions,
   TlpEchConfig,
   TlpTlsLibExceptions;
 
@@ -59,6 +61,11 @@ type
   public const
     /// <summary>The fixed accept-confirmation length (RFC 9849 sec. 7.2).</summary>
     ConfirmationLength = Int32(8);
+    /// <summary>The confirmation's offset inside ServerHello.random (its last 8 bytes).</summary>
+    ServerHelloRandomConfirmationOffset = Int32(24);
+    /// <summary>The confirmation's offset in the framed ServerHello (the 4-byte handshake
+    /// header and 2-byte legacy_version precede the 32-byte random).</summary>
+    FramedServerHelloConfirmationOffset = Int32(30);
   public
     /// <summary>The ClientHelloOuter encrypted_client_hello body.</summary>
     class function EncodeOuter(const AOuter: TEchOuterClientHello): TBytes; static;
@@ -67,7 +74,7 @@ type
     /// <summary>
     /// Decodes an encrypted_client_hello body, returning its form. For the outer form
     /// AOuter is filled; for the inner form it is left empty. Raises a decode_error on a
-    /// malformed body, or illegal_parameter on an out-of-range type (RFC 9849 sec. 5).
+    /// malformed body, or illegal_parameter on an out-of-range type (RFC 9849 sec. 7).
     /// </summary>
     class procedure Decode(const AData: TBytes; out AType: TEchClientHelloType;
       out AOuter: TEchOuterClientHello); static;
@@ -78,20 +85,17 @@ type
     /// malformed or empty list.</summary>
     class function DecodeOuterExtensions(const AData: TBytes): TArray<UInt16>; static;
 
-    /// <summary>
-    /// The EncryptedExtensions encrypted_client_hello body on ECH reject: the
-    /// retry_configs, which is exactly an ECHConfigList (RFC 9849 sec. 5).
-    /// </summary>
-    class function EncodeRetryConfigs(const AConfigListBytes: TBytes): TBytes; static;
-    /// <summary>Parses a retry_configs body (an ECHConfigList).</summary>
-    class function DecodeRetryConfigs(const AData: TBytes): TArray<TEchConfig>; static;
-
     /// <summary>The HelloRetryRequest encrypted_client_hello body: an 8-byte
     /// confirmation (RFC 9849 sec. 5). Raises if AConfirmation is not 8 bytes.</summary>
     class function EncodeHrrConfirmation(const AConfirmation: TBytes): TBytes; static;
     /// <summary>The 8-byte confirmation from a HelloRetryRequest ech body. Raises a
     /// decode_error if the body is not exactly 8 bytes.</summary>
     class function DecodeHrrConfirmation(const AData: TBytes): TBytes; static;
+    /// <summary>The absolute offset of the HelloRetryRequest ech confirmation in AFramedHrr, found
+    /// by parsing (the ech extension's position is not fixed); False when the HRR carries no ech.
+    /// Raises decode_error on a wrong-length ech.</summary>
+    class function LocateHrrConfirmation(const AFramedHrr: TBytes;
+      out AOffset: Int32): Boolean; static;
   end;
 
 implementation
@@ -156,7 +160,7 @@ var
 begin
   AOuter := Default(TEchOuterClientHello);
   LReader := TWireReader.Create(AData);
-  // an out-of-range ECHClientHelloType is illegal_parameter, not decode_error (RFC 9849 sec. 5)
+  // an out-of-range ECHClientHelloType is illegal_parameter, not decode_error (RFC 9849 sec. 7)
   if not TEchClientHelloType.TryFromByte(LReader.ReadUInt8, AType) then
     raise EFatalAlertTlsLibException.CreateRes(
       TTlsAlertDescription.IllegalParameter, @SUnknownEchType);
@@ -205,32 +209,19 @@ var
   LReader, LList: TWireReader;
   LCount: Int32;
 begin
-  Result := nil;
   LReader := TWireReader.Create(AData);
   LList := LReader.OpenVector(1);
   LReader.ExpectEnd;
+  // the vector is a run of UInt16 codepoints; size once from its byte length, then fill
+  SetLength(Result, LList.Remaining div 2);
   LCount := 0;
   while not LList.EndReached do
   begin
-    SetLength(Result, LCount + 1);
     Result[LCount] := LList.ReadUInt16;
     Inc(LCount);
   end;
   if LCount = 0 then
     raise EDecodeErrorTlsLibException.CreateRes(@SEmptyOuterExtensions);
-end;
-
-class function TEchExtension.EncodeRetryConfigs(
-  const AConfigListBytes: TBytes): TBytes;
-begin
-  // the EncryptedExtensions ech body IS an ECHConfigList (RFC 9849 sec. 5)
-  Result := System.Copy(AConfigListBytes);
-end;
-
-class function TEchExtension.DecodeRetryConfigs(
-  const AData: TBytes): TArray<TEchConfig>;
-begin
-  Result := TEchConfigList.Parse(AData);
 end;
 
 class function TEchExtension.EncodeHrrConfirmation(
@@ -246,6 +237,34 @@ begin
   if System.Length(AData) <> ConfirmationLength then
     raise EDecodeErrorTlsLibException.CreateRes(@SBadConfirmationLength);
   Result := System.Copy(AData);
+end;
+
+class function TEchExtension.LocateHrrConfirmation(const AFramedHrr: TBytes;
+  out AOffset: Int32): Boolean;
+var
+  LReader, LSid: TWireReader;
+  LVector: TExtensionVector;
+  LEntry: TExtensionEntry;
+begin
+  Result := False;
+  AOffset := 0;
+  LReader := TWireReader.Create(AFramedHrr);
+  LReader.Skip(4);  // handshake header (type + 3-byte length)
+  LReader.Skip(2);  // legacy_version
+  LReader.Skip(32); // random
+  LSid := LReader.OpenVector(1); // legacy_session_id_echo
+  LSid.Skip(LSid.Remaining);
+  LReader.Skip(2);  // cipher_suite
+  LReader.Skip(1);  // legacy_compression_method
+  LVector := TExtensionVector.ParseFrom(LReader);
+  if LVector.TryFind(TExtensionTypes.EncryptedClientHello, LEntry) then
+  begin
+    if System.Length(LEntry.Data) <> ConfirmationLength then
+      raise EFatalAlertTlsLibException.CreateRes(
+        TTlsAlertDescription.DecodeError, @SBadConfirmationLength);
+    AOffset := LEntry.DataOffset; // absolute in AFramedHrr
+    Result := True;
+  end;
 end;
 
 end.

@@ -70,13 +70,27 @@ uses
   ClpIKemDecapsulator,
   ClpISigner,
   ClpSignerUtilities,
+  ClpIDsa,
+  ClpIDsaKCalculator,
+  ClpHMacDsaKCalculator,
+  ClpECDsaSigner,
+  ClpDsaDigestSigner,
   ClpIAsymmetricKeyParameter,
   ClpPublicKeyFactory,
   ClpPrivateKeyFactory,
   ClpPrivateKeyInfoFactory,
+  ClpPbeUtilities,
+  ClpIBufferedCipher,
   ClpIOpenSslPasswordFinder,
   ClpIOpenSslPemReader,
   ClpOpenSslPemReader,
+  ClpIPemObject,
+  ClpIPemHeader,
+  ClpIPemReader,
+  ClpPemReader,
+  ClpIPemWriter,
+  ClpPemWriter,
+  ClpStringUtilities,
   ClpIPkcsAsn1Objects,
   ClpPkcsAsn1Objects,
   ClpIPkcsRsaAsn1Objects,
@@ -93,9 +107,9 @@ uses
   ClpAsn1Core,
   ClpRsaParameters,
   ClpIRsaParameters,
-  ClpX509CertificateParser,
-  ClpIX509CertificateParser,
-  ClpIX509Certificate,
+  ClpIEd25519Parameters,
+  ClpIEd448Parameters,
+  ClpSubjectPublicKeyInfoFactory,
   ClpIX509CertificateEntry,
   ClpIAsymmetricKeyEntry,
   ClpIPkcs12Store,
@@ -105,38 +119,20 @@ uses
   ClpX509Asn1Objects,
   ClpIAsn1Core,
   ClpIAsn1Objects,
-  ClpPkixCertPath,
-  ClpPkixParameters,
-  ClpPkixCertPathValidator,
-  ClpPkixCertPathBuilder,
-  ClpPkixBuilderParameters,
-  ClpX509StoreSelectors,
-  ClpIX509StoreSelectors,
-  ClpCollectionStore,
-  ClpIStore,
-  ClpTrustAnchor,
-  ClpIPkixTypes,
-  ClpOcspProtocolObjects,
-  ClpIOcspProtocolObjects,
-  ClpOcspGenerators,
-  ClpIOcspGenerators,
-  ClpX509ObjectIdentifiers,
-  ClpX509CrlParser,
-  ClpIX509CrlParser,
-  ClpIX509Crl,
   ClpCryptoLibTypes,
   ClpNullable,
   ClpValueHelper,
   ClpCryptoLibExceptions,
   TlpCryptoDomainTypes,
-  TlpNegotiationTypes,
   TlpPem,
   TlpBinaryPrimitives,
   TlpArrayUtilities,
   TlpEnumUtilities,
   TlpICryptoProvider,
   TlpISigningKey,
-  TlpTlsCredential,
+  TlpIKeyExchangePrivateKey,
+  TlpImportedCredential,
+  TlpPkcs12Identity,
   TlpISecretBuffer,
   TlpSecretBuffer,
   TlpTls12PrfComposition,
@@ -148,29 +144,9 @@ uses
 
 type
   /// <summary>
-  /// A recipe for composing a provider: each nil field takes the default, each
-  /// non-nil field replaces that one facet (and <c>Random</c> replaces the entropy
-  /// source threaded into the default Primitives and Signing). Composing coherent
-  /// facets is the composer's responsibility: any supplied facet or <c>IRandom</c>
-  /// must be thread-safe (stateless or internally synchronized), since it slots into
-  /// a provider whose accessors promise thread-safety and whose RNG is reached
-  /// concurrently from Primitives and Signing.
-  /// </summary>
-  TCryptoProviderOverrides = record
-    Random: IRandom;
-    Primitives: ICryptoPrimitives;
-    Signing: ISigningCrypto;
-    Inspector: ICertificateInspector;
-    PathValidation: ICertificatePathValidator;
-    Revocation: IRevocationChecker;
-    Hpke: IHpkeCrypto;
-  end;
-
-  /// <summary>
-  /// The default <see cref="ICryptoProvider" />, backed by CryptoLib4Pascal. A thin
-  /// composition root: it holds one instance of each facet and its accessors return
-  /// them. <see cref="Create" /> is the single composition point; the five facet
-  /// implementations are private to this unit.
+  /// The default <see cref="ICryptoProvider" />. A thin composition root: it holds one
+  /// instance of each facet and its accessors return them. <see cref="Create" /> is the
+  /// single composition point; the Primitives and Signing implementations are private to this unit.
   /// </summary>
   TDefaultCryptoProvider = class(TInterfacedObject, ICryptoProvider)
   strict private
@@ -180,51 +156,44 @@ type
   var
     FPrimitives: ICryptoPrimitives;
     FSigning: ISigningCrypto;
-    FInspector: ICertificateInspector;
-    FPathValidation: ICertificatePathValidator;
-    FRevocation: IRevocationChecker;
     FHpke: IHpkeCrypto;
+  private
+    /// <summary>The single composition point (reached by the builder). ARandom (nil: a fresh
+    /// CSPRNG) feeds the default Primitives/Signing; each nil facet is defaulted, each supplied
+    /// one held as-is. A supplied facet or IRandom must be thread-safe.</summary>
+    constructor Create(const ARandom: IRandom; const APrimitives: ICryptoPrimitives;
+      const ASigning: ISigningCrypto; const AHpke: IHpkeCrypto); overload;
   public
-    /// <summary>The single composition point. Resolves the effective RNG first (a supplied
-    /// AOverrides.Random bridged to the CryptoLib CSPRNG, else a fresh one) and threads that
-    /// one instance into the default Primitives and Signing it builds; each nil facet override
-    /// is defaulted, each supplied facet is held as-is. A Random override governs only the
-    /// default facets, not a supplied Primitives.</summary>
-    constructor Create(const AOverrides: TCryptoProviderOverrides); overload;
     /// <summary>An all-defaults provider (no overrides).</summary>
     constructor Create; overload;
     class constructor Create;
     class destructor Destroy;
     /// <summary>A process-wide, lazily-created all-defaults provider: the fallback when no
     /// provider is injected, and the hasher for memo signatures. One CSPRNG seed for the
-    /// process, shared (the provider is a stateless service factory). It reflects no overrides -
-    /// it is the all-defaults singleton.</summary>
+    /// process, shared (the provider is a stateless service factory). It reflects no
+    /// overrides.</summary>
     class function Shared: ICryptoProvider; static;
 
     function Primitives: ICryptoPrimitives;
     function Signing: ISigningCrypto;
-    function Certificates: ICertificateInspector;
-    function PathValidation: ICertificatePathValidator;
-    function Revocation: IRevocationChecker;
     function Hpke: IHpkeCrypto;
   end;
 
   /// <summary>
   /// The fluent <see cref="ICryptoProviderBuilder" />: accumulates facet overrides
-  /// and composes through <see cref="TDefaultCryptoProvider.Create" /> (zero
-  /// duplication - all composition logic stays in that one constructor).
+  /// and composes through <see cref="TDefaultCryptoProvider.Create" />.
   /// </summary>
   TCryptoProviderBuilder = class(TInterfacedObject, ICryptoProviderBuilder)
   strict private
   var
-    FOverrides: TCryptoProviderOverrides;
+    FRandom: IRandom;
+    FPrimitives: ICryptoPrimitives;
+    FSigning: ISigningCrypto;
+    FHpke: IHpkeCrypto;
   public
     function WithRandom(const ARandom: IRandom): ICryptoProviderBuilder;
     function WithPrimitives(const APrimitives: ICryptoPrimitives): ICryptoProviderBuilder;
     function WithSigning(const ASigning: ISigningCrypto): ICryptoProviderBuilder;
-    function WithInspector(const AInspector: ICertificateInspector): ICryptoProviderBuilder;
-    function WithPathValidation(const APathValidation: ICertificatePathValidator): ICryptoProviderBuilder;
-    function WithRevocation(const ARevocation: IRevocationChecker): ICryptoProviderBuilder;
     function WithHpke(const AHpke: IHpkeCrypto): ICryptoProviderBuilder;
     function Build: ICryptoProvider;
   end;
@@ -236,24 +205,39 @@ resourcestring
   SInvalidKeySize = 'AEAD key size %d does not match the required %d bytes';
   SInvalidNonceSize = 'AEAD nonce size %d does not match the required %d bytes';
   SAeadAuthFailed = 'AEAD authentication failed';
+  SAeadSpanOutOfRange = 'the AEAD source/destination span is out of range';
+  SAeadBadOverlap = 'the AEAD source and destination may only alias at the same offset';
+  SAeadNotKeyed = 'the AEAD cipher has no key; call Init before Seal or Open';
+  SAeadSealRejected = 'the AEAD Seal was rejected (nonce reuse or an invalid parameter)';
+  SAeadOpenRejected = 'the AEAD Open failed for a reason other than authentication';
   SDegenerateSharedSecret = 'the peer key produced a degenerate all-zero shared secret';
+  SBadX25519PeerKeyLength = 'an X25519 peer public key must be exactly 32 bytes';
   SInvalidPeerPoint = 'the peer public point is not a valid curve point';
-  SInvalidCiphertext = 'the peer ciphertext could not be decapsulated';
-  SBadCertificate = 'a certificate in the chain could not be parsed';
-  SCertificateExpired = 'a certificate in the chain is outside its validity window';
-  SUntrustedChain = 'the certificate chain does not reach a trusted anchor';
-  SWrongCertificatePurpose = 'a certificate in the chain has an extended key usage that excludes the required TLS role';
+  SRandomSpanOutOfRange = 'the requested random span lies outside the destination buffer';
+  SRandomShortRead = 'the random source returned %d bytes where %d were requested';
+  SKemDecapsulationFailed = 'the KEM decapsulation failed';
+  SInvalidKemPublicKey = 'the peer KEM public key could not be parsed';
   SMalformedPrivateKey = 'the private key could not be parsed in any supported encoding';
+  SPrivateKeyPasswordRequired =
+    'the private key is encrypted; a password is required to import it';
+  SUnsupportedKeyEncryption = 'the private key uses an unsupported encryption';
+  SEmptyPassphraseLegacyPem =
+    'a legacy-encrypted PEM private key needs a non-empty password';
   SUnsupportedKeyAlgorithm = 'the private key uses an algorithm this library cannot sign with';
   SForeignSigningKey = 'the signing key was not produced by this provider';
-  SMalformedCertificate = 'a certificate could not be parsed as PEM or DER';
-  SNoCertificatesFound = 'no certificates were found in the input';
+  SMalformedPublicKey = 'the public key could not be parsed as a SubjectPublicKeyInfo';
+  SSchemeNotCapable = 'the signing key cannot sign with the requested signature scheme';
+  SKeyUnusableForScheme = 'the key cannot be used with the requested signature scheme';
+  SInvalidScalarSize =
+    'the EC private scalar size (%d) does not match the curve field size (%d)';
+  SScalarOutOfRange = 'the EC private scalar is outside the valid range [1, n-1]';
+  SForeignKeyExchangeKey =
+    'the key-exchange private key was not produced by this crypto provider';
+  SKeyExchangeKeyNotExportable =
+    'this key-exchange key has no raw scalar to export (a KEM or hybrid key)';
   SMalformedPkcs12 = 'the PKCS#12 blob could not be read (wrong password, bad MAC, or malformed)';
-  SPkcs12NoKeyEntry = 'the PKCS#12 blob holds no private-key entry';
-  SPkcs12MultipleKeys =
-    'the PKCS#12 blob holds more than one private-key entry; it is ambiguous for a ' +
-    'single credential — split it or import the intended identity explicitly';
-  SPkcs12NoChain = 'the PKCS#12 private-key entry has no certificate chain';
+  SHkdfExpandTooLong = 'HKDF-Expand output length %d exceeds 255 * HashLen (%d)';
+  SHkdfExpandNegative = 'HKDF-Expand output length must not be negative';
 
 type
   TAeadKind = (AesGcm, ChaChaPoly);
@@ -264,7 +248,7 @@ type
     FRandom: ISecureRandom;
   public
     constructor Create(const ARandom: ISecureRandom);
-    procedure NextBytes(var ABuffer: TBytes);
+    procedure NextBytes(const ABuffer: TBytes);
     function GenerateBytes(ALength: Int32): TBytes;
   end;
 
@@ -274,12 +258,9 @@ type
     FDigest: IDigest;
   public
     constructor Create(const ADigest: IDigest);
-    function AlgorithmName: string;
     function HashSize: Int32;
-    function BlockSize: Int32;
     procedure Update(const AData: TBytes; AOffset, ALength: Int32);
     function DoFinal: TBytes;
-    procedure Reset;
     function Clone: IHash;
   end;
 
@@ -289,12 +270,10 @@ type
     FMac: IMac;
   public
     constructor Create(const ADigest: IDigest);
-    function AlgorithmName: string;
     function MacSize: Int32;
     procedure Init(const AKey: ISecretBuffer);
     procedure Update(const AData: TBytes; AOffset, ALength: Int32);
     function DoFinal: TBytes;
-    procedure Reset;
   end;
 
   THkdfAdapter = class(TInterfacedObject, IHkdf)
@@ -306,7 +285,7 @@ type
     function NewDigest: IDigest;
   public
     constructor Create(AAlgorithm: THashAlgorithm);
-    function Extract(const ASalt: TBytes; const AIkm: ISecretBuffer): ISecretBuffer;
+    function Extract(const ASalt, AIkm: ISecretBuffer): ISecretBuffer;
     function Expand(const APrk: ISecretBuffer; const AInfo: TBytes;
       ALength: Int32): ISecretBuffer;
   end;
@@ -315,27 +294,56 @@ type
   strict private
   var
     FKind: TAeadKind;
-    FAlgorithmName: string;
     FKeySize, FNonceSize, FTagSize: Int32;
     FHasHardwareAes: Boolean;
     FKey: ISecretBuffer;
     FPacket: IAeadPacketCipher;
     FKeyPending: Boolean;
     function NewPacketCipher: IAeadPacketCipher;
-    function Process(AForEncryption: Boolean; const ANonce, AAad, AInput: TBytes): TBytes;
+    function ProcessInto(AForEncryption: Boolean; const ANonce, AAad, ASrc: TBytes;
+      ASrcOff, ALen: Int32; const ADest: TBytes; ADestOff: Int32): Int32;
   public
-    constructor Create(AKind: TAeadKind; const AAlgorithmName: string;
-      AKeySize, ANonceSize, ATagSize: Int32; AHasHardwareAes: Boolean);
+    constructor Create(AKind: TAeadKind; AKeySize, ANonceSize, ATagSize: Int32;
+      AHasHardwareAes: Boolean);
     destructor Destroy; override;
-    function AlgorithmName: string;
     function UsageCategory: TAeadUsageCategory;
+    function UsageLimit: UInt64;
     function KeySize: Int32;
     function NonceSize: Int32;
     function TagSize: Int32;
-    function Overhead: Int32;
     procedure Init(const AKey: ISecretBuffer);
-    function Seal(const ANonce, AAad, APlaintext: TBytes): TBytes;
-    function Open(const ANonce, AAad, ACiphertext: TBytes): TBytes;
+    function Seal(const ANonce, AAad, ASrc: TBytes; ASrcOff, ALen: Int32;
+      const ADest: TBytes; ADestOff: Int32): Int32;
+    function Open(const ANonce, AAad, ASrc: TBytes; ASrcOff, ALen: Int32;
+      const ADest: TBytes; ADestOff: Int32): Int32;
+  end;
+
+  // The provider-internal face of a minted key-exchange key: the parsed backend parameter (the EC,
+  // X25519, or ML-KEM key), so an agreement reuses the one parse done at mint. Kept off
+  // IKeyExchangePrivateKey so a foreign key handed to Agree/Decapsulate is rejected, not misused.
+  IProviderKeyExchangeKey = interface(IInterface)
+    ['{2F5A9C3D-8B14-4E6A-9F02-7C1D5B8E3A46}']
+    function KeyParameter: IAsymmetricKeyParameter;
+  end;
+
+  // One key-exchange key class for all three default-backend primitives: it carries the fixed
+  // Usage, the raw scalar (for ExportRaw), and the parsed parameter (EC / X25519 / ML-KEM key).
+  // A KEM key is not exportable.
+  TKeyExchangePrivateKey = class(TInterfacedObject, IKeyExchangePrivateKey,
+    IProviderKeyExchangeKey)
+  strict private
+  var
+    FUsage: TKeyAgreementUsage;
+    FScalar: ISecretBuffer;
+    FKeyParameter: IAsymmetricKeyParameter;
+    FExportable: Boolean;
+  public
+    constructor Create(AUsage: TKeyAgreementUsage; const AScalar: ISecretBuffer;
+      const AKeyParameter: IAsymmetricKeyParameter; AExportable: Boolean);
+    destructor Destroy; override;
+    function Usage: TKeyAgreementUsage;
+    function ExportRaw: ISecretBuffer;
+    function KeyParameter: IAsymmetricKeyParameter;
   end;
 
   // X25519 key agreement wrapped as a group's IKeyAgreement.
@@ -345,21 +353,19 @@ type
     FRandom: ISecureRandom;
   public
     constructor Create(const ARandom: ISecureRandom);
-    function Name: string;
-    procedure GenerateKeyPair(out APrivateKey: ISecretBuffer; out APublicKey: TBytes);
-    function Agree(const APrivateKey: ISecretBuffer;
-      const APeerPublicKey: TBytes; AUsage: TKeyAgreementUsage): ISecretBuffer;
+    procedure GenerateKeyPair(out APrivateKey: IKeyExchangePrivateKey;
+      out APublicKey: TBytes);
+    function Agree(const APrivateKey: IKeyExchangePrivateKey;
+      const APeerPublicKey: TBytes): ISecretBuffer;
     function ValidatePublicKey(const APublicKey: TBytes): Boolean;
     function ImportPrivateKey(const ARawPrivateKey: ISecretBuffer;
-      out APublicKey: TBytes): ISecretBuffer;
-    function ExportPrivateKey(const APrivateKey: ISecretBuffer): ISecretBuffer;
+      AUsage: TKeyAgreementUsage; out APublicKey: TBytes): IKeyExchangePrivateKey;
   end;
 
   // A NIST prime-curve ECDH key agreement over the constant-time custom Nat curves.
   TNistEcAgreement = class(TInterfacedObject, IKeyAgreement)
   strict private
   var
-    FName: string;
     FRandom: ISecureRandom;
     FDomain: IECDomainParameters;
     FFieldSize: Int32;
@@ -368,33 +374,35 @@ type
     function WrapPeer(const APeerPub: TBytes): IECPublicKeyParameters;
     function AgreeParams(const APriv: IECPrivateKeyParameters;
       const APeer: IECPublicKeyParameters; AUsage: TKeyAgreementUsage): ISecretBuffer;
+    /// <summary>Validates a raw EC private scalar and returns it: it must be exactly the curve
+    /// field size and lie in [1, n-1] (RFC 5915 / SEC1). Raises EArgumentTlsLibException
+    /// otherwise, rather than letting an out-of-range scalar reduce mod n inside the backend.</summary>
+    function ScalarFromBytes(const ARaw: TBytes): TBigInteger;
   public
-    constructor Create(const AName: string; const ARandom: ISecureRandom);
-    function Name: string;
-    procedure GenerateKeyPair(out APrivateKey: ISecretBuffer; out APublicKey: TBytes);
-    function Agree(const APrivateKey: ISecretBuffer;
-      const APeerPublicKey: TBytes; AUsage: TKeyAgreementUsage): ISecretBuffer;
+    constructor Create(const ACurveName: string; const ARandom: ISecureRandom);
+    procedure GenerateKeyPair(out APrivateKey: IKeyExchangePrivateKey;
+      out APublicKey: TBytes);
+    function Agree(const APrivateKey: IKeyExchangePrivateKey;
+      const APeerPublicKey: TBytes): ISecretBuffer;
     function ValidatePublicKey(const APublicKey: TBytes): Boolean;
     function ImportPrivateKey(const ARawPrivateKey: ISecretBuffer;
-      out APublicKey: TBytes): ISecretBuffer;
-    function ExportPrivateKey(const APrivateKey: ISecretBuffer): ISecretBuffer;
+      AUsage: TKeyAgreementUsage; out APublicKey: TBytes): IKeyExchangePrivateKey;
   end;
 
   TKemAdapter = class(TInterfacedObject, IKem)
   strict private
   var
-    FName: string;
     FParams: IMlKemParameters;
     FRandom: ISecureRandom;
   public
-    constructor Create(const AName: string; const AParams: IMlKemParameters;
+    constructor Create(const AParams: IMlKemParameters;
       const ARandom: ISecureRandom);
-    function Name: string;
-    procedure GenerateKeyPair(out APrivateKey: ISecretBuffer; out APublicKey: TBytes);
+    procedure GenerateKeyPair(out APrivateKey: IKeyExchangePrivateKey;
+      out APublicKey: TBytes);
     procedure Encapsulate(const APeerPublicKey: TBytes; out ACiphertext: TBytes;
       out ASharedSecret: ISecretBuffer);
-    procedure Decapsulate(const APrivateKey: ISecretBuffer; const ACiphertext: TBytes;
-      out ASharedSecret: ISecretBuffer);
+    procedure Decapsulate(const APrivateKey: IKeyExchangePrivateKey;
+      const ACiphertext: TBytes; out ASharedSecret: ISecretBuffer);
     function ValidatePublicKey(const APublicKey: TBytes): Boolean;
   end;
 
@@ -402,10 +410,8 @@ type
   strict private
   var
     FSigner: ISigner;
-    FScheme: string;
   public
-    constructor Create(const ASigner: ISigner; const AScheme: string);
-    function AlgorithmName: string;
+    constructor Create(const ASigner: ISigner);
     procedure Update(const AData: TBytes; AOffset, ALength: Int32);
     function Sign: TBytes;
   end;
@@ -414,10 +420,16 @@ type
   strict private
   var
     FSigner: ISigner;
-    FScheme: string;
   public
-    constructor Create(const ASigner: ISigner; const AScheme: string);
-    function AlgorithmName: string;
+    constructor Create(const ASigner: ISigner);
+    procedure Update(const AData: TBytes; AOffset, ALength: Int32);
+    function Verify(const ASignature: TBytes): Boolean;
+  end;
+
+  /// <summary>A verifier that always reports failure, for a scheme/key-family mismatch that can
+  /// never verify: the caller then aborts decrypt_error rather than seeing a raised error.</summary>
+  TFailClosedSignatureVerifier = class(TInterfacedObject, ISignatureVerifier)
+  public
     procedure Update(const AData: TBytes; AOffset, ALength: Int32);
     function Verify(const ASignature: TBytes): Boolean;
   end;
@@ -428,75 +440,86 @@ type
   var
     FPassword: TArray<Char>;
   public
-    constructor Create(const APassword: string);
+    constructor Create(const APassword: ISecretBuffer);
+    destructor Destroy; override;
     function GetPassword: TArray<Char>;
   end;
 
-  // The provider-internal face of an imported signing key: it hands back the parsed
-  // key parameter (parsed and validated once at import, reused for every sign) plus the
-  // canonical PKCS#8 bytes. Kept off ISigningKey so no key material appears on the
-  // public surface.
+  // The provider-internal face of an imported signing key: it hands back the parsed key
+  // parameter, parsed and validated once at import and reused for every sign. Kept off
+  // ISigningKey so no key handle appears on the public surface.
   IProviderSigningKey = interface(IInterface)
     ['{6A7F0E2C-1B94-4D8A-9F3C-2E5B7C8D1A64}']
-    function PrivateKeyInfo: ISecretBuffer;
     function KeyParameter: IAsymmetricKeyParameter;
   end;
 
   TSigningKey = class(TInterfacedObject, ISigningKey, IProviderSigningKey)
   strict private
   var
-    FPrivateKeyInfo: ISecretBuffer;
     FKeyParameter: IAsymmetricKeyParameter;
     FCapableSchemes: TArray<TSignatureScheme>;
+    FPublicKeyInfo: TBytes;
+    // the public SubjectPublicKeyInfo derived from the private parameter (nil if the family
+    // is not one we can derive); computed once at import and shared with narrowed copies
+    class function DerivePublicKeyInfo(
+      const AKeyParameter: IAsymmetricKeyParameter): TBytes; static;
+    constructor Create(const AKeyParameter: IAsymmetricKeyParameter;
+      const ACapableSchemes: TArray<TSignatureScheme>;
+      const APublicKeyInfo: TBytes); overload;
   public
-    constructor Create(const APrivateKeyInfo: ISecretBuffer;
-      const AKeyParameter: IAsymmetricKeyParameter;
-      const ACapableSchemes: TArray<TSignatureScheme>);
+    // the public half of a private parameter (RSA/EC/Ed families), nil for any other family
+    class function DerivePublicParameter(
+      const AKeyParameter: IAsymmetricKeyParameter): IAsymmetricKeyParameter; static;
+    constructor Create(const AKeyParameter: IAsymmetricKeyParameter;
+      const ACapableSchemes: TArray<TSignatureScheme>); overload;
     function CapableSchemes: TArray<TSignatureScheme>;
+    function PublicKeyInfo: TBytes;
     function WithPreferredSchemes(const ASchemes: TArray<TSignatureScheme>): ISigningKey;
-    function PrivateKeyInfo: ISecretBuffer;
     function KeyParameter: IAsymmetricKeyParameter;
   end;
 
   // The shape of a DER-encoded private key, distinguished by its first inner elements.
   TDerKeyShape = (Unknown, Pkcs8, EncryptedPkcs8, Pkcs1Rsa, Sec1Ec);
 
-  // Parses and normalizes imported credential key material to canonical PKCS#8 and
-  // derives the schemes a key can sign with. All backend parsing stays here, inside
+  // Parses imported credential key material into a backend key parameter (no PKCS#8 bytes are
+  // retained) and derives the schemes a key can sign with. All backend parsing stays here, inside
   // the provider boundary.
   TCredentialImport = class sealed(TObject)
   strict private
     class function DetectDerKeyShape(const AData: TBytes): TDerKeyShape; static;
     class function SchemesForKeyInfo(const AInfo: IPrivateKeyInfo)
       : TArray<TSignatureScheme>; static;
-    class function KeyParamFromPem(const AData: TBytes; const APassword: string;
-      AHasPassword: Boolean): IAsymmetricKeyParameter; static;
-    class function KeyParamFromDer(const AData: TBytes; const APassword: string;
-      AHasPassword: Boolean): IAsymmetricKeyParameter; static;
+    class function FirstPrivateKeyObject(const AData: TBytes): IPemObject; static;
+    class function HasHeader(const AObject: IPemObject; const AName,
+      AValue: string): Boolean; static;
+    class function KeyParamFromPem(const AData: TBytes;
+      const APassword: ISecretBuffer): IAsymmetricKeyParameter; static;
+    class function KeyParamFromDer(const AData: TBytes;
+      const APassword: ISecretBuffer): IAsymmetricKeyParameter; static;
   public
-    /// <summary>The password as the character array the PEM/PKCS#12 backends expect;
-    /// empty yields nil (no password). Wipe it with WipePasswordChars after use.</summary>
-    class function PasswordChars(const APassword: string): TArray<Char>; static;
+    /// <summary>The passphrase's code units as the character array the PEM/PKCS#12 backends
+    /// expect; nil or an empty buffer yields nil. Wipe it with WipePasswordChars after use.</summary>
+    class function PasswordChars(const APassword: ISecretBuffer): TArray<Char>; static;
     /// <summary>Zeroes a password character array in place.</summary>
     class procedure WipePasswordChars(var APassword: TArray<Char>); static;
-    class function ImportKey(const AData: TBytes; const APassword: string;
-      AHasPassword: Boolean): ISigningKey; static;
-    /// <summary>The one signing-key construction path: normalizes a parsed private-key
-    /// parameter to canonical PKCS#8 (held wipeably), derives its schemes, and wraps it.
+    class function ImportKey(const AData: TBytes;
+      const APassword: ISecretBuffer): ISigningKey; static;
+    /// <summary>The one signing-key construction path: derives the schemes a parsed private-key
+    /// parameter can sign with and wraps it (the signing key holds only the parsed parameter).
     /// Both raw-key and PKCS#12 import funnel through here. Raises ENotSupported for a key
     /// algorithm this library cannot sign with.</summary>
     class function SigningKeyFromParam(
       const AKeyParam: IAsymmetricKeyParameter): ISigningKey; static;
   end;
 
-  // Resolves a hash algorithm to its CryptoLib digest. A stateless leaf shared by
+  // Resolves a hash algorithm to its digest. A stateless leaf shared by
   // the primitives and the path validator's anchor-key hash.
   TDigestResolver = class sealed(TObject)
   public
     class function Resolve(AAlgorithm: THashAlgorithm): IDigest; static;
   end;
 
-  // Bridges a facet IRandom into the CryptoLib IRandomGenerator a TSecureRandom
+  // Bridges a facet IRandom into the random generator a TSecureRandom
   // draws from, so a supplied entropy source governs the default facets' key
   // generation. Seed material is ignored - the source is already a CSPRNG.
   TRandomGeneratorBridge = class(TInterfacedObject, IRandomGenerator)
@@ -538,131 +561,27 @@ type
   var
     FRandom: ISecureRandom;
     class function SignerMechanismForScheme(AScheme: TSignatureScheme): string; static;
+    /// <summary>True for the three ECDSA schemes, with the scheme's hash.</summary>
+    class function EcdsaHashForScheme(AScheme: TSignatureScheme;
+      out AHash: THashAlgorithm): Boolean; static;
+    /// <summary>An ECDSA signer whose per-signature nonce is derived from the key and the
+    /// message hash (RFC 6979), so a weak or repeated RNG draw cannot leak the key.</summary>
+    class function CreateDeterministicEcdsaSigner(AHash: THashAlgorithm): ISigner; static;
+    /// <summary>Classifies a parsed public key into its TLS key family; False for a key kind the
+    /// provider does not model (e.g. X25519/DH/DSA, or an id-RSASSA-PSS key), which the verifier
+    /// factory then rejects since no catalogued signature scheme can be verified with such a key.</summary>
+    class function KeyKindOf(const AInfo: ISubjectPublicKeyInfo;
+      const AKey: IAsymmetricKeyParameter; out AKind: TSignatureKeyKind): Boolean; static;
   public
     constructor Create(const ARandom: ISecureRandom);
-    function ImportSigningKey(const AData: TBytes): ISigningKey; overload;
     function ImportSigningKey(const AData: TBytes;
-      const APassword: string): ISigningKey; overload;
+      const APassword: ISecretBuffer): ISigningKey;
     function ImportPkcs12(const AData: TBytes;
-      const APassword: string): TTlsCredential;
+      const APassword: ISecretBuffer): TImportedCredential;
     function CreateSignatureSigner(AScheme: TSignatureScheme;
       const AKey: ISigningKey): ISignatureSigner;
     function CreateSignatureVerifier(AScheme: TSignatureScheme;
       const APublicKeyDer: TBytes): ISignatureVerifier;
-  end;
-
-  // IInspectedCertificate - one X.509 certificate decoded once, answering the
-  // per-certificate queries from that single parse.
-  TInspectedCertificate = class(TInterfacedObject, IInspectedCertificate)
-  strict private
-  const
-    // PKCS#1 id-RSASSA-PSS: the restricted RSA-PSS key type (RFC 4055)
-    RsaSsaPssKeyOid = '1.2.840.113549.1.1.10';
-  var
-    FCert: IX509Certificate;
-  public
-    constructor Create(const ADer: TBytes);
-    function PublicKeyInfo: TBytes;
-    function DnsNames: TArray<string>;
-    function IpAddresses: TArray<TBytes>;
-    function KeyUsagePermits(AUsage: TCertKeyUsage): TCertAnswer;
-    function KeyIsRsaPss: TCertAnswer;
-    function KeyKind(out AKind: TCertKeyKind; out AEcNamedGroup: UInt16): Boolean;
-    function KeyFacts(out AFacts: TCertKeyFacts): Boolean;
-    function SignatureFacts(out AFacts: TCertSignatureFacts): Boolean;
-    function PeerInfo(out ASubject, AIssuer, ACommonName, ASerialHex: string): Boolean;
-  end;
-
-  // ICertificateInspector - pure, per-certificate, side-effect-free X.509 inspection.
-  TCertificateInspector = class(TInterfacedObject, ICertificateInspector)
-  strict private
-  const
-    // RFC 7633 id-pe-tlsfeature
-    TlsFeatureExtensionOid = '1.3.6.1.5.5.7.1.24';
-  public
-    function Parse(const ADer: TBytes): IInspectedCertificate;
-    function LoadChain(const AData: TBytes): TArray<TBytes>;
-    function IsWellFormed(const ADer: TBytes): Boolean;
-    function PublicKeyInfo(const ACertificateDer: TBytes): TBytes;
-    function DnsNames(const ACertificateDer: TBytes): TArray<string>;
-    function IpAddresses(const ACertificateDer: TBytes): TArray<TBytes>;
-    function PeerInfo(const ACertificateDer: TBytes;
-      out ASubject, AIssuer, ACommonName, ASerialHex: string): Boolean;
-    function TlsFeatures(const ACert: TBytes;
-      out AFeatures: TArray<UInt16>): Boolean;
-    function KeyUsagePermits(const ACertificateDer: TBytes;
-      AUsage: TCertKeyUsage): TCertAnswer;
-    function KeyIsRsaPss(const ACertificateDer: TBytes): TCertAnswer;
-    function KeyKind(const ACertificateDer: TBytes;
-      out AKind: TCertKeyKind; out AEcNamedGroup: UInt16): Boolean;
-  end;
-
-  // ICertificatePathValidator - RFC 5280 path validation. The trust-anchor ring is a
-  // class-level cache shared across the many short-lived providers.
-  TCertificatePathValidator = class(TInterfacedObject, ICertificatePathValidator)
-  strict private
-  type
-    // parsed trust anchors keyed by a digest of the anchor set, so a reused
-    // config does not re-parse its (possibly large) anchor store on every verify
-    TTrustAnchorRing = record
-    strict private
-    const
-      TrustAnchorCacheSize = Int32(8);
-    strict private
-      FKeys: TArray<TBytes>;
-      FSets: TArray<TArray<ITrustAnchor>>;
-      FCount: Int32;
-      FNext: Int32;
-    public
-      class function Init: TTrustAnchorRing; static;
-      function TryGet(const AKey: TBytes;
-        out AAnchors: TArray<ITrustAnchor>): Boolean;
-      procedure Remember(const AKey: TBytes;
-        const AAnchors: TArray<ITrustAnchor>);
-    end;
-  class var
-    FTrustAnchors: TTrustAnchorRing;
-    FTrustAnchorLock: TCriticalSection;
-  strict private
-    function TrustAnchorKey(const ATrustAnchors: TArray<TBytes>): TBytes;
-  public
-    class constructor Create;
-    class destructor Destroy;
-    procedure ValidateCertificatePath(const AChain, ATrustAnchors,
-      AIntermediates: TArray<TBytes>; const AValidationTimeUtc: TDateTime;
-      AKeyPurpose: TCertKeyPurpose; var AEffectiveChain: TArray<TBytes>);
-  end;
-
-  // IRevocationChecker - stapled-OCSP verification and the live OCSP/CRL primitives.
-  TRevocationChecker = class(TInterfacedObject, IRevocationChecker)
-  strict private
-    /// <summary>
-    /// Whether AResponse is signed by the certificate issuer itself or by a
-    /// responder the issuer delegated to (RFC 6960 sec. 4.2.2.2).
-    /// </summary>
-    class function OcspResponseAuthorised(const AResponse: IBasicOcspResp;
-      const AIssuerCert: IX509Certificate;
-      const AIssuerPublicKey: IAsymmetricKeyParameter;
-      AValidityDate: TDateTime): Boolean; static;
-    class function OcspDelegatedResponder(const AResponderCert,
-      AIssuerCert: IX509Certificate;
-      const AIssuerPublicKey: IAsymmetricKeyParameter;
-      AValidityDate: TDateTime): Boolean; static;
-  public
-    function ValidateOcspStaple(const ALeafCert, AIssuerCert,
-      AOcspResponseDer: TBytes; const AValidationTimeUtc: TDateTime;
-      out AStatus: TOcspStatus;
-      out AThisUpdate, ANextUpdate: TDateTime): Boolean;
-    function BuildOcspRequest(const ALeafCert, AIssuerCert: TBytes;
-      out ARequestDer: TBytes): Boolean;
-    function TryGetOcspResponderUrl(const ACert: TBytes;
-      out AUrl: string): Boolean;
-    function TryGetCrlDistributionPoints(const ACert: TBytes;
-      out AUrls: TArray<string>): Boolean;
-    function CheckCrlRevocation(const ALeafCert, AIssuerCert, ACrlDer: TBytes;
-      out ARevoked: Boolean): Boolean;
-    function TryFindIssuer(const ALeafCert: TBytes; const ACandidates: TArray<TBytes>;
-      out AIssuerCert: TBytes): Boolean;
   end;
 
 { TRandomAdapter }
@@ -673,7 +592,7 @@ begin
   FRandom := ARandom;
 end;
 
-procedure TRandomAdapter.NextBytes(var ABuffer: TBytes);
+procedure TRandomAdapter.NextBytes(const ABuffer: TBytes);
 begin
   FRandom.NextBytes(ABuffer);
 end;
@@ -694,19 +613,9 @@ begin
   FDigest := ADigest;
 end;
 
-function THashAdapter.AlgorithmName: string;
-begin
-  Result := FDigest.AlgorithmName;
-end;
-
 function THashAdapter.HashSize: Int32;
 begin
   Result := FDigest.GetDigestSize;
-end;
-
-function THashAdapter.BlockSize: Int32;
-begin
-  Result := FDigest.GetByteLength;
 end;
 
 procedure THashAdapter.Update(const AData: TBytes; AOffset, ALength: Int32);
@@ -717,11 +626,6 @@ end;
 function THashAdapter.DoFinal: TBytes;
 begin
   Result := FDigest.DoFinal;
-end;
-
-procedure THashAdapter.Reset;
-begin
-  FDigest.Reset;
 end;
 
 function THashAdapter.Clone: IHash;
@@ -735,11 +639,6 @@ constructor THmacAdapter.Create(const ADigest: IDigest);
 begin
   inherited Create;
   FMac := THMac.Create(ADigest);
-end;
-
-function THmacAdapter.AlgorithmName: string;
-begin
-  Result := FMac.AlgorithmName;
 end;
 
 function THmacAdapter.MacSize: Int32;
@@ -769,11 +668,6 @@ begin
   Result := FMac.DoFinal;
 end;
 
-procedure THmacAdapter.Reset;
-begin
-  FMac.Reset;
-end;
-
 { THkdfAdapter }
 
 constructor THkdfAdapter.Create(AAlgorithm: THashAlgorithm);
@@ -789,28 +683,34 @@ begin
   Result := TDigestUtilities.GetDigest(TEnumUtilities.GetName<THashAlgorithm>(FAlgorithm));
 end;
 
-function THkdfAdapter.Extract(const ASalt: TBytes;
-  const AIkm: ISecretBuffer): ISecretBuffer;
+function THkdfAdapter.Extract(const ASalt, AIkm: ISecretBuffer): ISecretBuffer;
 var
   LMac: IMac;
   LSalt, LIkmBytes, LPrk: TBytes;
 begin
   LMac := FExtractMac;
-  LSalt := ASalt;
-  if System.Length(LSalt) = 0 then
-    SetLength(LSalt, LMac.GetMacSize); // HashLen zero bytes
-  LMac.Init(TKeyParameter.Create(LSalt) as IKeyParameter);
-  LIkmBytes := AIkm.ToBytes;
+  // a nil or empty salt is HashLen zeros; otherwise the salt is secret material, so it is
+  // materialised into a private copy here and wiped, not aliased from the caller
+  if (ASalt = nil) or (ASalt.Len = 0) then
+    SetLength(LSalt, LMac.GetMacSize)
+  else
+    LSalt := ASalt.ToBytes;
   try
-    LMac.BlockUpdate(LIkmBytes, 0, System.Length(LIkmBytes));
-    LPrk := LMac.DoFinal;
+    LMac.Init(TKeyParameter.Create(LSalt) as IKeyParameter);
+    LIkmBytes := AIkm.ToBytes;
     try
-      Result := TSecretBuffer.From(LPrk);
+      LMac.BlockUpdate(LIkmBytes, 0, System.Length(LIkmBytes));
+      LPrk := LMac.DoFinal;
+      try
+        Result := TSecretBuffer.From(LPrk);
+      finally
+        TSecureMemory.WipeBytes(LPrk);
+      end;
     finally
-      TSecureMemory.WipeBytes(LPrk);
+      TSecureMemory.WipeBytes(LIkmBytes);
     end;
   finally
-    TSecureMemory.WipeBytes(LIkmBytes);
+    TSecureMemory.WipeBytes(LSalt);
   end;
 end;
 
@@ -820,7 +720,14 @@ var
   LGen: IHkdfBytesGenerator;
   LParams: IHkdfParameters;
   LPrkBytes, LOkm: TBytes;
+  LHashLen: Int32;
 begin
+  // RFC 5869: L must not exceed 255 * HashLen
+  LHashLen := FExtractMac.GetMacSize;
+  if ALength < 0 then
+    raise EArgumentTlsLibException.CreateRes(@SHkdfExpandNegative);
+  if ALength > 255 * LHashLen then
+    raise EArgumentTlsLibException.CreateResFmt(@SHkdfExpandTooLong, [ALength, 255 * LHashLen]);
   LGen := FExpandGen;
   LPrkBytes := APrk.ToBytes;
   try
@@ -842,12 +749,11 @@ end;
 
 { TAeadAdapter }
 
-constructor TAeadAdapter.Create(AKind: TAeadKind; const AAlgorithmName: string;
-  AKeySize, ANonceSize, ATagSize: Int32; AHasHardwareAes: Boolean);
+constructor TAeadAdapter.Create(AKind: TAeadKind; AKeySize, ANonceSize, ATagSize: Int32;
+  AHasHardwareAes: Boolean);
 begin
   inherited Create;
   FKind := AKind;
-  FAlgorithmName := AAlgorithmName;
   FKeySize := AKeySize;
   FNonceSize := ANonceSize;
   FTagSize := ATagSize;
@@ -861,17 +767,20 @@ begin
   inherited Destroy;
 end;
 
-function TAeadAdapter.AlgorithmName: string;
-begin
-  Result := FAlgorithmName;
-end;
-
 function TAeadAdapter.UsageCategory: TAeadUsageCategory;
 begin
   if FKind = TAeadKind.AesGcm then
     Result := TAeadUsageCategory.AesGcm
   else
     Result := TAeadUsageCategory.ChaCha20;
+end;
+
+function TAeadAdapter.UsageLimit: UInt64;
+var
+  LCategory: TAeadUsageCategory;
+begin
+  LCategory := UsageCategory;
+  Result := LCategory.UsageLimit;
 end;
 
 function TAeadAdapter.KeySize: Int32;
@@ -885,11 +794,6 @@ begin
 end;
 
 function TAeadAdapter.TagSize: Int32;
-begin
-  Result := FTagSize;
-end;
-
-function TAeadAdapter.Overhead: Int32;
 begin
   Result := FTagSize;
 end;
@@ -923,16 +827,31 @@ begin
   FKeyPending := True;
 end;
 
-function TAeadAdapter.Process(AForEncryption: Boolean;
-  const ANonce, AAad, AInput: TBytes): TBytes;
+function TAeadAdapter.ProcessInto(AForEncryption: Boolean;
+  const ANonce, AAad, ASrc: TBytes; ASrcOff, ALen: Int32; const ADest: TBytes;
+  ADestOff: Int32): Int32;
 var
-  LKey, LOut: TBytes;
+  LKey: TBytes;
   LUsedKey: Boolean;
-  LLen: Int32;
+  LOutLen: Int32;
 begin
   if System.Length(ANonce) <> FNonceSize then
     raise EArgumentTlsLibException.CreateResFmt(@SInvalidNonceSize,
       [System.Length(ANonce), FNonceSize]);
+  if AForEncryption then
+    LOutLen := ALen + FTagSize
+  else
+    LOutLen := ALen - FTagSize;
+  if (ASrcOff < 0) or (ALen < 0) or (Int64(ASrcOff) + ALen > System.Length(ASrc)) or
+    (ADestOff < 0) or (LOutLen < 0) or (Int64(ADestOff) + LOutLen > System.Length(ADest)) then
+    raise EArgumentTlsLibException.CreateRes(@SAeadSpanOutOfRange);
+  // in-place is only supported as an exact alias (same array, same offset); any other overlap
+  // would let the cipher read bytes it has already overwritten
+  if (PByte(ASrc) = PByte(ADest)) and (ASrcOff <> ADestOff) then
+    raise EArgumentTlsLibException.CreateRes(@SAeadBadOverlap);
+  // no key was ever supplied (Init not called): fail loud rather than pass nil to an unkeyed mode
+  if (FPacket = nil) and (not FKeyPending) then
+    raise EInvalidOperationTlsLibException.CreateRes(@SAeadNotKeyed);
   // one packet-cipher instance per adapter, and the driver installs an adapter for one
   // direction only (read or write); the connection is already single-threaded (unsynchronized
   // FSeq), so reusing the mode across records is safe (the mode is not thread-safe)
@@ -945,35 +864,87 @@ begin
   else
     LKey := nil;
   try
-    LOut := nil;
-    SetLength(LOut, FPacket.GetOutputSize(AForEncryption, System.Length(AInput), FTagSize * 8));
-    LLen := FPacket.ProcessPacket(AForEncryption, LKey, ANonce, AAad, AInput, 0,
-      System.Length(AInput), LOut, 0, FTagSize * 8);
-    SetLength(LOut, LLen);
+    Result := FPacket.ProcessPacket(AForEncryption, LKey, ANonce, AAad, ASrc, ASrcOff,
+      ALen, ADest, ADestOff, FTagSize * 8);
     // clear the pending flag only after the mode accepted and retained the key, so a throw
     // mid-init leaves the next record to re-supply it rather than pass nil to an unkeyed mode
     if LUsedKey then
+    begin
       FKeyPending := False;
-    Result := LOut;
+      FKey := nil;
+    end;
   finally
     TSecureMemory.WipeBytes(LKey);
   end;
 end;
 
-function TAeadAdapter.Seal(const ANonce, AAad, APlaintext: TBytes): TBytes;
-begin
-  Result := Process(True, ANonce, AAad, APlaintext);
-end;
-
-function TAeadAdapter.Open(const ANonce, AAad, ACiphertext: TBytes): TBytes;
+function TAeadAdapter.Seal(const ANonce, AAad, ASrc: TBytes; ASrcOff, ALen: Int32;
+  const ADest: TBytes; ADestOff: Int32): Int32;
 begin
   try
-    Result := Process(False, ANonce, AAad, ACiphertext);
+    Result := ProcessInto(True, ANonce, AAad, ASrc, ASrcOff, ALen, ADest, ADestOff);
+  except
+    // map the mode's nonce-reuse throw to a typed error
+    on E: ECryptoLibException do
+      raise EArgumentTlsLibException.CreateRes(@SAeadSealRejected);
+  end;
+end;
+
+function TAeadAdapter.Open(const ANonce, AAad, ASrc: TBytes; ASrcOff, ALen: Int32;
+  const ADest: TBytes; ADestOff: Int32): Int32;
+begin
+  // a record too short to hold the tag cannot authenticate: a bad_record_mac, not an argument error
+  if ALen < FTagSize then
+    raise EFatalAlertTlsLibException.CreateRes(TTlsAlertDescription.BadRecordMac,
+      @SAeadAuthFailed);
+  try
+    Result := ProcessInto(False, ANonce, AAad, ASrc, ASrcOff, ALen, ADest, ADestOff);
   except
     on E: EInvalidCipherTextCryptoLibException do
       raise EFatalAlertTlsLibException.CreateRes(TTlsAlertDescription.BadRecordMac,
         @SAeadAuthFailed);
+    // any other backend fault must not cross the seam raw (a trial-decrypt miss would become a fault)
+    on E: ECryptoLibException do
+      raise EInvalidOperationTlsLibException.CreateRes(@SAeadOpenRejected);
   end;
+end;
+
+{ TKeyExchangePrivateKey }
+
+constructor TKeyExchangePrivateKey.Create(AUsage: TKeyAgreementUsage;
+  const AScalar: ISecretBuffer; const AKeyParameter: IAsymmetricKeyParameter;
+  AExportable: Boolean);
+begin
+  inherited Create;
+  FUsage := AUsage;
+  FScalar := AScalar;
+  FKeyParameter := AKeyParameter;
+  FExportable := AExportable;
+end;
+
+destructor TKeyExchangePrivateKey.Destroy;
+begin
+  FScalar := nil;
+  FKeyParameter := nil;
+  inherited Destroy;
+end;
+
+function TKeyExchangePrivateKey.Usage: TKeyAgreementUsage;
+begin
+  Result := FUsage;
+end;
+
+function TKeyExchangePrivateKey.ExportRaw: ISecretBuffer;
+begin
+  if (not FExportable) or (FScalar = nil) then
+    raise ENotSupportedTlsLibException.CreateRes(@SKeyExchangeKeyNotExportable);
+  Result := FScalar;
+end;
+
+
+function TKeyExchangePrivateKey.KeyParameter: IAsymmetricKeyParameter;
+begin
+  Result := FKeyParameter;
 end;
 
 { TX25519Agreement }
@@ -984,12 +955,7 @@ begin
   FRandom := ARandom;
 end;
 
-function TX25519Agreement.Name: string;
-begin
-  Result := 'X25519';
-end;
-
-procedure TX25519Agreement.GenerateKeyPair(out APrivateKey: ISecretBuffer;
+procedure TX25519Agreement.GenerateKeyPair(out APrivateKey: IKeyExchangePrivateKey;
   out APublicKey: TBytes);
 var
   LX25519: IX25519PrivateKeyParameters;
@@ -999,44 +965,50 @@ begin
   APublicKey := LX25519.GeneratePublicKey.GetEncoded;
   LPrivBytes := LX25519.GetEncoded;
   try
-    APrivateKey := TSecretBuffer.From(LPrivBytes);
+    // carry the parsed parameter so Agree need not re-parse the scalar
+    APrivateKey := TKeyExchangePrivateKey.Create(TKeyAgreementUsage.Ephemeral,
+      TSecretBuffer.From(LPrivBytes), LX25519, True);
   finally
     TSecureMemory.WipeBytes(LPrivBytes);
   end;
 end;
 
-function TX25519Agreement.Agree(const APrivateKey: ISecretBuffer;
-  const APeerPublicKey: TBytes; AUsage: TKeyAgreementUsage): ISecretBuffer;
+function TX25519Agreement.Agree(const APrivateKey: IKeyExchangePrivateKey;
+  const APeerPublicKey: TBytes): ISecretBuffer;
 var
+  LKey: IProviderKeyExchangeKey;
   LPriv: IX25519PrivateKeyParameters;
-  LPrivBytes, LSecret: TBytes;
+  LSecret: TBytes;
 begin
-  // X25519's ladder is constant-time regardless of scalar reuse, so AUsage has no
+  // X25519's ladder is constant-time regardless of scalar reuse, so the key's Usage has no
   // effect here.
-  LPrivBytes := APrivateKey.ToBytes;
+  if not Supports(APrivateKey, IProviderKeyExchangeKey, LKey) then
+    raise EArgumentTlsLibException.CreateRes(@SForeignKeyExchangeKey);
+  // the handle is provider-typed but not primitive-typed: an EC or KEM handle must not agree here
+  if not Supports(LKey.KeyParameter, IX25519PrivateKeyParameters, LPriv) then
+    raise EArgumentTlsLibException.CreateRes(@SForeignKeyExchangeKey);
+  // a peer key of the wrong length is peer input, not a backend fault: surface it as our own error
+  // before the backend sees it
+  if System.Length(APeerPublicKey) <> TX25519PublicKeyParameters.KeySize then
+    raise EPeerInputTlsLibException.CreateRes(@SBadX25519PeerKeyLength);
+  LSecret := nil;
+  SetLength(LSecret, TX25519PublicKeyParameters.KeySize);
   try
-    LPriv := TX25519PrivateKeyParameters.Create(LPrivBytes);
-    LSecret := nil;
-    SetLength(LSecret, TX25519PublicKeyParameters.KeySize);
     try
-      try
-        LPriv.GenerateSecret(TX25519PublicKeyParameters.Create(APeerPublicKey)
-          as IX25519PublicKeyParameters, LSecret, 0);
-      except
-        // a small-order peer key yields an all-zero shared secret; the backend
-        // rejects it - surface it as our own error so no backend exception escapes
-        on E: EInvalidOperationCryptoLibException do
-          raise EPeerInputTlsLibException.CreateRes(@SDegenerateSharedSecret);
-      end;
-      // defense in depth: never hand back a degenerate (contributory) secret
-      if TSecureMemory.ConstantTimeIsAllZero(LSecret) then
+      LPriv.GenerateSecret(TX25519PublicKeyParameters.Create(APeerPublicKey)
+        as IX25519PublicKeyParameters, LSecret, 0);
+    except
+      // a small-order peer key yields an all-zero shared secret; the backend
+      // rejects it - surface it as our own error so no backend exception escapes
+      on E: EInvalidOperationCryptoLibException do
         raise EPeerInputTlsLibException.CreateRes(@SDegenerateSharedSecret);
-      Result := TSecretBuffer.From(LSecret);
-    finally
-      TSecureMemory.WipeBytes(LSecret);
     end;
+    // defense in depth: never hand back a degenerate (contributory) secret
+    if TSecureMemory.ConstantTimeIsAllZero(LSecret) then
+      raise EPeerInputTlsLibException.CreateRes(@SDegenerateSharedSecret);
+    Result := TSecretBuffer.From(LSecret);
   finally
-    TSecureMemory.WipeBytes(LPrivBytes);
+    TSecureMemory.WipeBytes(LSecret);
   end;
 end;
 
@@ -1048,43 +1020,37 @@ begin
 end;
 
 function TX25519Agreement.ImportPrivateKey(const ARawPrivateKey: ISecretBuffer;
-  out APublicKey: TBytes): ISecretBuffer;
+  AUsage: TKeyAgreementUsage; out APublicKey: TBytes): IKeyExchangePrivateKey;
 var
   LPriv: IX25519PrivateKeyParameters;
   LPrivBytes: TBytes;
 begin
   LPrivBytes := ARawPrivateKey.ToBytes;
   try
+    // X25519 clamps the scalar, so any 32 bytes are usable, but a wrong length is a caller
+    // error (a truncated/overlong buffer) rather than something to silently accept
+    if System.Length(LPrivBytes) <> TX25519PrivateKeyParameters.KeySize then
+      raise EArgumentTlsLibException.CreateResFmt(@SInvalidScalarSize,
+        [System.Length(LPrivBytes), Int32(TX25519PrivateKeyParameters.KeySize)]);
     LPriv := TX25519PrivateKeyParameters.Create(LPrivBytes);
     APublicKey := LPriv.GeneratePublicKey.GetEncoded;
-    Result := TSecretBuffer.From(LPrivBytes);
+    // carry the parsed parameter so Agree need not re-parse the scalar
+    Result := TKeyExchangePrivateKey.Create(AUsage, TSecretBuffer.From(LPrivBytes),
+      LPriv, True);
   finally
     TSecureMemory.WipeBytes(LPrivBytes);
   end;
 end;
 
-function TX25519Agreement.ExportPrivateKey(
-  const APrivateKey: ISecretBuffer): ISecretBuffer;
-begin
-  // the private key already is the raw scalar
-  Result := APrivateKey;
-end;
-
 { TNistEcAgreement }
 
-constructor TNistEcAgreement.Create(const AName: string;
+constructor TNistEcAgreement.Create(const ACurveName: string;
   const ARandom: ISecureRandom);
 begin
   inherited Create;
-  FName := AName;
   FRandom := ARandom;
-  FDomain := TECDomainParameters.FromX9ECParameters(TCustomNamedCurves.GetByName(AName));
+  FDomain := TECDomainParameters.FromX9ECParameters(TCustomNamedCurves.GetByName(ACurveName));
   FFieldSize := FDomain.Curve.FieldElementEncodingLength;
-end;
-
-function TNistEcAgreement.Name: string;
-begin
-  Result := FName;
 end;
 
 procedure TNistEcAgreement.GeneratePair(out APriv: IECPrivateKeyParameters;
@@ -1101,9 +1067,19 @@ begin
 end;
 
 function TNistEcAgreement.WrapPeer(const APeerPub: TBytes): IECPublicKeyParameters;
+const
+  UncompressedPointPrefix = $04; // SEC1 uncompressed EC point form
 var
   LPoint: IECPoint;
 begin
+  // the peer point must be the SEC1 uncompressed form of the exact field width: RFC 9180 7.1 / 7.1.1
+  // fix the DHKEM public-key length (Npk = 1 + 2*fieldSize) and RFC 9846 4.3.8.2 / RFC 8422
+  // 5.1.2 forbid compressed/hybrid encodings. DecodePoint alone would accept a compressed
+  // 0x02/0x03 point, so gate the form here - this path also serves HPKE Decap, where a short
+  // compressed enc would slip through.
+  if (System.Length(APeerPub) <> 1 + 2 * FFieldSize) or
+    (APeerPub[0] <> UncompressedPointPrefix) then
+    raise EPeerInputTlsLibException.CreateRes(@SInvalidPeerPoint);
   try
     LPoint := FDomain.Curve.DecodePoint(APeerPub);
   except
@@ -1129,7 +1105,7 @@ begin
     LBlindBits := TECCurveConstants.SCALAR_BLIND_FULL
   else
     LBlindBits := TECCurveConstants.SCALAR_BLIND_DETERMINISTIC;
-  LAgreement := TEphemeralECDHAgreement.Create(APriv, LBlindBits);
+  LAgreement := TEphemeralECDHAgreement.Create(APriv, FRandom, LBlindBits);
   LZ := TBigIntegerUtilities.AsUnsignedByteArray(FFieldSize, LAgreement.CalculateAgreement(APeer));
   try
     Result := TSecretBuffer.From(LZ);
@@ -1138,7 +1114,7 @@ begin
   end;
 end;
 
-procedure TNistEcAgreement.GenerateKeyPair(out APrivateKey: ISecretBuffer;
+procedure TNistEcAgreement.GenerateKeyPair(out APrivateKey: IKeyExchangePrivateKey;
   out APublicKey: TBytes);
 var
   LPriv: IECPrivateKeyParameters;
@@ -1149,26 +1125,40 @@ begin
   APublicKey := LPub.Q.GetEncoded(False);
   LPrivBytes := TBigIntegerUtilities.AsUnsignedByteArray(FFieldSize, LPriv.D);
   try
-    APrivateKey := TSecretBuffer.From(LPrivBytes);
+    // keep the parsed EC key parameter so Agree does not re-parse the scalar; the raw scalar
+    // is retained for ExportRaw
+    APrivateKey := TKeyExchangePrivateKey.Create(TKeyAgreementUsage.Ephemeral,
+      TSecretBuffer.From(LPrivBytes), LPriv, True);
   finally
     TSecureMemory.WipeBytes(LPrivBytes);
   end;
 end;
 
-function TNistEcAgreement.Agree(const APrivateKey: ISecretBuffer;
-  const APeerPublicKey: TBytes; AUsage: TKeyAgreementUsage): ISecretBuffer;
+function TNistEcAgreement.ScalarFromBytes(const ARaw: TBytes): TBigInteger;
+begin
+  if System.Length(ARaw) <> FFieldSize then
+    raise EArgumentTlsLibException.CreateResFmt(@SInvalidScalarSize,
+      [System.Length(ARaw), FFieldSize]);
+  // an unsigned scalar; reject 0 and anything >= n rather than let [d]G silently reduce d mod n
+  Result := TBigInteger.Create(1, ARaw);
+  if (Result.SignValue <= 0) or (Result.CompareTo(FDomain.N) >= 0) then
+    raise EArgumentTlsLibException.CreateRes(@SScalarOutOfRange);
+end;
+
+function TNistEcAgreement.Agree(const APrivateKey: IKeyExchangePrivateKey;
+  const APeerPublicKey: TBytes): ISecretBuffer;
 var
-  LPrivBytes: TBytes;
+  LKey: IProviderKeyExchangeKey;
   LPrivParams: IECPrivateKeyParameters;
 begin
-  LPrivBytes := APrivateKey.ToBytes;
-  try
-    LPrivParams := TECPrivateKeyParameters.Create(TBigInteger.Create(1, LPrivBytes),
-      FDomain);
-    Result := AgreeParams(LPrivParams, WrapPeer(APeerPublicKey), AUsage);
-  finally
-    TSecureMemory.WipeBytes(LPrivBytes);
-  end;
+  if not Supports(APrivateKey, IProviderKeyExchangeKey, LKey) then
+    raise EArgumentTlsLibException.CreateRes(@SForeignKeyExchangeKey);
+  // a same-width foreign scalar must not agree under this curve's domain
+  if not Supports(LKey.KeyParameter, IECPrivateKeyParameters, LPrivParams) or
+    not LPrivParams.Parameters.Equals(FDomain) then
+    raise EArgumentTlsLibException.CreateRes(@SForeignKeyExchangeKey);
+  // the key's Usage drives the blinding posture
+  Result := AgreeParams(LPrivParams, WrapPeer(APeerPublicKey), APrivateKey.Usage);
 end;
 
 function TNistEcAgreement.ValidatePublicKey(const APublicKey: TBytes): Boolean;
@@ -1178,7 +1168,7 @@ var
   LPoint: IECPoint;
 begin
   Result := False;
-  // an EC key share must use the uncompressed point form: RFC 8446 4.2.8.2 (TLS 1.3)
+  // an EC key share must use the uncompressed point form: RFC 9846 4.3.8.2 (TLS 1.3)
   // and RFC 8422 5.1.2 (TLS 1.2 and earlier) both mandate it and forbid compressed/
   // hybrid, so reject those up front - the caller then yields illegal_parameter
   if (System.Length(APublicKey) = 0) or (APublicKey[0] <> UncompressedPointPrefix) then
@@ -1192,61 +1182,59 @@ begin
 end;
 
 function TNistEcAgreement.ImportPrivateKey(const ARawPrivateKey: ISecretBuffer;
-  out APublicKey: TBytes): ISecretBuffer;
+  AUsage: TKeyAgreementUsage; out APublicKey: TBytes): IKeyExchangePrivateKey;
 var
   LScalar: TBytes;
+  LD: TBigInteger;
+  LFactory: IECCTMultiplierFactory;
+  LMul: IECMultiplier;
+  LQ: IECPoint;
 begin
   LScalar := ARawPrivateKey.ToBytes;
   try
-    // the public value is the SEC1 uncompressed encoding of [d]G
-    APublicKey := FDomain.G.Multiply(TBigInteger.Create(1, LScalar))
-      .Normalize.GetEncoded(False);
-    Result := TSecretBuffer.From(LScalar);
+    // d validated in [1, n-1]; the public value is the SEC1 uncompressed encoding of [d]G
+    LD := ScalarFromBytes(LScalar);
+    // derive [d]G through the injected RNG so the blind is provider-owned
+    if Supports(FDomain.Curve, IECCTMultiplierFactory, LFactory) then
+    begin
+      LMul := LFactory.CreateCTMultiplier(FRandom, TECCurveConstants.SCALAR_BLIND_FULL);
+      LQ := LMul.Multiply(FDomain.G, LD);
+    end
+    else
+      LQ := FDomain.G.Multiply(LD);
+    APublicKey := LQ.Normalize.GetEncoded(False);
+    // parse the EC key parameter once here so a later Agree reuses it; keep the raw scalar
+    Result := TKeyExchangePrivateKey.Create(AUsage, TSecretBuffer.From(LScalar),
+      TECPrivateKeyParameters.Create(LD, FDomain), True);
   finally
     TSecureMemory.WipeBytes(LScalar);
   end;
 end;
 
-function TNistEcAgreement.ExportPrivateKey(
-  const APrivateKey: ISecretBuffer): ISecretBuffer;
-begin
-  // the private key already is the raw big-endian scalar
-  Result := APrivateKey;
-end;
-
 { TKemAdapter }
 
-constructor TKemAdapter.Create(const AName: string; const AParams: IMlKemParameters;
+constructor TKemAdapter.Create(const AParams: IMlKemParameters;
   const ARandom: ISecureRandom);
 begin
   inherited Create;
-  FName := AName;
   FParams := AParams;
   FRandom := ARandom;
 end;
 
-function TKemAdapter.Name: string;
-begin
-  Result := FName;
-end;
-
-procedure TKemAdapter.GenerateKeyPair(out APrivateKey: ISecretBuffer;
+procedure TKemAdapter.GenerateKeyPair(out APrivateKey: IKeyExchangePrivateKey;
   out APublicKey: TBytes);
 var
   LGen: IMlKemKeyPairGenerator;
   LKp: IAsymmetricCipherKeyPair;
-  LPrivBytes: TBytes;
 begin
   LGen := TMlKemKeyPairGenerator.Create;
   LGen.Init(TMlKemKeyGenerationParameters.Create(FRandom, FParams) as IKeyGenerationParameters);
   LKp := LGen.GenerateKeyPair;
   APublicKey := (LKp.Public as IMlKemPublicKeyParameters).GetEncoded;
-  LPrivBytes := (LKp.Private as IMlKemPrivateKeyParameters).GetEncoded;
-  try
-    APrivateKey := TSecretBuffer.From(LPrivBytes);
-  finally
-    TSecureMemory.WipeBytes(LPrivBytes);
-  end;
+  // hold the parsed decapsulation key so Decapsulate does not re-decode it; a KEM key has no
+  // single raw scalar, so it is not exportable
+  APrivateKey := TKeyExchangePrivateKey.Create(TKeyAgreementUsage.Ephemeral, nil,
+    LKp.Private, False);
 end;
 
 procedure TKemAdapter.Encapsulate(const APeerPublicKey: TBytes;
@@ -1256,7 +1244,13 @@ var
   LSecret: TBytes;
 begin
   LEnc := TMlKemEncapsulator.Create(FParams);
-  LEnc.Init(TMlKemPublicKeyParameters.FromEncoding(FParams, APeerPublicKey));
+  try
+    LEnc.Init(TMlKemPublicKeyParameters.FromEncoding(FParams, APeerPublicKey));
+  except
+    // a malformed peer KEM public key must not leak a backend exception
+    on E: ECryptoLibException do
+      raise EPeerInputTlsLibException.CreateRes(@SInvalidKemPublicKey);
+  end;
   ACiphertext := nil;
   SetLength(ACiphertext, LEnc.GetEncapsulationLength);
   LSecret := nil;
@@ -1270,33 +1264,35 @@ begin
   end;
 end;
 
-procedure TKemAdapter.Decapsulate(const APrivateKey: ISecretBuffer;
+procedure TKemAdapter.Decapsulate(const APrivateKey: IKeyExchangePrivateKey;
   const ACiphertext: TBytes; out ASharedSecret: ISecretBuffer);
 var
+  LKey: IProviderKeyExchangeKey;
   LDec: IKemDecapsulator;
-  LPrivBytes, LSecret: TBytes;
+  LPriv: IMlKemPrivateKeyParameters;
+  LSecret: TBytes;
 begin
-  LPrivBytes := APrivateKey.ToBytes;
+  if not Supports(APrivateKey, IProviderKeyExchangeKey, LKey) then
+    raise EArgumentTlsLibException.CreateRes(@SForeignKeyExchangeKey);
+  // the handle is provider-typed but not primitive-typed: an EC/X25519 handle must not decapsulate
+  if not Supports(LKey.KeyParameter, IMlKemPrivateKeyParameters, LPriv) then
+    raise EArgumentTlsLibException.CreateRes(@SForeignKeyExchangeKey);
   try
+    LDec := TMlKemDecapsulator.Create(FParams);
+    LDec.Init(LPriv);
+    LSecret := nil;
+    SetLength(LSecret, LDec.GetSecretLength);
     try
-      LDec := TMlKemDecapsulator.Create(FParams);
-      LDec.Init(TMlKemPrivateKeyParameters.FromEncoding(FParams, LPrivBytes));
-      LSecret := nil;
-      SetLength(LSecret, LDec.GetSecretLength);
-      try
-        LDec.Decapsulate(ACiphertext, 0, System.Length(ACiphertext), LSecret, 0,
-          System.Length(LSecret));
-        ASharedSecret := TSecretBuffer.From(LSecret);
-      finally
-        TSecureMemory.WipeBytes(LSecret);
-      end;
-    except
-      // a malformed peer ciphertext must not leak a backend exception
-      on E: ECryptoLibException do
-        raise EPeerInputTlsLibException.CreateRes(@SInvalidCiphertext);
+      LDec.Decapsulate(ACiphertext, 0, System.Length(ACiphertext), LSecret, 0,
+        System.Length(LSecret));
+      ASharedSecret := TSecretBuffer.From(LSecret);
+    finally
+      TSecureMemory.WipeBytes(LSecret);
     end;
-  finally
-    TSecureMemory.WipeBytes(LPrivBytes);
+  except
+    // RFC 10024 4.2: past the group's length check a fault is local (internal_error)
+    on E: ECryptoLibException do
+      raise EInvalidOperationTlsLibException.CreateRes(@SKemDecapsulationFailed);
   end;
 end;
 
@@ -1316,17 +1312,10 @@ end;
 
 { TSignatureSignerAdapter }
 
-constructor TSignatureSignerAdapter.Create(const ASigner: ISigner;
-  const AScheme: string);
+constructor TSignatureSignerAdapter.Create(const ASigner: ISigner);
 begin
   inherited Create;
   FSigner := ASigner;
-  FScheme := AScheme;
-end;
-
-function TSignatureSignerAdapter.AlgorithmName: string;
-begin
-  Result := FScheme;
 end;
 
 procedure TSignatureSignerAdapter.Update(const AData: TBytes; AOffset, ALength: Int32);
@@ -1336,22 +1325,21 @@ end;
 
 function TSignatureSignerAdapter.Sign: TBytes;
 begin
-  Result := FSigner.GenerateSignature;
+  try
+    Result := FSigner.GenerateSignature;
+  except
+    // keep a typed exception at the seam (a modulus too small for the scheme's encoding)
+    on E: ECryptoLibException do
+      raise EInvalidOperationTlsLibException.CreateRes(@SKeyUnusableForScheme);
+  end;
 end;
 
 { TSignatureVerifierAdapter }
 
-constructor TSignatureVerifierAdapter.Create(const ASigner: ISigner;
-  const AScheme: string);
+constructor TSignatureVerifierAdapter.Create(const ASigner: ISigner);
 begin
   inherited Create;
   FSigner := ASigner;
-  FScheme := AScheme;
-end;
-
-function TSignatureVerifierAdapter.AlgorithmName: string;
-begin
-  Result := FScheme;
 end;
 
 procedure TSignatureVerifierAdapter.Update(const AData: TBytes; AOffset, ALength: Int32);
@@ -1361,22 +1349,39 @@ end;
 
 function TSignatureVerifierAdapter.Verify(const ASignature: TBytes): Boolean;
 begin
-  // fail-closed: a structurally invalid signature is a failed verification, never
-  // an escaping exception
+  // fail-closed: any error on a malformed signature (a range/convert error from the ASN.1/bignum
+  // layer, not only a backend exception) is a failed verification, never an escaping exception
   try
     Result := FSigner.VerifySignature(ASignature);
   except
-    on E: ECryptoLibException do
+    on E: Exception do
       Result := False;
   end;
 end;
 
+{ TFailClosedSignatureVerifier }
+
+procedure TFailClosedSignatureVerifier.Update(const AData: TBytes; AOffset, ALength: Int32);
+begin
+end;
+
+function TFailClosedSignatureVerifier.Verify(const ASignature: TBytes): Boolean;
+begin
+  Result := False;
+end;
+
 { TStaticPasswordFinder }
 
-constructor TStaticPasswordFinder.Create(const APassword: string);
+constructor TStaticPasswordFinder.Create(const APassword: ISecretBuffer);
 begin
   inherited Create;
   FPassword := TCredentialImport.PasswordChars(APassword);
+end;
+
+destructor TStaticPasswordFinder.Destroy;
+begin
+  TCredentialImport.WipePasswordChars(FPassword);
+  inherited Destroy;
 end;
 
 function TStaticPasswordFinder.GetPassword: TArray<Char>;
@@ -1386,19 +1391,68 @@ end;
 
 { TSigningKey }
 
-constructor TSigningKey.Create(const APrivateKeyInfo: ISecretBuffer;
-  const AKeyParameter: IAsymmetricKeyParameter;
+constructor TSigningKey.Create(const AKeyParameter: IAsymmetricKeyParameter;
   const ACapableSchemes: TArray<TSignatureScheme>);
 begin
   inherited Create;
-  FPrivateKeyInfo := APrivateKeyInfo;
   FKeyParameter := AKeyParameter;
   FCapableSchemes := ACapableSchemes;
+  FPublicKeyInfo := DerivePublicKeyInfo(AKeyParameter);
+end;
+
+constructor TSigningKey.Create(const AKeyParameter: IAsymmetricKeyParameter;
+  const ACapableSchemes: TArray<TSignatureScheme>; const APublicKeyInfo: TBytes);
+begin
+  inherited Create;
+  FKeyParameter := AKeyParameter;
+  FCapableSchemes := ACapableSchemes;
+  FPublicKeyInfo := APublicKeyInfo;
+end;
+
+class function TSigningKey.DerivePublicParameter(
+  const AKeyParameter: IAsymmetricKeyParameter): IAsymmetricKeyParameter;
+var
+  LRsa: IRsaPrivateCrtKeyParameters;
+  LEc: IECPrivateKeyParameters;
+  LEd25519: IEd25519PrivateKeyParameters;
+  LEd448: IEd448PrivateKeyParameters;
+begin
+  Result := nil;
+  if AKeyParameter = nil then
+    Exit;
+  if Supports(AKeyParameter, IRsaPrivateCrtKeyParameters, LRsa) then
+    Result := TRsaKeyParameters.Create(False, LRsa.Modulus, LRsa.PublicExponent)
+      as IAsymmetricKeyParameter
+  else if Supports(AKeyParameter, IECPrivateKeyParameters, LEc) then
+    Result := TECKeyPairGenerator.GetCorrespondingPublicKey(LEc) as IAsymmetricKeyParameter
+  else if Supports(AKeyParameter, IEd25519PrivateKeyParameters, LEd25519) then
+    Result := LEd25519.GeneratePublicKey as IAsymmetricKeyParameter
+  else if Supports(AKeyParameter, IEd448PrivateKeyParameters, LEd448) then
+    Result := LEd448.GeneratePublicKey as IAsymmetricKeyParameter;
+end;
+
+class function TSigningKey.DerivePublicKeyInfo(
+  const AKeyParameter: IAsymmetricKeyParameter): TBytes;
+var
+  LPublic: IAsymmetricKeyParameter;
+  LInfo: ISubjectPublicKeyInfo;
+begin
+  Result := nil;
+  LPublic := DerivePublicParameter(AKeyParameter);
+  if LPublic = nil then
+    Exit;
+  LInfo := TSubjectPublicKeyInfoFactory.CreateSubjectPublicKeyInfo(LPublic);
+  Result := LInfo.GetDerEncoded;
 end;
 
 function TSigningKey.CapableSchemes: TArray<TSignatureScheme>;
 begin
   Result := FCapableSchemes;
+end;
+
+function TSigningKey.PublicKeyInfo: TBytes;
+begin
+  Result := System.Copy(FPublicKeyInfo);
 end;
 
 function TSigningKey.WithPreferredSchemes(
@@ -1412,7 +1466,7 @@ begin
     Exit(Self);
   LNarrowed := nil;
   // keep the requested schemes this key can actually sign, in the requested order;
-  // the new handle shares the same parsed key and canonical bytes
+  // the new handle shares the same parsed key
   for LPref in ASchemes do
     for LCapable in FCapableSchemes do
       if LPref = LCapable then
@@ -1422,12 +1476,8 @@ begin
         LNarrowed[LN] := LPref;
         Break;
       end;
-  Result := TSigningKey.Create(FPrivateKeyInfo, FKeyParameter, LNarrowed);
-end;
-
-function TSigningKey.PrivateKeyInfo: ISecretBuffer;
-begin
-  Result := FPrivateKeyInfo;
+  // the narrowed handle shares the same parsed key and its already-derived public key
+  Result := TSigningKey.Create(FKeyParameter, LNarrowed, FPublicKeyInfo);
 end;
 
 function TSigningKey.KeyParameter: IAsymmetricKeyParameter;
@@ -1438,14 +1488,33 @@ end;
 { TCredentialImport }
 
 class function TCredentialImport.PasswordChars(
-  const APassword: string): TArray<Char>;
+  const APassword: ISecretBuffer): TArray<Char>;
 var
-  LI: Int32;
+  LUtf8: TBytes;
+
+  function Utf8ToChars(const AUtf8: TBytes): TArray<Char>;
+  begin
+  {$IF SizeOf(Char) = 1}
+    // a one-byte Char: the passphrase's UTF-8 octets are the char array, copied as-is
+    SetLength(Result, System.Length(AUtf8));
+    Move(AUtf8[0], Result[0], System.Length(AUtf8));
+  {$ELSE}
+    // a wide Char: decode the UTF-8 octets to characters
+    Result := TEncoding.UTF8.GetChars(AUtf8);
+  {$IFEND}
+  end;
+
 begin
   Result := nil;
-  SetLength(Result, System.Length(APassword));
-  for LI := 1 to System.Length(APassword) do
-    Result[LI - 1] := APassword[LI];
+  // nil and a zero-length buffer both yield no chars (an empty passphrase)
+  if (APassword = nil) or (APassword.Len = 0) then
+    Exit;
+  LUtf8 := APassword.ToBytes;
+  try
+    Result := Utf8ToChars(LUtf8);
+  finally
+    TSecureMemory.WipeBytes(LUtf8);
+  end;
 end;
 
 class procedure TCredentialImport.WipePasswordChars(
@@ -1456,7 +1525,7 @@ begin
 end;
 
 // Classifies a DER private key by the types of the outer SEQUENCE's first elements:
-// a leading SEQUENCE is EncryptedPrivateKeyInfo; a leading INTEGER (the version) is
+// a leading SEQUENCE with an OCTET STRING second is EncryptedPrivateKeyInfo; a leading INTEGER (the version) is
 // followed by a SEQUENCE (PKCS#8), an INTEGER (PKCS#1 RSAPrivateKey) or an OCTET
 // STRING (SEC1 ECPrivateKey). The ASN.1 layer does the DER decoding and validation.
 class function TCredentialImport.DetectDerKeyShape(const AData: TBytes): TDerKeyShape;
@@ -1479,7 +1548,12 @@ begin
     Exit;
   LFirst := LSeq[0].ToAsn1Object;
   if Supports(LFirst, IAsn1Sequence, LSeqRef) then
-    Exit(TDerKeyShape.EncryptedPkcs8);
+  begin
+    // EncryptedPrivateKeyInfo is exactly (algorithm, encryptedData OCTET STRING), RFC 5958 3
+    if (LSeq.Count = 2) and Supports(LSeq[1].ToAsn1Object, IAsn1OctetString, LOctRef) then
+      Result := TDerKeyShape.EncryptedPkcs8;
+    Exit;
+  end;
   if not Supports(LFirst, IDerInteger, LIntRef) then
     Exit;
   LSecond := LSeq[1].ToAsn1Object;
@@ -1493,7 +1567,7 @@ end;
 
 // Derives the schemes a key can sign with from its PrivateKeyInfo AlgorithmIdentifier:
 // RSA -> the three rsa_pss_rsae_* variants; a named EC curve -> its matching ECDSA
-// scheme; Ed25519 -> ed25519. Raises on any unsupported algorithm.
+// scheme; an EdDSA key -> ed25519/ed448. Raises on any unsupported algorithm.
 class function TCredentialImport.SchemesForKeyInfo(
   const AInfo: IPrivateKeyInfo): TArray<TSignatureScheme>;
 var
@@ -1505,7 +1579,7 @@ begin
   LOid := LAlg.Algorithm;
   // an rsaEncryption key can sign both RSASSA-PSS and legacy RSASSA-PKCS1-v1_5; PSS is
   // listed first so it stays preferred (and is the only RSA option for a 1.3 handshake
-  // signature - the pkcs1 schemes are gated out there, RFC 8446 4.2.3)
+  // signature - the pkcs1 schemes are gated out there, RFC 9846 4.3.3)
   if LOid.Equals(TPkcsObjectIdentifiers.RsaEncryption) then
     Exit(TArray<TSignatureScheme>.Create(TSignatureScheme.RSA_PSS_RSAE_SHA256,
       TSignatureScheme.RSA_PSS_RSAE_SHA384, TSignatureScheme.RSA_PSS_RSAE_SHA512,
@@ -1513,6 +1587,8 @@ begin
       TSignatureScheme.RSA_PKCS1_SHA512));
   if LOid.Equals(TEdECObjectIdentifiers.IdEd25519) then
     Exit(TArray<TSignatureScheme>.Create(TSignatureScheme.ED25519));
+  if LOid.Equals(TEdECObjectIdentifiers.IdEd448) then
+    Exit(TArray<TSignatureScheme>.Create(TSignatureScheme.ED448));
   if LOid.Equals(TX9ObjectIdentifiers.IdECPublicKey) and (LAlg.Parameters <> nil) and
     Supports(LAlg.Parameters.ToAsn1Object, IDerObjectIdentifier, LCurve) then
   begin
@@ -1526,21 +1602,82 @@ begin
   raise ENotSupportedTlsLibException.CreateRes(@SUnsupportedKeyAlgorithm);
 end;
 
+// The first block of the file whose type names a private key, framed but not parsed (so a
+// certificate or parameters ahead of it are never judged); nil when there is none.
+class function TCredentialImport.FirstPrivateKeyObject(const AData: TBytes): IPemObject;
+var
+  LStream: TBytesStream;
+  LReader: IPemReader;
+begin
+  LStream := TBytesStream.Create(AData);
+  try
+    LReader := TPemReader.Create(LStream) as IPemReader;
+    repeat
+      Result := LReader.ReadPemObject;
+    until (Result = nil) or TStringUtilities.EndsWith(Result.&Type, 'PRIVATE KEY');
+    LReader := nil;
+  finally
+    LStream.Free;
+  end;
+end;
+
+// Whether the block carries an RFC 1421 header AName with the value AValue.
+class function TCredentialImport.HasHeader(const AObject: IPemObject; const AName,
+  AValue: string): Boolean;
+var
+  LHeader: IPemHeader;
+begin
+  Result := False;
+  for LHeader in AObject.Headers do
+    if (LHeader.Name = AName) and (LHeader.Value = AValue) then
+      Exit(True);
+end;
+
 // The private half of the key object the PEM reader returned (a bare key parameter,
 // or the private key of a returned key pair).
 class function TCredentialImport.KeyParamFromPem(const AData: TBytes;
-  const APassword: string; AHasPassword: Boolean): IAsymmetricKeyParameter;
+  const APassword: ISecretBuffer): IAsymmetricKeyParameter;
 var
+  LObject: IPemObject;
+  LWriter: IPemWriter;
   LStream: TBytesStream;
   LReader: IOpenSslPemReader;
   LValue: TValue;
   LPair: IAsymmetricCipherKeyPair;
   LParam: IAsymmetricKeyParameter;
+  LWipe: TBytes;
 begin
   Result := nil;
-  LStream := TBytesStream.Create(AData);
+  // a key file often leads with other objects (EC PARAMETERS, a certificate in a cert+key
+  // bundle): only the first private key is parsed
+  LObject := FirstPrivateKeyObject(AData);
+  if LObject = nil then
+    raise EArgumentTlsLibException.CreateRes(@SMalformedPrivateKey);
+  // the legacy reader cannot take an empty passphrase (nil or zero-length), so it is refused here
+  if ((APassword = nil) or (APassword.Len = 0)) and
+    HasHeader(LObject, 'Proc-Type', '4,ENCRYPTED') then
+    raise EArgumentTlsLibException.CreateRes(@SEmptyPassphraseLegacyPem);
+  // the label binds the content to an EncryptedPrivateKeyInfo (RFC 7468 11); the DER arm decrypts
+  // under any passphrase, an empty one included
+  if LObject.&Type = 'ENCRYPTED PRIVATE KEY' then
+  begin
+    LWipe := LObject.Content;
+    try
+      if DetectDerKeyShape(LWipe) <> TDerKeyShape.EncryptedPkcs8 then
+        raise EArgumentTlsLibException.CreateRes(@SMalformedPrivateKey);
+      Exit(KeyParamFromDer(LWipe, APassword));
+    finally
+      TSecureMemory.WipeBytes(LWipe);
+    end;
+  end;
+  // the chosen block alone, headers included, goes back through the reader that decrypts it
+  LStream := TBytesStream.Create;
   try
-    if AHasPassword then
+    LWriter := TPemWriter.Create(LStream) as IPemWriter;
+    LWriter.WriteObject(LObject);
+    LWriter := nil;
+    LStream.Position := 0;
+    if APassword <> nil then
       LReader := TOpenSslPemReader.Create(LStream,
         TStaticPasswordFinder.Create(APassword) as IOpenSslPasswordFinder)
     else
@@ -1557,19 +1694,27 @@ begin
       LReader := nil;
     end;
   finally
+    // the re-framed block holds the key in the clear when it is unencrypted
+    LWipe := LStream.Bytes;
+    TSecureMemory.WipeBytes(LWipe);
     LStream.Free;
+    LWipe := LObject.Content;
+    TSecureMemory.WipeBytes(LWipe);
   end;
 end;
 
 // The key parameter for a DER private key, dispatched on its ASN.1 shape. PKCS#1
 // and SEC1 are wrapped into a PrivateKeyInfo exactly as the PEM reader does.
 class function TCredentialImport.KeyParamFromDer(const AData: TBytes;
-  const APassword: string; AHasPassword: Boolean): IAsymmetricKeyParameter;
+  const APassword: ISecretBuffer): IAsymmetricKeyParameter;
 var
   LRsa: IRsaPrivateKeyStructure;
   LEc: IECPrivateKeyStructure;
   LAlgId: IAlgorithmIdentifier;
   LInfo: IPrivateKeyInfo;
+  LEnc: IEncryptedPrivateKeyInfo;
+  LEngine: TValue;
+  LCipher: IBufferedCipher;
   LPass: TArray<Char>;
 begin
   Result := nil;
@@ -1578,11 +1723,38 @@ begin
       Result := TPrivateKeyFactory.CreateKey(AData);
     TDerKeyShape.EncryptedPkcs8:
       begin
-        if not AHasPassword then
-          raise EArgumentTlsLibException.CreateRes(@SMalformedPrivateKey);
+        // an unsupported encryption is reported as such, whatever password was given
+        LEnc := TEncryptedPrivateKeyInfo.GetInstance(AData);
+        try
+          LEngine := TPbeUtilities.CreateEngine(LEnc.EncryptionAlgorithm);
+        except
+          on E: ESecurityUtilityCryptoLibException do
+            raise ENotSupportedTlsLibException.CreateRes(@SUnsupportedKeyEncryption);
+        end;
+        if not (LEngine.TryGetAsType<IBufferedCipher>(LCipher)) or (LCipher = nil) then
+          raise ENotSupportedTlsLibException.CreateRes(@SUnsupportedKeyEncryption);
+        // PBES2 is read as PBKDF2 whatever its key-derivation function says
+        if LEnc.EncryptionAlgorithm.Algorithm.Equals(TPkcsObjectIdentifiers.IdPbeS2) and
+          not TPbeS2Parameters.GetInstance(LEnc.EncryptionAlgorithm.Parameters.ToAsn1Object)
+          .KeyDerivationFunc.Algorithm.Equals(TPkcsObjectIdentifiers.IdPbkdf2) then
+          raise ENotSupportedTlsLibException.CreateRes(@SUnsupportedKeyEncryption);
         LPass := PasswordChars(APassword);
         try
-          Result := TPrivateKeyFactory.DecryptKey(LPass, AData);
+          try
+            Result := TPrivateKeyFactory.DecryptKey(LPass, LEnc);
+          except
+            on E: EBaseTlsLibException do
+              raise;
+            on E: ESecurityUtilityCryptoLibException do
+              raise ENotSupportedTlsLibException.CreateRes(@SUnsupportedKeyEncryption);
+            on E: Exception do
+            begin
+              // nil and zero-length are the empty passphrase: failing under it asks for a password
+              if (APassword = nil) or (APassword.Len = 0) then
+                raise EArgumentTlsLibException.CreateRes(@SPrivateKeyPasswordRequired);
+              raise;
+            end;
+          end;
         finally
           WipePasswordChars(LPass);
         end;
@@ -1611,39 +1783,33 @@ class function TCredentialImport.SigningKeyFromParam(
   const AKeyParam: IAsymmetricKeyParameter): ISigningKey;
 var
   LInfo: IPrivateKeyInfo;
-  LPkcs8: TBytes;
   LSchemes: TArray<TSignatureScheme>;
-  LBuffer: ISecretBuffer;
+  LRsa: IRsaKeyParameters;
 begin
   if (AKeyParam = nil) or (not AKeyParam.IsPrivate) then
     raise EArgumentTlsLibException.CreateRes(@SMalformedPrivateKey);
+  // capability comes straight off the parsed key info; the signing key holds only the parsed
+  // key parameter (reused for every sign) - the PKCS#8 bytes are not retained
   LInfo := TPrivateKeyInfoFactory.CreatePrivateKeyInfo(AKeyParam);
-  // capability comes straight off the parsed key info; hold the parsed key (reused for
-  // every sign) plus canonical PKCS#8 (the wipeable export form)
   LSchemes := SchemesForKeyInfo(LInfo);
-  LPkcs8 := LInfo.GetDerEncoded;
-  try
-    LBuffer := TSecretBuffer.From(LPkcs8);
-  finally
-    TSecureMemory.WipeBytes(LPkcs8);
-  end;
-  Result := TSigningKey.Create(LBuffer, AKeyParam, LSchemes);
+  if Supports(AKeyParam, IRsaKeyParameters, LRsa) then
+    LSchemes := TSignatureScheme.FitRsaModulus(LSchemes, LRsa.Modulus.BitLength);
+  Result := TSigningKey.Create(AKeyParam, LSchemes);
 end;
 
-// Imports a signing key in any supported encoding: normalizes it to canonical
-// PKCS#8 (held wipeably) and derives the schemes it can sign with. Any backend
-// parse failure is reclassified as a typed library exception, so no Clp*/ASN.1
-// exception escapes the provider.
+// Imports a signing key in any supported encoding: parses it to a key parameter and
+// derives the schemes it can sign with. Any backend parse failure is reclassified as a
+// typed library exception, so no Clp*/ASN.1 exception escapes the provider.
 class function TCredentialImport.ImportKey(const AData: TBytes;
-  const APassword: string; AHasPassword: Boolean): ISigningKey;
+  const APassword: ISecretBuffer): ISigningKey;
 var
   LKeyParam: IAsymmetricKeyParameter;
 begin
   try
     if TPem.IsArmored(AData) then
-      LKeyParam := KeyParamFromPem(AData, APassword, AHasPassword)
+      LKeyParam := KeyParamFromPem(AData, APassword)
     else
-      LKeyParam := KeyParamFromDer(AData, APassword, AHasPassword);
+      LKeyParam := KeyParamFromDer(AData, APassword);
     Result := SigningKeyFromParam(LKeyParam);
   except
     on E: EBaseTlsLibException do
@@ -1655,7 +1821,9 @@ end;
 
 { TDefaultCryptoProvider }
 
-constructor TDefaultCryptoProvider.Create(const AOverrides: TCryptoProviderOverrides);
+constructor TDefaultCryptoProvider.Create(const ARandom: IRandom;
+  const APrimitives: ICryptoPrimitives; const ASigning: ISigningCrypto;
+  const AHpke: IHpkeCrypto);
 var
   LRandom: ISecureRandom;
 begin
@@ -1663,50 +1831,32 @@ begin
   // resolve the effective entropy source first, then thread that ONE instance into the
   // default Primitives and Signing this ctor builds; a supplied Random governs only the
   // facets built here, never a supplied Primitives override
-  if AOverrides.Random <> nil then
-    LRandom := TSecureRandom.Create(TRandomGeneratorBridge.Create(AOverrides.Random)
+  if ARandom <> nil then
+    LRandom := TSecureRandom.Create(TRandomGeneratorBridge.Create(ARandom)
       as IRandomGenerator)
   else
     LRandom := TSecureRandom.Create;
 
-  if AOverrides.Primitives <> nil then
-    FPrimitives := AOverrides.Primitives
+  if APrimitives <> nil then
+    FPrimitives := APrimitives
   else
     FPrimitives := TCryptoPrimitives.Create(LRandom,
       TAesUtilities.IsHardwareAccelerated()) as ICryptoPrimitives;
 
-  if AOverrides.Signing <> nil then
-    FSigning := AOverrides.Signing
+  if ASigning <> nil then
+    FSigning := ASigning
   else
     FSigning := TSigningCrypto.Create(LRandom) as ISigningCrypto;
 
-  if AOverrides.Inspector <> nil then
-    FInspector := AOverrides.Inspector
-  else
-    FInspector := TCertificateInspector.Create as ICertificateInspector;
-
-  if AOverrides.PathValidation <> nil then
-    FPathValidation := AOverrides.PathValidation
-  else
-    FPathValidation := TCertificatePathValidator.Create as ICertificatePathValidator;
-
-  if AOverrides.Revocation <> nil then
-    FRevocation := AOverrides.Revocation
-  else
-    FRevocation := TRevocationChecker.Create as IRevocationChecker;
-
-  if AOverrides.Hpke <> nil then
-    FHpke := AOverrides.Hpke
+  if AHpke <> nil then
+    FHpke := AHpke
   else
     FHpke := THpkeComposition.Create(FPrimitives) as IHpkeCrypto;
 end;
 
 constructor TDefaultCryptoProvider.Create;
-var
-  LOverrides: TCryptoProviderOverrides;
 begin
-  LOverrides := Default(TCryptoProviderOverrides);
-  Create(LOverrides);
+  Create(nil, nil, nil, nil);
 end;
 
 { TDigestResolver }
@@ -1747,8 +1897,20 @@ var
 begin
   if ALen <= 0 then
     Exit;
+  if (AStart < 0) or (Int64(AStart) + ALen > System.Length(ABytes)) then
+    raise EArgumentTlsLibException.CreateRes(@SRandomSpanOutOfRange);
+  // the generated bytes may seed key material downstream; wipe this copy once handed over
   LGen := FRandom.GenerateBytes(ALen);
-  System.Move(LGen[0], ABytes[AStart], ALen);
+  try
+    // an injected source that returns fewer bytes than asked must fail, never leave the
+    // remainder as adjacent memory that then serves as key or nonce material
+    if System.Length(LGen) <> ALen then
+      raise EInvalidOperationTlsLibException.CreateResFmt(@SRandomShortRead,
+        [System.Length(LGen), ALen]);
+    System.Move(LGen[0], ABytes[AStart], ALen);
+  finally
+    TSecureMemory.WipeBytes(LGen);
+  end;
 end;
 
 { TCryptoPrimitives }
@@ -1775,7 +1937,7 @@ end;
 class function TSigningCrypto.SignerMechanismForScheme(
   AScheme: TSignatureScheme): string;
 begin
-  // map a TLS 1.3 signature scheme to a CryptoLib signer mechanism. The named
+  // map a TLS 1.3 signature scheme to a signer mechanism. The named
   // RSA-PSS mechanisms carry the right hash, MGF1 digest, and salt length (= the
   // hash size), matching the rsa_pss_rsae_* profile; the bare "PSSwithRSA" would
   // wrongly default to SHA-1. ECDSA resolves to DER-encoded signatures.
@@ -1797,7 +1959,7 @@ begin
     TSignatureScheme.RSA_PSS_RSAE_SHA512:
       Result := 'SHA-512withRSAandMGF1';
     // the legacy rsa_pkcs1_* schemes are RSASSA-PKCS1-v1_5 with the named hash; valid for
-    // a TLS 1.2 handshake signature and for certificate signatures (RFC 8446 4.2.3)
+    // a TLS 1.2 handshake signature and for certificate signatures (RFC 9846 4.3.3)
     TSignatureScheme.RSA_PKCS1_SHA256:
       Result := 'SHA-256withRSA';
     TSignatureScheme.RSA_PKCS1_SHA384:
@@ -1810,6 +1972,35 @@ begin
   end;
 end;
 
+class function TSigningCrypto.EcdsaHashForScheme(AScheme: TSignatureScheme;
+  out AHash: THashAlgorithm): Boolean;
+begin
+  Result := True;
+  case AScheme of
+    TSignatureScheme.ECDSA_SECP256R1_SHA256:
+      AHash := THashAlgorithm.SHA_256;
+    TSignatureScheme.ECDSA_SECP384R1_SHA384:
+      AHash := THashAlgorithm.SHA_384;
+    TSignatureScheme.ECDSA_SECP521R1_SHA512:
+      AHash := THashAlgorithm.SHA_512;
+  else
+    AHash := THashAlgorithm.SHA_256; // unused when Result is False; keeps the out param assigned
+    Result := False;
+  end;
+end;
+
+class function TSigningCrypto.CreateDeterministicEcdsaSigner(
+  AHash: THashAlgorithm): ISigner;
+var
+  LKCalculator: IDsaKCalculator;
+  LDsa: IDsa;
+begin
+  // two digest instances: one drives the nonce derivation, the other hashes the message
+  LKCalculator := THMacDsaKCalculator.Create(TDigestResolver.Resolve(AHash));
+  LDsa := TECDsaSigner.Create(LKCalculator);
+  Result := TDsaDigestSigner.Create(LDsa, TDigestResolver.Resolve(AHash));
+end;
+
 function TDefaultCryptoProvider.Primitives: ICryptoPrimitives;
 begin
   Result := FPrimitives;
@@ -1818,21 +2009,6 @@ end;
 function TDefaultCryptoProvider.Signing: ISigningCrypto;
 begin
   Result := FSigning;
-end;
-
-function TDefaultCryptoProvider.Certificates: ICertificateInspector;
-begin
-  Result := FInspector;
-end;
-
-function TDefaultCryptoProvider.PathValidation: ICertificatePathValidator;
-begin
-  Result := FPathValidation;
-end;
-
-function TDefaultCryptoProvider.Revocation: IRevocationChecker;
-begin
-  Result := FRevocation;
 end;
 
 function TDefaultCryptoProvider.Hpke: IHpkeCrypto;
@@ -1869,29 +2045,40 @@ function TCryptoPrimitives.CreateAead(AAlgorithm: TAeadAlgorithm): IAead;
 begin
   case AAlgorithm of
     TAeadAlgorithm.AES_128_GCM:
-      Result := TAeadAdapter.Create(TAeadKind.AesGcm,
-        TEnumUtilities.GetName<TAeadAlgorithm>(AAlgorithm), 16, 12, 16, FHasHardwareAes);
+      Result := TAeadAdapter.Create(TAeadKind.AesGcm, 16, 12, 16, FHasHardwareAes);
     TAeadAlgorithm.AES_256_GCM:
-      Result := TAeadAdapter.Create(TAeadKind.AesGcm,
-        TEnumUtilities.GetName<TAeadAlgorithm>(AAlgorithm), 32, 12, 16, FHasHardwareAes);
+      Result := TAeadAdapter.Create(TAeadKind.AesGcm, 32, 12, 16, FHasHardwareAes);
     TAeadAlgorithm.CHACHA20_POLY1305:
-      Result := TAeadAdapter.Create(TAeadKind.ChaChaPoly,
-        TEnumUtilities.GetName<TAeadAlgorithm>(AAlgorithm), 32, 12, 16, FHasHardwareAes);
+      Result := TAeadAdapter.Create(TAeadKind.ChaChaPoly, 32, 12, 16, FHasHardwareAes);
   else
     raise ENotSupportedTlsLibException.CreateResFmt(@SUnhandledAlgorithm,
       [Ord(AAlgorithm)]);
   end;
 end;
 
-function TSigningCrypto.ImportSigningKey(const AData: TBytes): ISigningKey;
+function TSigningCrypto.ImportSigningKey(const AData: TBytes;
+  const APassword: ISecretBuffer): ISigningKey;
 begin
-  Result := TCredentialImport.ImportKey(AData, '', False);
+  Result := TCredentialImport.ImportKey(AData, APassword);
 end;
 
-function TSigningCrypto.ImportSigningKey(const AData: TBytes;
-  const APassword: string): ISigningKey;
+class function TSigningCrypto.KeyKindOf(const AInfo: ISubjectPublicKeyInfo;
+  const AKey: IAsymmetricKeyParameter; out AKind: TSignatureKeyKind): Boolean;
 begin
-  Result := TCredentialImport.ImportKey(AData, APassword, True);
+  Result := True;
+  // an id-RSASSA-PSS key fits only rsa_pss_pss_*, which is not offered (RFC 4055 1.2)
+  if AInfo.Algorithm.Algorithm.Equals(TPkcsObjectIdentifiers.IdRsassaPss) then
+    Exit(False);
+  if Supports(AKey, IRsaKeyParameters) then
+    AKind := TSignatureKeyKind.Rsa
+  else if Supports(AKey, IECPublicKeyParameters) then
+    AKind := TSignatureKeyKind.Ecdsa
+  else if Supports(AKey, IEd25519PublicKeyParameters) then
+    AKind := TSignatureKeyKind.Ed25519
+  else if Supports(AKey, IEd448PublicKeyParameters) then
+    AKind := TSignatureKeyKind.Ed448
+  else
+    Result := False;
 end;
 
 function TSigningCrypto.CreateSignatureSigner(AScheme: TSignatureScheme;
@@ -1899,117 +2086,102 @@ function TSigningCrypto.CreateSignatureSigner(AScheme: TSignatureScheme;
 var
   LProviderKey: IProviderSigningKey;
   LKey: IAsymmetricKeyParameter;
+  LHash: THashAlgorithm;
+  LSigner: ISigner;
 begin
   if not Supports(AKey, IProviderSigningKey, LProviderKey) then
     raise EArgumentTlsLibException.CreateRes(@SForeignSigningKey);
+  // the key may only sign with a scheme it declared capable of (the import narrows this, and
+  // WithPreferredSchemes narrows it further); refuse anything else rather than let the backend
+  // produce a signature the key was never meant to make
+  if not (TArrayUtilities.Contains<TSignatureScheme>(AKey.CapableSchemes, AScheme)) then
+    raise EArgumentTlsLibException.CreateRes(@SSchemeNotCapable);
   // the key was parsed and validated once at import; reuse it rather than re-parsing and
-  // re-validating it on every sign - InitSigner still makes a fresh per-call signer for
-  // the digest state, so concurrent handshakes stay independent
+  // re-validating it on every sign - each call still makes a fresh signer for the digest
+  // state, so concurrent handshakes stay independent
   LKey := LProviderKey.KeyParameter;
-  Result := TSignatureSignerAdapter.Create(
-    TSignerUtilities.InitSigner(SignerMechanismForScheme(AScheme), True, LKey, FRandom),
-    TEnumUtilities.GetName<TSignatureScheme>(AScheme));
+  try
+    if EcdsaHashForScheme(AScheme, LHash) then
+    begin
+      LSigner := CreateDeterministicEcdsaSigner(LHash);
+      LSigner.Init(True, LKey);
+    end
+    else
+      LSigner := TSignerUtilities.InitSigner(SignerMechanismForScheme(AScheme), True, LKey,
+        FRandom);
+    Result := TSignatureSignerAdapter.Create(LSigner);
+  except
+    // a backend rejection here is a key/scheme problem our own config produced; keep a typed
+    // exception at the seam rather than letting a raw backend exception cross it
+    on E: ECryptoLibException do
+      raise EArgumentTlsLibException.CreateRes(@SKeyUnusableForScheme);
+  end;
 end;
 
 function TSigningCrypto.CreateSignatureVerifier(AScheme: TSignatureScheme;
   const APublicKeyDer: TBytes): ISignatureVerifier;
 var
+  LInfo: ISubjectPublicKeyInfo;
   LKey: IAsymmetricKeyParameter;
+  LKind: TSignatureKeyKind;
   LSigner: ISigner;
 begin
-  LKey := TPublicKeyFactory.CreateKey(APublicKeyDer);
-  LSigner := TSignerUtilities.GetSigner(SignerMechanismForScheme(AScheme));
-  LSigner.Init(False, LKey);
-  Result := TSignatureVerifierAdapter.Create(LSigner,
-    TEnumUtilities.GetName<TSignatureScheme>(AScheme));
-end;
-
-function TCertificateInspector.LoadChain(
-  const AData: TBytes): TArray<TBytes>;
-var
-  LStream: TBytesStream;
-  LReader: IOpenSslPemReader;
-  LValue: TValue;
-  LCert: IX509Certificate;
-  LParser: IX509CertificateParser;
-  LChain: TList<TBytes>;
-begin
-  // PEM may carry a whole chain/bundle (leaf first); DER is a single certificate.
-  // Either way the result is the ordered list of raw DER certificates.
-  Result := nil;
+  // parse the SubjectPublicKeyInfo behind a typed exception (a malformed SPKI is a caller/peer
+  // input problem, never a raw backend exception crossing the seam)
   try
-    if TPem.IsArmored(AData) then
-    begin
-      LChain := TList<TBytes>.Create;
-      try
-        LStream := TBytesStream.Create(AData);
-        try
-          LReader := TOpenSslPemReader.Create(LStream);
-          try
-            while True do
-            begin
-              LValue := LReader.ReadObject;
-              if LValue.IsEmpty then
-                Break;
-              if LValue.TryGetAsType<IX509Certificate>(LCert) then
-                LChain.Add(LCert.GetEncoded);
-            end;
-          finally
-            LReader := nil;
-          end;
-        finally
-          LStream.Free;
-        end;
-        Result := LChain.ToArray;
-      finally
-        LChain.Free;
-      end;
-    end
-    else
-    begin
-      LParser := TX509CertificateParser.Create;
-      Result := TArray<TBytes>.Create(
-        LParser.ReadCertificate(AData).GetEncoded);
-    end;
+    LInfo := TSubjectPublicKeyInfo.GetInstance(APublicKeyDer);
+    LKey := TPublicKeyFactory.CreateKey(LInfo);
+  except
+    on E: EBaseTlsLibException do
+      raise;
+    // a malformed SPKI can also surface as a range/convert error from the ASN.1/bignum layer, not
+    // only a backend exception; map every such failure to the typed malformed-key error
+    on E: Exception do
+      raise EArgumentTlsLibException.CreateRes(@SMalformedPublicKey);
+  end;
+  // bind the scheme's key family to the key: an EC key under rsa_pss_rsae_*, or an RSA key under
+  // ecdsa_*, and an unclassifiable key, can never verify the scheme (RFC 9846 4.3.3). Return a
+  // fail-closed verifier so the outcome is decrypt_error, not a raised error. The curve-vs-scheme
+  // bind stays a TLS 1.3 handshake concern (TCertificateVerify).
+  if (not KeyKindOf(LInfo, LKey, LKind)) or (LKind <> AScheme.KeyKind) then
+    Exit(TFailClosedSignatureVerifier.Create as ISignatureVerifier);
+  try
+    LSigner := TSignerUtilities.GetSigner(SignerMechanismForScheme(AScheme));
+    LSigner.Init(False, LKey);
   except
     on E: ECryptoLibException do
-      raise EArgumentTlsLibException.CreateRes(@SMalformedCertificate);
+      raise EArgumentTlsLibException.CreateRes(@SKeyUnusableForScheme);
   end;
-  if System.Length(Result) = 0 then
-    raise EArgumentTlsLibException.CreateRes(@SNoCertificatesFound);
-end;
-
-function TCertificateInspector.Parse(const ADer: TBytes): IInspectedCertificate;
-begin
-  Result := TInspectedCertificate.Create(ADer) as IInspectedCertificate;
-end;
-
-function TCertificateInspector.IsWellFormed(
-  const ADer: TBytes): Boolean;
-begin
-  Result := False;
-  if System.Length(ADer) = 0 then
-    Exit;
-  try
-    Parse(ADer);
-    Result := True;
-  except
-    Result := False;
-  end;
+  Result := TSignatureVerifierAdapter.Create(LSigner);
 end;
 
 function TSigningCrypto.ImportPkcs12(const AData: TBytes;
-  const APassword: string): TTlsCredential;
+  const APassword: ISecretBuffer): TImportedCredential;
 var
   LStore: IPkcs12Store;
   LStoreBuilder: IPkcs12StoreBuilder;
   LStream: TBytesStream;
   LPass: TArray<Char>;
-  LAliases: TArray<string>;
-  LAlias, LKeyAlias: string;
-  LChainEntries: TArray<IX509CertificateEntry>;
-  LChain: TArray<TBytes>;
-  LI, LKeyCount: Int32;
+  LAliases, LKeyAliases: TArray<string>;
+  LKeyParam, LPub: IAsymmetricKeyParameter;
+  LCerts: TArray<IX509CertificateEntry>;
+  LLinked: IX509CertificateEntry;
+  LLinkedDer: TBytes;
+  LContents: TPkcs12Contents;
+  LKey: TPkcs12Key;
+  LI, LJ: Int32;
+
+  function CertPairsKey(const AEntry: IX509CertificateEntry): Boolean;
+  begin
+    // a certificate whose key the backend cannot parse is not this key's leaf; skip it rather
+    // than fail the whole import (another bag may still pair the key)
+    try
+      Result := LPub.Equals(AEntry.Certificate.GetPublicKey);
+    except
+      Result := False;
+    end;
+  end;
+
 begin
   // PKCS#12 takes a character-array password (empty = none), wiped in the finally so no
   // key-derivation password lingers
@@ -2025,37 +2197,50 @@ begin
         LStream.Free;
       end;
 
-      // the credential requires exactly one private-key entry; alias order is not stable,
-      // so a multi-identity store is rejected rather than binding an arbitrary one
-      LKeyAlias := '';
-      LKeyCount := 0;
+      // alias order is not stable, so the key count decides before any key or certificate is read
       LAliases := LStore.GetAliases;
       for LI := 0 to System.High(LAliases) do
+        if LStore.IsKeyEntry(LAliases[LI]) then
+          TArrayUtilities.Append<string>(LKeyAliases, LAliases[LI]);
+      SetLength(LContents.Keys, System.Length(LKeyAliases));
+
+      if System.Length(LKeyAliases) = 1 then
       begin
-        LAlias := LAliases[LI];
-        if LStore.IsKeyEntry(LAlias) then
+        // every certificate bag counts, including those with no alias
+        LCerts := LStore.GetCertificates;
+        SetLength(LContents.Certificates, System.Length(LCerts));
+        for LI := 0 to System.High(LCerts) do
         begin
-          LKeyAlias := LAlias;
-          Inc(LKeyCount);
+          LContents.Certificates[LI].Der := LCerts[LI].Certificate.GetEncoded;
+          LContents.Certificates[LI].Subject := LCerts[LI].Certificate.SubjectDN.GetEncoded;
+          LContents.Certificates[LI].Issuer := LCerts[LI].Certificate.IssuerDN.GetEncoded;
         end;
+
+        // RFC 7292 leaves the key<->cert link (localKeyId) optional, so pairing is by public key
+        LKeyParam := LStore.GetKey(LKeyAliases[0]).Key;
+        LPub := TSigningKey.DerivePublicParameter(LKeyParam);
+        if LPub = nil then
+          raise ENotSupportedTlsLibException.CreateRes(@SUnsupportedKeyAlgorithm);
+        LKey.Linked := -1;
+        LLinked := LStore.GetCertificate(LKeyAliases[0]);
+        if LLinked <> nil then
+          LLinkedDer := LLinked.Certificate.GetEncoded
+        else
+          LLinkedDer := nil;
+        for LJ := 0 to System.High(LCerts) do
+        begin
+          if CertPairsKey(LCerts[LJ]) then
+            TArrayUtilities.Append<Int32>(LKey.Pairs, LJ);
+          if (LLinkedDer <> nil) and (LKey.Linked < 0) and
+            TArrayUtilities.AreEqual(LContents.Certificates[LJ].Der, LLinkedDer) then
+            LKey.Linked := LJ;
+        end;
+        // the signing key is built only once a certificate pairs it
+        if System.Length(LKey.Pairs) > 0 then
+          LKey.Key := TCredentialImport.SigningKeyFromParam(LKeyParam);
+        LContents.Keys[0] := LKey;
       end;
-      if LKeyCount = 0 then
-        raise EArgumentTlsLibException.CreateRes(@SPkcs12NoKeyEntry);
-      if LKeyCount > 1 then
-        raise EArgumentTlsLibException.CreateRes(@SPkcs12MultipleKeys);
-
-      // the store orders the chain leaf-first (end entity to root)
-      LChainEntries := LStore.GetCertificateChain(LKeyAlias);
-      if System.Length(LChainEntries) = 0 then
-        raise EArgumentTlsLibException.CreateRes(@SPkcs12NoChain);
-      SetLength(LChain, System.Length(LChainEntries));
-      for LI := 0 to System.High(LChainEntries) do
-        LChain[LI] := LChainEntries[LI].Certificate.GetEncoded;
-
-      // the single signing-key path shared with ImportSigningKey; wipes the PKCS#8
-      Result.PrivateKey := TCredentialImport.SigningKeyFromParam(
-        LStore.GetKey(LKeyAlias).Key);
-      Result.CertificateChain := LChain;
+      Result := TPkcs12Identity.Select(LContents);
     except
       // fail closed: reclassify any backend failure as a typed library exception, leaving
       // an already-typed one (e.g. unsupported-algorithm) to propagate unchanged
@@ -2069,121 +2254,6 @@ begin
   end;
 end;
 
-function TCertificateInspector.PublicKeyInfo(
-  const ACertificateDer: TBytes): TBytes;
-begin
-  Result := Parse(ACertificateDer).PublicKeyInfo;
-end;
-
-function TCertificateInspector.DnsNames(
-  const ACertificateDer: TBytes): TArray<string>;
-begin
-  Result := Parse(ACertificateDer).DnsNames;
-end;
-
-function TCertificateInspector.IpAddresses(
-  const ACertificateDer: TBytes): TArray<TBytes>;
-begin
-  Result := Parse(ACertificateDer).IpAddresses;
-end;
-
-constructor TInspectedCertificate.Create(const ADer: TBytes);
-var
-  LParser: IX509CertificateParser;
-begin
-  inherited Create;
-  LParser := TX509CertificateParser.Create;
-  FCert := LParser.ReadCertificate(ADer);
-  if FCert = nil then
-    raise EArgumentTlsLibException.CreateRes(@SMalformedCertificate);
-end;
-
-function TInspectedCertificate.PublicKeyInfo: TBytes;
-begin
-  Result := FCert.GetSubjectPublicKeyInfo.GetDerEncoded;
-end;
-
-function TInspectedCertificate.DnsNames: TArray<string>;
-var
-  LGeneralNames: IGeneralNames;
-  LNames: TArray<IGeneralName>;
-  LString: IAsn1String;
-  LI, LCount: Int32;
-begin
-  Result := nil;
-  LGeneralNames := FCert.GetSubjectAlternativeNameExtension;
-  if LGeneralNames = nil then
-    Exit;
-  LNames := LGeneralNames.GetNames;
-  SetLength(Result, System.Length(LNames));
-  LCount := 0;
-  for LI := 0 to System.Length(LNames) - 1 do
-    if (LNames[LI].TagNo = TGeneralName.DnsName) and
-      Supports(LNames[LI].GetName, IAsn1String, LString) then
-    begin
-      Result[LCount] := LString.GetString;
-      Inc(LCount);
-    end;
-  SetLength(Result, LCount);
-end;
-
-function TInspectedCertificate.IpAddresses: TArray<TBytes>;
-var
-  LGeneralNames: IGeneralNames;
-  LNames: TArray<IGeneralName>;
-  LOctets: IAsn1OctetString;
-  LI, LCount: Int32;
-begin
-  Result := nil;
-  LGeneralNames := FCert.GetSubjectAlternativeNameExtension;
-  if LGeneralNames = nil then
-    Exit;
-  LNames := LGeneralNames.GetNames;
-  SetLength(Result, System.Length(LNames));
-  LCount := 0;
-  for LI := 0 to System.Length(LNames) - 1 do
-    if (LNames[LI].TagNo = TGeneralName.IPAddress) and
-      Supports(LNames[LI].GetName, IAsn1OctetString, LOctets) then
-    begin
-      Result[LCount] := LOctets.GetOctets;
-      Inc(LCount);
-    end;
-  SetLength(Result, LCount);
-end;
-
-class function TCertificatePathValidator.TTrustAnchorRing.Init: TTrustAnchorRing;
-begin
-  SetLength(Result.FKeys, TrustAnchorCacheSize);
-  SetLength(Result.FSets, TrustAnchorCacheSize);
-  Result.FCount := 0;
-  Result.FNext := 0;
-end;
-
-function TCertificatePathValidator.TTrustAnchorRing.TryGet(const AKey: TBytes;
-  out AAnchors: TArray<ITrustAnchor>): Boolean;
-var
-  LI: Int32;
-begin
-  AAnchors := nil;
-  for LI := 0 to FCount - 1 do
-    if TArrayUtilities.AreEqual(FKeys[LI], AKey) then
-    begin
-      AAnchors := FSets[LI];
-      Exit(True);
-    end;
-  Result := False;
-end;
-
-procedure TCertificatePathValidator.TTrustAnchorRing.Remember(const AKey: TBytes;
-  const AAnchors: TArray<ITrustAnchor>);
-begin
-  FKeys[FNext] := AKey;
-  FSets[FNext] := AAnchors;
-  FNext := (FNext + 1) mod TrustAnchorCacheSize;
-  if FCount < TrustAnchorCacheSize then
-    Inc(FCount);
-end;
-
 class constructor TDefaultCryptoProvider.Create;
 begin
   FSharedLock := TCriticalSection.Create;
@@ -2195,17 +2265,6 @@ begin
   FSharedLock.Free;
 end;
 
-class constructor TCertificatePathValidator.Create;
-begin
-  FTrustAnchors := TTrustAnchorRing.Init;
-  FTrustAnchorLock := TCriticalSection.Create;
-end;
-
-class destructor TCertificatePathValidator.Destroy;
-begin
-  FTrustAnchorLock.Free;
-end;
-
 class function TDefaultCryptoProvider.Shared: ICryptoProvider;
 begin
   FSharedLock.Acquire;
@@ -2215,1004 +2274,6 @@ begin
     Result := FShared;
   finally
     FSharedLock.Release;
-  end;
-end;
-
-function TCertificatePathValidator.TrustAnchorKey(
-  const ATrustAnchors: TArray<TBytes>): TBytes;
-var
-  LDigest: IDigest;
-  LI, LN: Int32;
-  LLen: TBytes;
-begin
-  LDigest := TDigestResolver.Resolve(THashAlgorithm.SHA_256);
-  System.SetLength(LLen, 4);
-  for LI := 0 to System.High(ATrustAnchors) do
-  begin
-    // length-prefix each anchor so distinct groupings cannot alias one another
-    LN := System.Length(ATrustAnchors[LI]);
-    TBinaryPrimitives.WriteUInt32LittleEndian(LLen, 0, UInt32(LN));
-    LDigest.BlockUpdate(LLen, 0, 4);
-    if LN > 0 then
-      LDigest.BlockUpdate(ATrustAnchors[LI], 0, LN);
-  end;
-  Result := LDigest.DoFinal;
-end;
-
-procedure TCertificatePathValidator.ValidateCertificatePath(const AChain,
-  ATrustAnchors, AIntermediates: TArray<TBytes>; const AValidationTimeUtc: TDateTime;
-  AKeyPurpose: TCertKeyPurpose; var AEffectiveChain: TArray<TBytes>);
-
-  function IsAnchor(const ACert: IX509Certificate): Boolean;
-  var
-    LDer: TBytes;
-    LJ: Int32;
-  begin
-    Result := False;
-    LDer := ACert.GetEncoded;
-    for LJ := 0 to High(ATrustAnchors) do
-      if TArrayUtilities.AreEqual(LDer, ATrustAnchors[LJ]) then
-        Exit(True);
-  end;
-
-  // append the trust anchor the validator resolved to the effective path, so the leaf-first
-  // chain the caller sees ends at the anchor (a key-pin over the validated path can then pin
-  // the root, matching what an OS delegate reports). A no-op when the anchor is unknown or the
-  // path already ends in it (the peer sent the root, or the builder included it).
-  procedure AppendAnchor(const AAnchorCert: IX509Certificate);
-  var
-    LAnchorDer: TBytes;
-    LLen: Int32;
-  begin
-    if AAnchorCert = nil then
-      Exit;
-    LAnchorDer := AAnchorCert.GetEncoded;
-    LLen := System.Length(AEffectiveChain);
-    if (LLen > 0) and TArrayUtilities.AreEqual(AEffectiveChain[LLen - 1], LAnchorDer) then
-      Exit;
-    SetLength(AEffectiveChain, LLen + 1);
-    AEffectiveChain[LLen] := LAnchorDer;
-  end;
-
-  // RFC 5280 4.2.1.12 extendedKeyUsage, enforced over the validated path (leaf + every
-  // intermediate, never the trust anchor): a certificate carrying an EKU extension must
-  // include the role's purpose; one with no EKU extension is unrestricted. anyExtendedKeyUsage
-  // is not accepted as a substitute, and a present-but-empty EKU is rejected.
-  procedure EnforcePurpose(const APath: TArray<IX509Certificate>);
-  var
-    LRequired: IDerObjectIdentifier;
-    LI, LJ: Int32;
-    LEkus: TArray<IDerObjectIdentifier>;
-    LFound: Boolean;
-    LCert: IX509Certificate;
-  begin
-    if AKeyPurpose = TCertKeyPurpose.ServerAuth then
-      LRequired := TKeyPurposeId.IdKpServerAuth
-    else
-      LRequired := TKeyPurposeId.IdKpClientAuth;
-    for LI := 0 to High(APath) do
-    begin
-      LCert := APath[LI];
-      // a trust anchor is trusted by configuration, not by its own extensions, so its EKU is
-      // not processed - but the end-entity at index 0 always is, even when it is itself the
-      // pinned anchor (a directly-trusted leaf must still carry the required TLS role)
-      if (LI > 0) and IsAnchor(LCert) then
-        Continue;
-      if LCert.GetExtensionValue(TX509Extensions.ExtendedKeyUsage) = nil then
-        Continue; // no EKU extension -> unrestricted
-      try
-        LEkus := LCert.GetExtendedKeyUsage;
-      except
-        // a present-but-unparsable EKU (not a SEQUENCE OF OID) is a malformed certificate,
-        // not an internal fault
-        on E: ECryptoLibException do
-          raise EFatalAlertTlsLibException.CreateRes(
-            TTlsAlertDescription.BadCertificate, @SBadCertificate);
-      end;
-      LFound := False;
-      for LJ := 0 to System.High(LEkus) do
-        if LRequired.Equals(LEkus[LJ]) then
-        begin
-          LFound := True;
-          Break;
-        end;
-      if not LFound then
-        raise EFatalAlertTlsLibException.CreateRes(
-          TTlsAlertDescription.UnsupportedCertificate, @SWrongCertificatePurpose);
-    end;
-  end;
-
-const
-  // the builder only reconstructs an INCOMPLETE chain, which is inherently shallow (a real
-  // hierarchy is a leaf plus at most a few intermediates). Capping the built path's length
-  // keeps a hostile peer that pads its chain with many like-named certificates from driving
-  // the depth-first search into an expensive fan-out. A legitimately deeper chain sent in
-  // full is unaffected: the strict literal pass below has no such cap and accepts it there.
-  MaxBuiltPathLength = 4;
-var
-  LParser: IX509CertificateParser;
-  LCerts, LPool, LInter: TArray<IX509Certificate>;
-  LAnchors: TArray<ITrustAnchor>;
-  LBuilt: TArray<IX509Certificate>;
-  LAnchorKey: TBytes;
-  LHit, LLiteralValidated: Boolean;
-  LParams: IPkixParameters;
-  LPath: IPkixCertPath;
-  LValidator: IPkixCertPathValidator;
-  LValidatorResult: IPkixCertPathValidatorResult;
-  LTarget: IX509CertStoreSelector;
-  LBuilderParams: IPkixBuilderParameters;
-  LPoolStore: IStore<IX509Certificate>;
-  LBuilder: IPkixCertPathBuilder;
-  LBuildResult: IPkixCertPathBuilderResult;
-  LI: Int32;
-begin
-  // by default the effective chain is the one the peer presented; a successful path build
-  // (below) replaces it with the assembled leaf-to-anchor path
-  AEffectiveChain := AChain;
-
-  LParser := TX509CertificateParser.Create;
-  try
-    SetLength(LCerts, System.Length(AChain));
-    for LI := 0 to High(AChain) do
-      LCerts[LI] := LParser.ReadCertificate(AChain[LI]);
-  except
-    on E: ECryptoLibException do
-      raise EFatalAlertTlsLibException.CreateRes(
-        TTlsAlertDescription.BadCertificate, @SBadCertificate);
-  end;
-
-  // an out-of-window certificate is a distinct, well-known failure; the window is
-  // judged at the injected validation time so a mock clock drives it
-  for LI := 0 to High(LCerts) do
-    if not LCerts[LI].IsValid(AValidationTimeUtc) then
-      raise EFatalAlertTlsLibException.CreateRes(
-        TTlsAlertDescription.CertificateExpired, @SCertificateExpired);
-
-  if System.Length(ATrustAnchors) = 0 then
-    raise EFatalAlertTlsLibException.CreateRes(
-      TTlsAlertDescription.UnknownCa, @SUntrustedChain);
-
-  // parsing the anchor store dominates a reused-config verify, so memoise the
-  // parsed anchors keyed by a digest of the anchor set; the parse itself runs
-  // outside the lock so concurrent cold verifies do not serialise on it
-  LAnchorKey := TrustAnchorKey(ATrustAnchors);
-  FTrustAnchorLock.Acquire;
-  try
-    LHit := FTrustAnchors.TryGet(LAnchorKey, LAnchors);
-  finally
-    FTrustAnchorLock.Release;
-  end;
-
-  if not LHit then
-  begin
-    try
-      SetLength(LAnchors, System.Length(ATrustAnchors));
-      for LI := 0 to High(ATrustAnchors) do
-        LAnchors[LI] := TTrustAnchor.Create(
-          LParser.ReadCertificate(ATrustAnchors[LI]), nil);
-    except
-      on E: ECryptoLibException do
-        raise EFatalAlertTlsLibException.CreateRes(
-          TTlsAlertDescription.UnknownCa, @SUntrustedChain);
-    end;
-    FTrustAnchorLock.Acquire;
-    try
-      FTrustAnchors.Remember(LAnchorKey, LAnchors);
-    finally
-      FTrustAnchorLock.Release;
-    end;
-  end;
-
-  // strict pass first: validate the chain the peer presented (a leaf-first path; the validator
-  // normalises ordering). A well-formed chain of any depth is accepted here, unchanged, and
-  // never reaches the path builder below - so configuring intermediates never relaxes validation
-  // for a peer that already sends a complete chain.
-  try
-    LParams := TPkixParameters.Create(LAnchors);
-    LParams.SetIsRevocationEnabled(False);
-    // pin the PKIX path date to the same source as the notBefore/notAfter check
-    LParams.SetDate(AValidationTimeUtc);
-    LPath := TPkixCertPath.Create(LCerts);
-    LValidator := TPkixCertPathValidator.Create;
-    LValidatorResult := LValidator.Validate(LPath, LParams);
-    LLiteralValidated := True;
-  except
-    on E: ECryptoLibException do
-      LLiteralValidated := False; // fall through to path building if intermediates are configured
-  end;
-  if LLiteralValidated then
-  begin
-    EnforcePurpose(LCerts);
-    // the peer's chain validated as-is; append the resolved anchor unless the peer sent it
-    AppendAnchor(LValidatorResult.TrustAnchor.TrustedCert);
-    Exit;
-  end;
-
-  // the chain did not validate as received. With no configured intermediates that is the
-  // final verdict: the peer did not chain to a trusted anchor.
-  if System.Length(AIntermediates) = 0 then
-    raise EFatalAlertTlsLibException.CreateRes(
-      TTlsAlertDescription.UnknownCa, @SUntrustedChain);
-
-  // fall back to path building: the peer may have sent an incomplete chain, so pool its
-  // certificates with the configured intermediates and let the builder assemble an ordered
-  // path from the leaf up to a trusted anchor - the sans-IO stand-in for AIA fetching.
-  try
-    SetLength(LInter, System.Length(AIntermediates));
-    for LI := 0 to High(AIntermediates) do
-      LInter[LI] := LParser.ReadCertificate(AIntermediates[LI]);
-  except
-    on E: ECryptoLibException do
-      raise EFatalAlertTlsLibException.CreateRes(
-        TTlsAlertDescription.UnknownCa, @SUntrustedChain);
-  end;
-
-  // note: an out-of-window configured intermediate is left for the builder's own path-time
-  // validity check (SetDate) to reject as part of a path that will not build (unknown_ca). We
-  // do NOT pre-reject every configured intermediate on expiry: a bundle may carry an unused
-  // stale entry, and failing an otherwise-buildable connection on it would be worse than the
-  // slightly less precise alert.
-  SetLength(LPool, System.Length(LCerts) + System.Length(LInter));
-  for LI := 0 to High(LCerts) do
-    LPool[LI] := LCerts[LI];
-  for LI := 0 to High(LInter) do
-    LPool[System.Length(LCerts) + LI] := LInter[LI];
-
-  try
-    // the target of the build is the leaf as the peer presented it
-    LTarget := TX509CertStoreSelector.Create;
-    LTarget.SetCertificate(LCerts[0]);
-    LBuilderParams := TPkixBuilderParameters.Create(LAnchors, LTarget);
-    LBuilderParams.SetIsRevocationEnabled(False);
-    LBuilderParams.SetDate(AValidationTimeUtc);
-    LBuilderParams.SetMaxPathLength(MaxBuiltPathLength);
-    LPoolStore := TCollectionStore<IX509Certificate>.Create(LPool);
-    LBuilderParams.AddStoreCert(LPoolStore);
-    LBuilder := TPkixCertPathBuilder.Create as IPkixCertPathBuilder;
-    LBuildResult := LBuilder.Build(LBuilderParams);
-  except
-    on E: ECryptoLibException do
-      raise EFatalAlertTlsLibException.CreateRes(
-        TTlsAlertDescription.UnknownCa, @SUntrustedChain);
-  end;
-
-  // hand back the assembled path (leaf-first) so the downstream staple and pin checks see the
-  // real issuer the peer omitted, not just the bare leaf
-  LBuilt := LBuildResult.CertPath.Certificates;
-  EnforcePurpose(LBuilt);
-  SetLength(AEffectiveChain, System.Length(LBuilt));
-  for LI := 0 to High(LBuilt) do
-    AEffectiveChain[LI] := LBuilt[LI].GetEncoded;
-  // a built PKIX path excludes the anchor; append it so the effective chain ends at the root
-  AppendAnchor(LBuildResult.TrustAnchor.TrustedCert);
-end;
-
-class function TRevocationChecker.OcspDelegatedResponder(const AResponderCert,
-  AIssuerCert: IX509Certificate; const AIssuerPublicKey: IAsymmetricKeyParameter;
-  AValidityDate: TDateTime): Boolean;
-var
-  LKeyPurposes: TArray<IDerObjectIdentifier>;
-  LI: Int32;
-begin
-  Result := False;
-  // the delegation only holds if the issuer itself issued the responder certificate
-  if not AResponderCert.IssuerDN.Equivalent(AIssuerCert.SubjectDN, True) then
-    Exit;
-  try
-    AResponderCert.CheckValidity(AValidityDate);
-    AResponderCert.Verify(AIssuerPublicKey);
-    LKeyPurposes := AResponderCert.GetExtendedKeyUsage;
-  except
-    // a responder certificate that is out of date, does not verify against the
-    // issuer, or exposes no extended key usage delegates nothing
-    Exit;
-  end;
-  for LI := 0 to System.High(LKeyPurposes) do
-    if TKeyPurposeId.IdKpOcspSigning.Equals(LKeyPurposes[LI]) then
-    begin
-      Result := True;
-      Exit;
-    end;
-end;
-
-class function TRevocationChecker.OcspResponseAuthorised(
-  const AResponse: IBasicOcspResp; const AIssuerCert: IX509Certificate;
-  const AIssuerPublicKey: IAsymmetricKeyParameter; AValidityDate: TDateTime): Boolean;
-var
-  LCerts: TArray<IX509Certificate>;
-  LI: Int32;
-begin
-  Result := False;
-  try
-    if AResponse.Verify(AIssuerPublicKey) then
-    begin
-      Result := True;
-      Exit;
-    end;
-  except
-    // a signature this key cannot even be applied to is simply not the issuer's
-  end;
-
-  LCerts := AResponse.GetCerts;
-  for LI := 0 to System.High(LCerts) do
-  begin
-    if not OcspDelegatedResponder(LCerts[LI], AIssuerCert, AIssuerPublicKey,
-      AValidityDate) then
-      Continue;
-    try
-      if AResponse.Verify(LCerts[LI].GetPublicKey) then
-      begin
-        Result := True;
-        Exit;
-      end;
-    except
-      // a delegated responder whose signature does not verify is not authoritative
-    end;
-  end;
-end;
-
-function TRevocationChecker.ValidateOcspStaple(const ALeafCert, AIssuerCert,
-  AOcspResponseDer: TBytes; const AValidationTimeUtc: TDateTime;
-  out AStatus: TOcspStatus; out AThisUpdate, ANextUpdate: TDateTime): Boolean;
-var
-  LParser: IX509CertificateParser;
-  LLeaf, LIssuer: IX509Certificate;
-  LResp: IOcspResp;
-  LBasic: IBasicOcspResp;
-  LSingles: TArray<ISingleResp>;
-  LSingle: ISingleResp;
-  LCertId: ICertificateID;
-  LStatus: ICertificateStatus;
-  LValidity: TDateTime;
-  LI: Int32;
-begin
-  Result := False;
-  AStatus := TOcspStatus.Unknown;
-  AThisUpdate := 0;
-  ANextUpdate := 0;
-  if (System.Length(ALeafCert) = 0) or (System.Length(AIssuerCert) = 0) or
-    (System.Length(AOcspResponseDer) = 0) then
-    Exit;
-
-  try
-    LParser := TX509CertificateParser.Create;
-    LLeaf := LParser.ReadCertificate(ALeafCert);
-    LIssuer := LParser.ReadCertificate(AIssuerCert);
-
-    LResp := TOcspResp.Create(AOcspResponseDer) as IOcspResp;
-    if LResp.Status <> TOcspRespStatus.Successful then
-      Exit;
-    LBasic := LResp.GetResponseObject;
-    if LBasic = nil then
-      Exit;
-
-    LValidity := AValidationTimeUtc;
-    LSingles := LBasic.GetResponses;
-    for LI := 0 to System.High(LSingles) do
-    begin
-      LSingle := LSingles[LI];
-      LCertId := LSingle.GetCertID;
-      // the staple must be about this leaf: matching serial and issuer name/key hash
-      if not LLeaf.SerialNumber.Equals(LCertId.SerialNumber) then
-        Continue;
-      if not LCertId.MatchesIssuer(LIssuer) then
-        Continue;
-      // and it must be authoritative for that leaf
-      if not OcspResponseAuthorised(LBasic, LIssuer, LIssuer.GetPublicKey,
-        LValidity) then
-        Exit;
-
-      AThisUpdate := LSingle.ThisUpdate;
-      // an omitted nextUpdate leaves no upper bound; 0 signals that to the caller
-      if LSingle.NextUpdate.HasValue then
-        ANextUpdate := LSingle.NextUpdate.Value
-      else
-        ANextUpdate := 0;
-
-      LStatus := LSingle.GetCertStatus;
-      if LStatus = nil then
-        AStatus := TOcspStatus.Good
-      else if Supports(LStatus, IRevokedStatus) then
-        AStatus := TOcspStatus.Revoked
-      else
-        AStatus := TOcspStatus.Unknown;
-      Result := True;
-      Exit;
-    end;
-  except
-    // a response that cannot be parsed leaves the status indeterminate, never raises
-    Result := False;
-    AStatus := TOcspStatus.Unknown;
-    AThisUpdate := 0;
-    ANextUpdate := 0;
-  end;
-end;
-
-function TRevocationChecker.BuildOcspRequest(const ALeafCert,
-  AIssuerCert: TBytes; out ARequestDer: TBytes): Boolean;
-var
-  LParser: IX509CertificateParser;
-  LLeaf, LIssuer: IX509Certificate;
-  LCertId: ICertificateID;
-  LGen: IOcspReqGenerator;
-begin
-  Result := False;
-  ARequestDer := nil;
-  if (System.Length(ALeafCert) = 0) or (System.Length(AIssuerCert) = 0) then
-    Exit;
-  try
-    LParser := TX509CertificateParser.Create;
-    LLeaf := LParser.ReadCertificate(ALeafCert);
-    LIssuer := LParser.ReadCertificate(AIssuerCert);
-    // the CertID is the SHA-1 issuer name/key hash plus the leaf serial (RFC 6960 4.1.1)
-    LCertId := TCertificateID.Create(TCertificateID.DigestSha1, LIssuer,
-      LLeaf.SerialNumber) as ICertificateID;
-    LGen := TOcspReqGenerator.Create as IOcspReqGenerator;
-    LGen.AddRequest(LCertId);
-    ARequestDer := LGen.Generate.GetEncoded;
-    Result := System.Length(ARequestDer) > 0;
-  except
-    // a malformed input leaves no request; never raise a backend exception
-    Result := False;
-    ARequestDer := nil;
-  end;
-end;
-
-function TRevocationChecker.TryGetOcspResponderUrl(const ACert: TBytes;
-  out AUrl: string): Boolean;
-var
-  LParser: IX509CertificateParser;
-  LCert: IX509Certificate;
-  LExt: IAsn1OctetString;
-  LAia: IAuthorityInformationAccess;
-  LDescs: TCryptoLibGenericArray<IAccessDescription>;
-  LLoc: IGeneralName;
-  LIa5: IDerIA5String;
-  LI: Int32;
-begin
-  Result := False;
-  AUrl := '';
-  if System.Length(ACert) = 0 then
-    Exit;
-  try
-    LParser := TX509CertificateParser.Create;
-    LCert := LParser.ReadCertificate(ACert);
-    LExt := LCert.GetExtensionValue(TX509Extensions.AuthorityInfoAccess);
-    if LExt = nil then
-      Exit;
-    LAia := TAuthorityInformationAccess.GetInstance(LExt.GetOctets);
-    if LAia = nil then
-      Exit;
-    LDescs := LAia.GetAccessDescriptions;
-    for LI := 0 to System.High(LDescs) do
-      if TX509ObjectIdentifiers.IdADOcsp.Equals(LDescs[LI].GetAccessMethod) then
-      begin
-        LLoc := LDescs[LI].GetAccessLocation;
-        if (LLoc <> nil) and (LLoc.GetTagNo = TGeneralName.UniformResourceIdentifier) and
-          Supports(LLoc.GetName, IDerIA5String, LIa5) then
-        begin
-          AUrl := LIa5.GetString;
-          if AUrl <> '' then
-            Exit(True);
-        end;
-      end;
-  except
-    Result := False;
-    AUrl := '';
-  end;
-end;
-
-function TRevocationChecker.TryGetCrlDistributionPoints(const ACert: TBytes;
-  out AUrls: TArray<string>): Boolean;
-var
-  LParser: IX509CertificateParser;
-  LCert: IX509Certificate;
-  LExt: IAsn1OctetString;
-  LCdp: ICrlDistPoint;
-  LPoints: TCryptoLibGenericArray<IDistributionPoint>;
-  LDpn: IDistributionPointName;
-  LGns: IGeneralNames;
-  LNames: TCryptoLibGenericArray<IGeneralName>;
-  LIa5: IDerIA5String;
-  LI, LJ: Int32;
-begin
-  Result := False;
-  AUrls := nil;
-  if System.Length(ACert) = 0 then
-    Exit;
-  try
-    LParser := TX509CertificateParser.Create;
-    LCert := LParser.ReadCertificate(ACert);
-    LExt := LCert.GetExtensionValue(TX509Extensions.CrlDistributionPoints);
-    if LExt = nil then
-      Exit;
-    LCdp := TCrlDistPoint.GetInstance(LExt.GetOctets);
-    if LCdp = nil then
-      Exit;
-    LPoints := LCdp.GetDistributionPoints;
-    for LI := 0 to System.High(LPoints) do
-    begin
-      LDpn := LPoints[LI].GetDistributionPointName;
-      if (LDpn = nil) or (LDpn.GetType <> TDistributionPointName.FullName) then
-        Continue;
-      if not Supports(LDpn.GetName, IGeneralNames, LGns) then
-        Continue;
-      LNames := LGns.GetNames;
-      for LJ := 0 to System.High(LNames) do
-        if (LNames[LJ].GetTagNo = TGeneralName.UniformResourceIdentifier) and
-          Supports(LNames[LJ].GetName, IDerIA5String, LIa5) and
-          (LIa5.GetString <> '') then
-          TArrayUtilities.Append<string>(AUrls, LIa5.GetString);
-    end;
-    Result := System.Length(AUrls) > 0;
-  except
-    Result := False;
-    AUrls := nil;
-  end;
-end;
-
-function TRevocationChecker.CheckCrlRevocation(const ALeafCert, AIssuerCert,
-  ACrlDer: TBytes; out ARevoked: Boolean): Boolean;
-var
-  LParser: IX509CertificateParser;
-  LLeaf, LIssuer: IX509Certificate;
-  LCrlParser: IX509CrlParser;
-  LCrl: IX509Crl;
-  LNowMs: Int64;
-begin
-  Result := False;
-  ARevoked := False;
-  if (System.Length(ALeafCert) = 0) or (System.Length(AIssuerCert) = 0) or
-    (System.Length(ACrlDer) = 0) then
-    Exit;
-  try
-    LParser := TX509CertificateParser.Create;
-    LLeaf := LParser.ReadCertificate(ALeafCert);
-    LIssuer := LParser.ReadCertificate(AIssuerCert);
-    LCrlParser := TX509CrlParser.Create;
-    LCrl := LCrlParser.ReadCrl(ACrlDer);
-    if LCrl = nil then
-      Exit;
-    // the CRL must be signed by the leaf's issuer to be authoritative
-    if not LCrl.IsSignatureValid(LIssuer.GetPublicKey) then
-      Exit;
-    // honor the CRL validity window (mirrors the OCSP thisUpdate/nextUpdate check): a validly
-    // signed but not-yet-valid or expired CRL is never authoritative - a MITM could otherwise
-    // replay an old, legitimately-signed CRL predating the revocation. Out of window -> False
-    // (indeterminate), never a silent Good.
-    LNowMs := TDateTimeUtilities.CurrentUnixMs;
-    if LNowMs < TDateTimeUtilities.DateTimeToUnixMs(LCrl.ThisUpdate) then
-      Exit;
-    if LCrl.NextUpdate.HasValue and
-      (LNowMs >= TDateTimeUtilities.DateTimeToUnixMs(LCrl.NextUpdate.Value)) then
-      Exit;
-    ARevoked := LCrl.GetRevokedCertificate(LLeaf.SerialNumber) <> nil;
-    Result := True;
-  except
-    // an unparseable or unverifiable CRL is indeterminate, never a raise
-    Result := False;
-    ARevoked := False;
-  end;
-end;
-
-function TRevocationChecker.TryFindIssuer(const ALeafCert: TBytes;
-  const ACandidates: TArray<TBytes>; out AIssuerCert: TBytes): Boolean;
-var
-  LParser: IX509CertificateParser;
-  LLeaf, LCandidate: IX509Certificate;
-  LI: Int32;
-begin
-  Result := False;
-  AIssuerCert := nil;
-  if System.Length(ALeafCert) = 0 then
-    Exit;
-  try
-    LParser := TX509CertificateParser.Create;
-    LLeaf := LParser.ReadCertificate(ALeafCert);
-    for LI := 0 to System.High(ACandidates) do
-    begin
-      if System.Length(ACandidates[LI]) = 0 then
-        Continue;
-      LCandidate := LParser.ReadCertificate(ACandidates[LI]);
-      // name match is a prefilter only; the candidate is the issuer solely when its key verifies the
-      // leaf's signature, so a same-name/wrong-key candidate is rejected - that keeps the OCSP CertID
-      // issuerKeyHash bound to the true signer (a wrong pick could otherwise mis-key the request)
-      if not LLeaf.IssuerDN.Equivalent(LCandidate.SubjectDN, True) then
-        Continue;
-      try
-        LLeaf.Verify(LCandidate.GetPublicKey);
-      except
-        // this candidate did not sign the leaf; keep looking
-        Continue;
-      end;
-      AIssuerCert := ACandidates[LI];
-      Result := True;
-      Exit;
-    end;
-  except
-    // a malformed leaf or candidate leaves the issuer unresolved, never raises
-    Result := False;
-    AIssuerCert := nil;
-  end;
-end;
-
-function TCertificateInspector.PeerInfo(const ACertificateDer: TBytes;
-  out ASubject, AIssuer, ACommonName, ASerialHex: string): Boolean;
-begin
-  try
-    Result := Parse(ACertificateDer).PeerInfo(ASubject, AIssuer, ACommonName,
-      ASerialHex);
-  except
-    Result := False;
-    ASubject := '';
-    AIssuer := '';
-    ACommonName := '';
-    ASerialHex := '';
-  end;
-end;
-
-function TCertificateInspector.TlsFeatures(const ACert: TBytes;
-  out AFeatures: TArray<UInt16>): Boolean;
-var
-  LParser: IX509CertificateParser;
-  LCert: IX509Certificate;
-  LExtValue: IAsn1OctetString;
-  LObj: IAsn1Object;
-  LSeq: IAsn1Sequence;
-  LInt: IDerInteger;
-  LI, LValue: Int32;
-begin
-  Result := False;
-  AFeatures := nil;
-  try
-    LParser := TX509CertificateParser.Create;
-    LCert := LParser.ReadCertificate(ACert);
-    LExtValue := LCert.GetExtensionValue(
-      TDerObjectIdentifier.Create(TlsFeatureExtensionOid) as IDerObjectIdentifier);
-    if LExtValue = nil then
-    begin
-      // an absent extension is well-formed with no features
-      Result := True;
-      Exit;
-    end;
-
-    LObj := TAsn1Object.FromByteArray(LExtValue.GetOctets);
-    if not Supports(LObj, IAsn1Sequence, LSeq) then
-      // present but not a SEQUENCE: malformed TLS Feature
-      Exit;
-
-    SetLength(AFeatures, LSeq.Count);
-    for LI := 0 to LSeq.Count - 1 do
-    begin
-      if not Supports(LSeq.Items[LI], IDerInteger, LInt) then
-      begin
-        AFeatures := nil;
-        Exit;
-      end;
-      if (not LInt.TryGetIntValueExact(LValue)) or (LValue < 0) or
-        (LValue > $FFFF) then
-      begin
-        AFeatures := nil;
-        Exit;
-      end;
-      AFeatures[LI] := UInt16(LValue);
-    end;
-    Result := True;
-  except
-    // a present-but-unparseable TLS Feature value is malformed
-    AFeatures := nil;
-    Result := False;
-  end;
-end;
-
-function TCertificateInspector.KeyUsagePermits(
-  const ACertificateDer: TBytes; AUsage: TCertKeyUsage): TCertAnswer;
-begin
-  try
-    Result := Parse(ACertificateDer).KeyUsagePermits(AUsage);
-  except
-    // an unparseable certificate cannot be determined; imposes no restriction
-    Result := TCertAnswer.Undetermined;
-  end;
-end;
-
-function TCertificateInspector.KeyIsRsaPss(
-  const ACertificateDer: TBytes): TCertAnswer;
-begin
-  try
-    Result := Parse(ACertificateDer).KeyIsRsaPss;
-  except
-    // an unparseable certificate cannot be determined
-    Result := TCertAnswer.Undetermined;
-  end;
-end;
-
-function TCertificateInspector.KeyKind(const ACertificateDer: TBytes;
-  out AKind: TCertKeyKind; out AEcNamedGroup: UInt16): Boolean;
-begin
-  try
-    Result := Parse(ACertificateDer).KeyKind(AKind, AEcNamedGroup);
-  except
-    // an unparseable certificate cannot be classified
-    AKind := TCertKeyKind.Rsa;
-    AEcNamedGroup := 0;
-    Result := False;
-  end;
-end;
-
-function TInspectedCertificate.KeyUsagePermits(AUsage: TCertKeyUsage): TCertAnswer;
-var
-  LBits: TArray<Boolean>;
-  LIndex: Int32;
-begin
-  try
-    LBits := FCert.GetKeyUsage; // nil when the keyUsage extension is absent
-  except
-    Exit(TCertAnswer.Undetermined);
-  end;
-  // an absent extension imposes no restriction
-  if LBits = nil then
-    Exit(TCertAnswer.Yes);
-  // RFC 5280 4.2.1.3 bit order: digitalSignature(0), keyEncipherment(2), keyAgreement(4)
-  case AUsage of
-    TCertKeyUsage.DigitalSignature:
-      LIndex := 0;
-    TCertKeyUsage.KeyEncipherment:
-      LIndex := 2;
-    TCertKeyUsage.KeyAgreement:
-      LIndex := 4;
-  else
-    LIndex := -1;
-  end;
-  // the extension is present, so the bit must be asserted; a bit past the encoded
-  // length is an omitted trailing zero, i.e. not asserted
-  if (LIndex >= 0) and (LIndex <= High(LBits)) and LBits[LIndex] then
-    Result := TCertAnswer.Yes
-  else
-    Result := TCertAnswer.No;
-end;
-
-function TInspectedCertificate.KeyIsRsaPss: TCertAnswer;
-begin
-  try
-    if FCert.GetSubjectPublicKeyInfo.GetAlgorithm.GetAlgorithm.GetID
-      = RsaSsaPssKeyOid then
-      Result := TCertAnswer.Yes
-    else
-      Result := TCertAnswer.No;
-  except
-    Result := TCertAnswer.Undetermined;
-  end;
-end;
-
-function TInspectedCertificate.PeerInfo(out ASubject, AIssuer, ACommonName,
-  ASerialHex: string): Boolean;
-var
-  LCns: TCryptoLibStringArray;
-begin
-  ASubject := '';
-  AIssuer := '';
-  ACommonName := '';
-  ASerialHex := '';
-  try
-    ASubject := FCert.SubjectDN.ToString;
-    AIssuer := FCert.IssuerDN.ToString;
-    LCns := FCert.SubjectDN.GetValueList(TX509Name.CN);
-    if System.Length(LCns) > 0 then
-      ACommonName := LCns[0];
-    ASerialHex := FCert.SerialNumber.ToString(16);
-    Result := True;
-  except
-    Result := False;
-    ASubject := '';
-    AIssuer := '';
-    ACommonName := '';
-    ASerialHex := '';
-  end;
-end;
-
-function TInspectedCertificate.KeyKind(out AKind: TCertKeyKind;
-  out AEcNamedGroup: UInt16): Boolean;
-var
-  LAlg: IAlgorithmIdentifier;
-  LOid, LCurve: IDerObjectIdentifier;
-begin
-  AKind := TCertKeyKind.Rsa; // ignored unless Result is True
-  AEcNamedGroup := 0;
-  try
-    LAlg := FCert.GetSubjectPublicKeyInfo.GetAlgorithm;
-    LOid := LAlg.Algorithm;
-  except
-    Exit(False);
-  end;
-  Result := True;
-  if LOid.Equals(TPkcsObjectIdentifiers.RsaEncryption) or
-    (LOid.GetID = RsaSsaPssKeyOid) then
-    AKind := TCertKeyKind.Rsa
-  else if LOid.Equals(TEdECObjectIdentifiers.IdEd25519) then
-    AKind := TCertKeyKind.Ed25519
-  else if LOid.Equals(TEdECObjectIdentifiers.IdEd448) then
-    AKind := TCertKeyKind.Ed448
-  else if LOid.Equals(TX9ObjectIdentifiers.IdECPublicKey) and (LAlg.Parameters <> nil) and
-    Supports(LAlg.Parameters.ToAsn1Object, IDerObjectIdentifier, LCurve) then
-  begin
-    AKind := TCertKeyKind.Ecdsa;
-    // the leaf's named curve as an IANA supported_groups code; 0 when unrecognized
-    if LCurve.Equals(TX9ObjectIdentifiers.Prime256v1) then
-      AEcNamedGroup := TNamedGroupCatalog.Secp256r1
-    else if LCurve.Equals(TSecObjectIdentifiers.SecP384r1) then
-      AEcNamedGroup := TNamedGroupCatalog.Secp384r1
-    else if LCurve.Equals(TSecObjectIdentifiers.SecP521r1) then
-      AEcNamedGroup := TNamedGroupCatalog.Secp521r1;
-  end
-  else
-    // a parseable certificate whose key algorithm we do not model is not classified
-    Result := False;
-end;
-
-function TInspectedCertificate.KeyFacts(out AFacts: TCertKeyFacts): Boolean;
-var
-  LRsa: IRsaKeyParameters;
-begin
-  AFacts.Bits := 0;
-  if not KeyKind(AFacts.Kind, AFacts.EcNamedGroup) then
-    Exit(False);
-  try
-    case AFacts.Kind of
-      TCertKeyKind.Rsa:
-        if Supports(FCert.GetPublicKey, IRsaKeyParameters, LRsa) then
-          AFacts.Bits := LRsa.Modulus.BitLength
-        else
-          Exit(False);
-      TCertKeyKind.Ecdsa:
-        // field size follows the recognised named curve; an unrecognised curve stays 0
-        case AFacts.EcNamedGroup of
-          TNamedGroupCatalog.Secp256r1:
-            AFacts.Bits := 256;
-          TNamedGroupCatalog.Secp384r1:
-            AFacts.Bits := 384;
-          TNamedGroupCatalog.Secp521r1:
-            AFacts.Bits := 521;
-        end;
-    end;
-    Result := True;
-  except
-    Result := False;
-  end;
-end;
-
-function TInspectedCertificate.SignatureFacts(out AFacts: TCertSignatureFacts): Boolean;
-var
-  LSig: IAlgorithmIdentifier;
-  LOid: IDerObjectIdentifier;
-
-  function HashOf(const AOid: IDerObjectIdentifier;
-    out AHash: TCertSignatureHash): Boolean;
-  begin
-    Result := True;
-    if AOid.Equals(TOiwObjectIdentifiers.IdSha1) then
-      AHash := TCertSignatureHash.Sha1
-    else if AOid.Equals(TNistObjectIdentifiers.IdSha224) then
-      AHash := TCertSignatureHash.Sha224
-    else if AOid.Equals(TNistObjectIdentifiers.IdSha256) then
-      AHash := TCertSignatureHash.Sha256
-    else if AOid.Equals(TNistObjectIdentifiers.IdSha384) then
-      AHash := TCertSignatureHash.Sha384
-    else if AOid.Equals(TNistObjectIdentifiers.IdSha512) then
-      AHash := TCertSignatureHash.Sha512
-    else
-      Result := False;
-  end;
-
-  function DigestLen(AHash: TCertSignatureHash): Int32;
-  begin
-    case AHash of
-      TCertSignatureHash.Sha1:
-        Result := 20;
-      TCertSignatureHash.Sha224:
-        Result := 28;
-      TCertSignatureHash.Sha256:
-        Result := 32;
-      TCertSignatureHash.Sha384:
-        Result := 48;
-      TCertSignatureHash.Sha512:
-        Result := 64;
-    else
-      Result := 0;
-    end;
-  end;
-
-  function FillPss(const APss: IAlgorithmIdentifier): Boolean;
-  var
-    LParams: IRsassaPssParameters;
-    LMgfHash: IAlgorithmIdentifier;
-  begin
-    AFacts.Family := TCertSignatureFamily.RsaPss;
-    AFacts.PssCanonical := False;
-    // RFC 4055: absent parameters default every field to SHA-1
-    if APss.Parameters = nil then
-    begin
-      AFacts.Hash := TCertSignatureHash.Sha1;
-      Exit(True);
-    end;
-    LParams := TRsassaPssParameters.GetInstance(APss.Parameters.ToAsn1Object);
-    if not HashOf(LParams.HashAlgorithm.Algorithm, AFacts.Hash) then
-      Exit(False);
-    // canonical iff MGF1 is over the same hash and the salt length equals the digest length;
-    // anything else leaves PssCanonical False so the chain-algorithm filter rejects it
-    if LParams.MaskGenAlgorithm.Algorithm.Equals(TPkcsObjectIdentifiers.IdMgf1) then
-    begin
-      LMgfHash := TAlgorithmIdentifier.GetInstance(
-        LParams.MaskGenAlgorithm.Parameters.ToAsn1Object);
-      AFacts.PssCanonical := LMgfHash.Algorithm.Equals(LParams.HashAlgorithm.Algorithm) and
-        (LParams.SaltLength <> nil) and
-        LParams.SaltLength.Value.Equals(TBigInteger.ValueOf(DigestLen(AFacts.Hash)));
-    end;
-    Result := True;
-  end;
-
-begin
-  AFacts.Family := TCertSignatureFamily.RsaPkcs1;
-  AFacts.Hash := TCertSignatureHash.Sha256;
-  AFacts.PssCanonical := False;
-  try
-    LSig := FCert.GetSignatureAlgorithm;
-    LOid := LSig.Algorithm;
-    Result := True;
-    if LOid.Equals(TPkcsObjectIdentifiers.Sha256WithRsaEncryption) then
-      AFacts.Hash := TCertSignatureHash.Sha256
-    else if LOid.Equals(TPkcsObjectIdentifiers.Sha384WithRsaEncryption) then
-      AFacts.Hash := TCertSignatureHash.Sha384
-    else if LOid.Equals(TPkcsObjectIdentifiers.Sha512WithRsaEncryption) then
-      AFacts.Hash := TCertSignatureHash.Sha512
-    else if LOid.Equals(TPkcsObjectIdentifiers.Sha224WithRsaEncryption) then
-      AFacts.Hash := TCertSignatureHash.Sha224
-    else if LOid.Equals(TPkcsObjectIdentifiers.Sha1WithRsaEncryption) then
-      AFacts.Hash := TCertSignatureHash.Sha1
-    else if LOid.Equals(TPkcsObjectIdentifiers.MD5WithRsaEncryption) then
-      AFacts.Hash := TCertSignatureHash.Md5
-    else if LOid.Equals(TX9ObjectIdentifiers.ECDsaWithSha256) then
-    begin
-      AFacts.Family := TCertSignatureFamily.Ecdsa;
-      AFacts.Hash := TCertSignatureHash.Sha256;
-    end
-    else if LOid.Equals(TX9ObjectIdentifiers.ECDsaWithSha384) then
-    begin
-      AFacts.Family := TCertSignatureFamily.Ecdsa;
-      AFacts.Hash := TCertSignatureHash.Sha384;
-    end
-    else if LOid.Equals(TX9ObjectIdentifiers.ECDsaWithSha512) then
-    begin
-      AFacts.Family := TCertSignatureFamily.Ecdsa;
-      AFacts.Hash := TCertSignatureHash.Sha512;
-    end
-    else if LOid.Equals(TX9ObjectIdentifiers.ECDsaWithSha224) then
-    begin
-      AFacts.Family := TCertSignatureFamily.Ecdsa;
-      AFacts.Hash := TCertSignatureHash.Sha224;
-    end
-    else if LOid.Equals(TX9ObjectIdentifiers.ECDsaWithSha1) then
-    begin
-      AFacts.Family := TCertSignatureFamily.Ecdsa;
-      AFacts.Hash := TCertSignatureHash.Sha1;
-    end
-    else if LOid.Equals(TEdECObjectIdentifiers.IdEd25519) then
-    begin
-      AFacts.Family := TCertSignatureFamily.Ed25519;
-      AFacts.Hash := TCertSignatureHash.Implicit;
-    end
-    else if LOid.Equals(TEdECObjectIdentifiers.IdEd448) then
-    begin
-      AFacts.Family := TCertSignatureFamily.Ed448;
-      AFacts.Hash := TCertSignatureHash.Implicit;
-    end
-    else if LOid.Equals(TPkcsObjectIdentifiers.IdRsassaPss) then
-      Result := FillPss(LSig)
-    else
-      Result := False;
-  except
-    Result := False;
   end;
 end;
 
@@ -3239,8 +2300,7 @@ function TCryptoPrimitives.CreateKem(AAlgorithm: TKemAlgorithm): IKem;
 begin
   case AAlgorithm of
     TKemAlgorithm.ML_KEM_768:
-      Result := TKemAdapter.Create(TEnumUtilities.GetName<TKemAlgorithm>(AAlgorithm),
-        TMlKemParameters.MlKem768, FRandom);
+      Result := TKemAdapter.Create(TMlKemParameters.MlKem768, FRandom);
   else
     raise ENotSupportedTlsLibException.CreateResFmt(@SUnhandledAlgorithm,
       [Ord(AAlgorithm)]);
@@ -3257,55 +2317,34 @@ end;
 function TCryptoProviderBuilder.WithRandom(
   const ARandom: IRandom): ICryptoProviderBuilder;
 begin
-  FOverrides.Random := ARandom;
+  FRandom := ARandom;
   Result := Self;
 end;
 
 function TCryptoProviderBuilder.WithPrimitives(
   const APrimitives: ICryptoPrimitives): ICryptoProviderBuilder;
 begin
-  FOverrides.Primitives := APrimitives;
+  FPrimitives := APrimitives;
   Result := Self;
 end;
 
 function TCryptoProviderBuilder.WithSigning(
   const ASigning: ISigningCrypto): ICryptoProviderBuilder;
 begin
-  FOverrides.Signing := ASigning;
-  Result := Self;
-end;
-
-function TCryptoProviderBuilder.WithInspector(
-  const AInspector: ICertificateInspector): ICryptoProviderBuilder;
-begin
-  FOverrides.Inspector := AInspector;
-  Result := Self;
-end;
-
-function TCryptoProviderBuilder.WithPathValidation(
-  const APathValidation: ICertificatePathValidator): ICryptoProviderBuilder;
-begin
-  FOverrides.PathValidation := APathValidation;
-  Result := Self;
-end;
-
-function TCryptoProviderBuilder.WithRevocation(
-  const ARevocation: IRevocationChecker): ICryptoProviderBuilder;
-begin
-  FOverrides.Revocation := ARevocation;
+  FSigning := ASigning;
   Result := Self;
 end;
 
 function TCryptoProviderBuilder.WithHpke(
   const AHpke: IHpkeCrypto): ICryptoProviderBuilder;
 begin
-  FOverrides.Hpke := AHpke;
+  FHpke := AHpke;
   Result := Self;
 end;
 
 function TCryptoProviderBuilder.Build: ICryptoProvider;
 begin
-  Result := TDefaultCryptoProvider.Create(FOverrides) as ICryptoProvider;
+  Result := TDefaultCryptoProvider.Create(FRandom, FPrimitives, FSigning, FHpke) as ICryptoProvider;
 end;
 
 end.

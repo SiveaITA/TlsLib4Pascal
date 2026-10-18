@@ -28,20 +28,18 @@ uses
 {$ENDIF FPC}
   TlpIClock,
   TlpClock,
-  TlpICryptoProvider,
   TlpNamedGroups,
   TlpNegotiationTypes,
   TlpNegotiationPolicy,
   TlpCipherSuiteRegistry,
   TlpCoreExtensions,
   TlpIHandshakeMachine,
-  TlpHandshakeEffect,
   TlpHandshakeMessage,
   TlpHandshakeMessages,
   TlpICertificateTrust,
   TlpServerName,
+  TlpCertificateLimits,
   TlpCertificateVerifier,
-  TlpTlsCredential,
   TlpCredentialResolvers,
   TlpCertificateCompression,
   TlpICertificateCompression,
@@ -50,18 +48,20 @@ uses
   TlpInMemoryCertificateCompressionCache,
   TlpTls13ClientStateMachine,
   TlpTls13ServerStateMachine,
-  TlsLibTestBase;
+  MockCertificateCompression,
+  TlsLibHandshakeTestBase,
+  TlsLibTestCertificates,
+  TlsLibTestHandshakeDecoder;
 
 type
-  TTestCertificateCompressionCache = class(TTlsLibAlgorithmTestCase)
+  TTestCertificateCompressionCache = class(TTlsLibHandshakeTestCase)
   private
     function ByteBlob(AValue: Byte; ALength: Int32): TBytes;
     function ZlibCompressor: ICertificateCompressor;
     function DirectCompress(const ABody: TBytes): TBytes;
+    function CompressThrough(const ACache: ICertificateCompressionCache;
+      const ACompressor: ICertificateCompressor; const ABody: TBytes): TBytes;
     // low-level machine scaffold for the end-to-end loopback proof
-    function TestRootCertificate: TBytes;
-    function ServerCredential: TTlsCredential;
-    function CredentialWithChain(const AChain: TArray<TBytes>): TTlsCredential;
     function CompressibleChain(AValue: Byte): TArray<TBytes>;
     function NewClientMachine: IHandshakeMachine;
     function NewServerMachine(const AChain: TArray<TBytes>;
@@ -71,20 +71,19 @@ type
       const ACompressors: TArray<ICertificateCompressor>;
       const ACache: ICertificateCompressionCache): TTlsHandshakeMessage;
     function PlaintextCertBody(const AChain: TArray<TBytes>): TBytes;
-    function MsgFrom(const AFramed: TBytes): TTlsHandshakeMessage;
-    function FirstSendHandshake(const AEffects: TArray<THandshakeEffect>): TBytes;
-    function AllSendHandshake(const AEffects: TArray<THandshakeEffect>): TArray<TBytes>;
   published
     // cache unit
     procedure TestMissThenPutThenHit;
     procedure TestBoundedEvictionDropsOldest;
-    procedure TestCompactionPreservesLiveEntriesUnderChurn;
+    procedure TestOverwriteChurnPreservesLiveEntries;
+    procedure TestRePutAfterEvictionIsNotEvictedByStaleOrder;
     procedure TestConcurrentPutAndGetSmoke;
-    // policy (CompressWithCache)
+    // policy (TryCompressWithCache)
     procedure TestCacheHitAndMissEqualDirectCompress;
     procedure TestComputesOncePerBody;
     procedure TestRecomputesWhenBodyChanges;
     procedure TestNilCacheEqualsDirect;
+    procedure TestDeclineIsNotCached;
     // end-to-end loopback
     procedure TestLoopbackWireIdenticalAndSingleCompress;
     procedure TestLoopbackBodyChangeRecomputesBothWireCorrect;
@@ -93,20 +92,6 @@ type
 implementation
 
 type
-  /// <summary>A zlib compressor that tallies its Compress calls, so a test can prove the
-  /// cache computes a given body exactly once.</summary>
-  TSpyCompressor = class sealed(TInterfacedObject, ICertificateCompressor)
-  strict private
-  var
-    FInner: ICertificateCompressor;
-    FCount: Int32;
-  public
-    constructor Create;
-    function Algorithm: UInt16;
-    function Compress(const AData: TBytes): TBytes;
-    property Count: Int32 read FCount;
-  end;
-
   /// <summary>Hammers one shared cache from a background thread to smoke-test the lock.</summary>
   TCacheStressThread = class sealed(TThread)
   strict private
@@ -119,26 +104,6 @@ type
     constructor Create(const ACache: ICertificateCompressionCache; ABase: Byte; AOps: Int32);
     procedure Execute; override;
   end;
-
-{ TSpyCompressor }
-
-constructor TSpyCompressor.Create;
-begin
-  inherited Create;
-  FInner := TZlibCertificateCompression.DefaultCompressors[0];
-  FCount := 0;
-end;
-
-function TSpyCompressor.Algorithm: UInt16;
-begin
-  Result := FInner.Algorithm;
-end;
-
-function TSpyCompressor.Compress(const AData: TBytes): TBytes;
-begin
-  Inc(FCount);
-  Result := FInner.Compress(AData);
-end;
 
 { TCacheStressThread }
 
@@ -189,7 +154,15 @@ end;
 
 function TTestCertificateCompressionCache.DirectCompress(const ABody: TBytes): TBytes;
 begin
-  Result := ZlibCompressor.Compress(ABody);
+  CheckTrue(ZlibCompressor.TryCompress(ABody, Result), 'zlib compressed the body');
+end;
+
+function TTestCertificateCompressionCache.CompressThrough(
+  const ACache: ICertificateCompressionCache; const ACompressor: ICertificateCompressor;
+  const ABody: TBytes): TBytes;
+begin
+  CheckTrue(TCertificateCompression.TryCompressWithCache(ACache, Crypto, ACompressor, ABody,
+    Result), 'the body compressed');
 end;
 
 procedure TTestCertificateCompressionCache.TestMissThenPutThenHit;
@@ -225,16 +198,35 @@ begin
   CheckTrue(LCache.TryGet(LK3, LGot), 'the newest entry survives');
 end;
 
-procedure TTestCertificateCompressionCache.TestCompactionPreservesLiveEntriesUnderChurn;
+procedure TTestCertificateCompressionCache.TestRePutAfterEvictionIsNotEvictedByStaleOrder;
+var
+  LCache: ICertificateCompressionCache;
+  LA, LB, LC, LGot: TBytes;
+begin
+  LCache := TInMemoryCertificateCompressionCache.Create(2);
+  LA := ByteBlob($01, 32);
+  LB := ByteBlob($02, 32);
+  LC := ByteBlob($03, 32);
+  LCache.Put(LA, ByteBlob($A1, 8));
+  LCache.Put(LA, ByteBlob($A2, 8)); // an overwrite must not queue A a second time
+  LCache.Put(LB, ByteBlob($B1, 8));
+  LCache.Put(LC, ByteBlob($C1, 8)); // evicts A, the oldest
+  CheckFalse(LCache.TryGet(LA, LGot), 'the oldest key was evicted');
+  LCache.Put(LA, ByteBlob($A3, 8)); // evicts B, now the oldest
+  CheckTrue(LCache.TryGet(LA, LGot), 'a key put again is held, not evicted by a leftover order entry');
+  CheckEqualBytes('with its new value', ByteBlob($A3, 8), LGot);
+  CheckFalse(LCache.TryGet(LB, LGot), 'the oldest live key was evicted instead');
+  CheckEquals(2, LCache.Count, 'the cache stays at its cap');
+end;
+
+procedure TTestCertificateCompressionCache.TestOverwriteChurnPreservesLiveEntries;
 var
   LCache: ICertificateCompressionCache;
   LLive: array [0 .. 4] of TBytes;
   LChurn, LGot: TBytes;
   LI: Int32;
 begin
-  // overwrite one throwaway key far more often than the cap: FByKey stays small so eviction
-  // rarely fires and the order structure must be compacted instead of growing without bound.
-  // Compaction must leave the long-lived entries intact.
+  // overwriting one key past the cap neither evicts the long-lived entries nor loses its value
   LCache := TInMemoryCertificateCompressionCache.Create(8);
   for LI := 0 to 4 do
   begin
@@ -246,7 +238,7 @@ begin
     LCache.Put(LChurn, ByteBlob(Byte(LI), 4));
   for LI := 0 to 4 do
   begin
-    CheckTrue(LCache.TryGet(LLive[LI], LGot), 'a live entry survives repeated compaction');
+    CheckTrue(LCache.TryGet(LLive[LI], LGot), 'a live entry survives the overwrite churn');
     CheckEqualBytes('with its bytes intact', ByteBlob(Byte($A0 + LI), 16), LGot);
   end;
   CheckTrue(LCache.TryGet(LChurn, LGot), 'the churned key holds its latest value');
@@ -286,8 +278,8 @@ begin
   LBody := ByteBlob($3C, 2048);
   LDirect := DirectCompress(LBody);
   // first call is a miss (computes + stores); second is a hit (returns the stored bytes)
-  LMiss := TCertificateCompression.CompressWithCache(LCache, Provider, ZlibCompressor, LBody);
-  LHit := TCertificateCompression.CompressWithCache(LCache, Provider, ZlibCompressor, LBody);
+  LMiss := CompressThrough(LCache, ZlibCompressor, LBody);
+  LHit := CompressThrough(LCache, ZlibCompressor, LBody);
   CheckEqualBytes('a miss equals a direct Compress', LDirect, LMiss);
   CheckEqualBytes('a hit equals a direct Compress', LDirect, LHit);
 end;
@@ -295,16 +287,17 @@ end;
 procedure TTestCertificateCompressionCache.TestComputesOncePerBody;
 var
   LCache: ICertificateCompressionCache;
-  LSpy: TSpyCompressor;
+  LSpy: TMockCertificateCompressor;
   LSpyRef: ICertificateCompressor;
   LBody, LFirst, LSecond: TBytes;
 begin
   LCache := TInMemoryCertificateCompressionCache.Create;
-  LSpy := TSpyCompressor.Create;
+  LSpy := TMockCertificateCompressor.Create(TCertificateCompressionAlgorithms.Zlib,
+    TMockCompressorMode.Normal);
   LSpyRef := LSpy; // the interface reference governs lifetime; read Count off the object
   LBody := ByteBlob($77, 4096);
-  LFirst := TCertificateCompression.CompressWithCache(LCache, Provider, LSpyRef, LBody);
-  LSecond := TCertificateCompression.CompressWithCache(LCache, Provider, LSpyRef, LBody);
+  LFirst := CompressThrough(LCache, LSpyRef, LBody);
+  LSecond := CompressThrough(LCache, LSpyRef, LBody);
   CheckEquals(1, LSpy.Count, 'the same body is compressed exactly once');
   CheckEqualBytes('both calls return the same bytes', LFirst, LSecond);
 end;
@@ -312,19 +305,20 @@ end;
 procedure TTestCertificateCompressionCache.TestRecomputesWhenBodyChanges;
 var
   LCache: ICertificateCompressionCache;
-  LSpy: TSpyCompressor;
+  LSpy: TMockCertificateCompressor;
   LSpyRef: ICertificateCompressor;
   LBodyA, LBodyB, LOutA, LOutB: TBytes;
 begin
   LCache := TInMemoryCertificateCompressionCache.Create;
-  LSpy := TSpyCompressor.Create;
+  LSpy := TMockCertificateCompressor.Create(TCertificateCompressionAlgorithms.Zlib,
+    TMockCompressorMode.Normal);
   LSpyRef := LSpy;
   LBodyA := ByteBlob($10, 2048);
   // a changed leaf staple changes the exact bytes handed to Compress, so the key differs
   LBodyB := ByteBlob($10, 2049);
-  LOutA := TCertificateCompression.CompressWithCache(LCache, Provider, LSpyRef, LBodyA);
-  TCertificateCompression.CompressWithCache(LCache, Provider, LSpyRef, LBodyA); // hit
-  LOutB := TCertificateCompression.CompressWithCache(LCache, Provider, LSpyRef, LBodyB);
+  LOutA := CompressThrough(LCache, LSpyRef, LBodyA);
+  CompressThrough(LCache, LSpyRef, LBodyA); // hit
+  LOutB := CompressThrough(LCache, LSpyRef, LBodyB);
   CheckEquals(2, LSpy.Count, 'a distinct body forces a recompute; a repeat does not');
   CheckEqualBytes('body A stays byte-correct', DirectCompress(LBodyA), LOutA);
   CheckEqualBytes('body B stays byte-correct', DirectCompress(LBodyB), LOutB);
@@ -335,42 +329,34 @@ var
   LBody, LOut: TBytes;
 begin
   LBody := ByteBlob($5A, 1024);
-  LOut := TCertificateCompression.CompressWithCache(nil, Provider, ZlibCompressor, LBody);
+  LOut := CompressThrough(nil, ZlibCompressor, LBody);
   CheckEqualBytes('a nil cache compresses directly', DirectCompress(LBody), LOut);
 end;
 
-function TTestCertificateCompressionCache.TestRootCertificate: TBytes;
+procedure TTestCertificateCompressionCache.TestDeclineIsNotCached;
 var
-  LCerts: TStringList;
+  LCache: ICertificateCompressionCache;
+  LSpy: TMockCertificateCompressor;
+  LSpyRef: ICertificateCompressor;
+  LBody, LOut: TBytes;
 begin
-  LCerts := LoadVectorFields('Certs/EcP256Chain.txt');
-  try
-    Result := DecodeHex(LCerts.Values['root_cert']);
-  finally
-    LCerts.Free;
-  end;
-end;
-
-function TTestCertificateCompressionCache.ServerCredential: TTlsCredential;
-var
-  LCerts: TStringList;
-begin
-  LCerts := LoadVectorFields('Certs/EcP256Chain.txt');
-  try
-    Result.CertificateChain := TArray<TBytes>.Create(
-      DecodeHex(LCerts.Values['leaf_cert']));
-    Result.PrivateKey := Provider.Signing.ImportSigningKey(DecodeHex(LCerts.Values['leaf_key']));
-  finally
-    LCerts.Free;
-  end;
-end;
-
-function TTestCertificateCompressionCache.CredentialWithChain(
-  const AChain: TArray<TBytes>): TTlsCredential;
-begin
-  // keep the real signing key, swap the certificate chain the Certificate carries
-  Result := ServerCredential;
-  Result.CertificateChain := AChain;
+  // a decline may be transient, so it is not remembered: the next call asks the compressor again,
+  // and once it succeeds that result is cached like any other
+  LCache := TInMemoryCertificateCompressionCache.Create;
+  LSpy := TMockCertificateCompressor.Create(TCertificateCompressionAlgorithms.Zlib,
+    TMockCompressorMode.Normal);
+  LSpyRef := LSpy;
+  LBody := ByteBlob($21, 1024);
+  LSpy.Mode := TMockCompressorMode.Decline;
+  CheckFalse(TCertificateCompression.TryCompressWithCache(LCache, Crypto, LSpyRef, LBody, LOut),
+    'a declining compressor reports False');
+  CheckFalse(TCertificateCompression.TryCompressWithCache(LCache, Crypto, LSpyRef, LBody, LOut),
+    'and is asked again rather than served a remembered decline');
+  CheckEquals(2, LSpy.Count, 'a decline is never cached');
+  LSpy.Mode := TMockCompressorMode.Normal;
+  CompressThrough(LCache, LSpyRef, LBody);
+  CompressThrough(LCache, LSpyRef, LBody);
+  CheckEquals(3, LSpy.Count, 'the first success is cached, the repeat is a hit');
 end;
 
 function TTestCertificateCompressionCache.CompressibleChain(AValue: Byte): TArray<TBytes>;
@@ -393,21 +379,22 @@ var
 begin
   LParams := Default(TClientHandshakeParams);
   LParams.Clock := TSystemClock.Create;
-  LParams.Provider := Provider;
-  LParams.Group := TNamedGroups.CreateX25519(Provider);
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.Group := TNamedGroups.CreateX25519(Crypto);
   LParams.GroupCode := TNamedGroupCatalog.X25519;
-  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Provider);
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Crypto);
   LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
   LParams.OfferedSuites := TArray<UInt16>.Create(TCipherSuites13.Aes128GcmSha256);
   LParams.OfferedSchemes := TArray<UInt16>.Create(TSignatureSchemes.EcdsaSecp256r1Sha256);
   LParams.ClientRandom := DecodeHex(StringOfChar('1', 64));
   LParams.LegacySessionId := DecodeHex(StringOfChar('3', 64));
-  LParams.CertificateVerifier := TCertificateVerifier.Create(Provider,
+  LParams.CertificateVerifier := TCertificateVerifier.Create(Pkix,
     TSystemClock.Create as ITlsClock,
-    TTrustAnchorStore.Create(TArray<TBytes>.Create(TestRootCertificate)) as ITrustAnchorStore,
-    True) as IServerCertificateVerifier;
+    TTlsLibTestCertificates.EcP256RootStore, True) as IServerCertificateVerifier;
   // the client advertises the built-in zlib decompressor, so the server may compress
   LParams.CertificateDecompressors := TZlibCertificateCompression.DefaultDecompressors;
+  LParams.CertificateChainLimits := TCertificateChainLimits.Defaults;
   LParams.ExpectedServerName := TServerName.DnsName('localhost');
   Result := TTls13ClientStateMachine.Create(LParams) as IHandshakeMachine;
 end;
@@ -421,11 +408,12 @@ var
 begin
   LParams := Default(TServerHandshakeParams);
   LParams.Clock := TSystemClock.Create;
-  LParams.Provider := Provider;
-  LParams.Policy := TNegotiationPolicy.CreateDefault(Provider);
-  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Provider);
+  LParams.Crypto := Crypto;
+  LParams.Inspector := Pkix.Certificates;
+  LParams.Policy := TNegotiationPolicy.CreateDefault(Crypto);
+  LParams.CipherSuites := TCipherSuiteRegistry.CreateDefault(Crypto);
   LParams.ExtensionRegistry := TCoreExtensions.CreateDefaultRegistry;
-  LParams.Group := TNamedGroups.CreateX25519(Provider);
+  LParams.Group := TNamedGroups.CreateX25519(Crypto);
   LParams.ServerRandom := DecodeHex(StringOfChar('2', 64));
   LParams.CertificateCompressors := ACompressors;
   LParams.CertificateCompressionCache := ACache;
@@ -444,9 +432,9 @@ begin
   LClient := NewClientMachine;
   LServer := NewServerMachine(AChain, ACompressors, ACache);
   // the encrypted flight is [ServerHello, EncryptedExtensions, Certificate, ...]
-  LFlight := AllSendHandshake(LServer.ProcessMessage(MsgFrom(
+  LFlight := AllSendHandshake(LServer.ProcessMessage(TTlsLibTestHandshakeDecoder.HandshakeMessage(
     FirstSendHandshake(LClient.Start))));
-  Result := MsgFrom(LFlight[2]);
+  Result := TTlsLibTestHandshakeDecoder.HandshakeMessage(LFlight[2]);
 end;
 
 function TTestCertificateCompressionCache.PlaintextCertBody(
@@ -456,52 +444,10 @@ begin
   Result := ServerCertMessage(AChain, nil, nil).Body;
 end;
 
-function TTestCertificateCompressionCache.MsgFrom(
-  const AFramed: TBytes): TTlsHandshakeMessage;
-var
-  LReader: THandshakeMessageReader;
-begin
-  LReader := THandshakeMessageReader.Create;
-  try
-    LReader.Append(AFramed, 0, System.Length(AFramed));
-    LReader.NextMessage(Result);
-  finally
-    LReader.Free;
-  end;
-end;
-
-function TTestCertificateCompressionCache.FirstSendHandshake(
-  const AEffects: TArray<THandshakeEffect>): TBytes;
-var
-  LEffect: THandshakeEffect;
-begin
-  Result := nil;
-  for LEffect in AEffects do
-    if LEffect.Kind = THandshakeEffectKind.SendHandshake then
-      Exit(LEffect.Bytes);
-end;
-
-function TTestCertificateCompressionCache.AllSendHandshake(
-  const AEffects: TArray<THandshakeEffect>): TArray<TBytes>;
-var
-  LEffect: THandshakeEffect;
-  LCount: Int32;
-begin
-  Result := nil;
-  LCount := 0;
-  for LEffect in AEffects do
-    if LEffect.Kind = THandshakeEffectKind.SendHandshake then
-    begin
-      SetLength(Result, LCount + 1);
-      Result[LCount] := LEffect.Bytes;
-      Inc(LCount);
-    end;
-end;
-
 procedure TTestCertificateCompressionCache.TestLoopbackWireIdenticalAndSingleCompress;
 var
   LCache: ICertificateCompressionCache;
-  LSpy: TSpyCompressor;
+  LSpy: TMockCertificateCompressor;
   LCompressors: TArray<ICertificateCompressor>;
   LChain: TArray<TBytes>;
   LMsg1, LMsg2: TTlsHandshakeMessage;
@@ -510,7 +456,8 @@ var
 begin
   // one shared cache and one spy compressor across two independent server handshakes
   LCache := TInMemoryCertificateCompressionCache.Create;
-  LSpy := TSpyCompressor.Create;
+  LSpy := TMockCertificateCompressor.Create(TCertificateCompressionAlgorithms.Zlib,
+    TMockCompressorMode.Normal);
   LCompressors := TArray<ICertificateCompressor>.Create(LSpy as ICertificateCompressor);
   LChain := CompressibleChain(0);
 
@@ -529,7 +476,8 @@ begin
   LDecoded := THandshakeMessages.DecodeCompressedCertificate(LMsg2.Body);
   LRecovered := TCertificateCompression.Decompress(
     TZlibCertificateCompression.DefaultDecompressors, LDecoded.Algorithm,
-    LDecoded.Compressed, LDecoded.UncompressedLength);
+    LDecoded.Compressed, LDecoded.UncompressedLength,
+    TCertificateChainLimits.Defaults.MaxTotalChainLength);
   CheckEqualBytes('the cached body decompresses to the plaintext Certificate',
     PlaintextCertBody(LChain), LRecovered);
 end;
@@ -537,14 +485,15 @@ end;
 procedure TTestCertificateCompressionCache.TestLoopbackBodyChangeRecomputesBothWireCorrect;
 var
   LCache: ICertificateCompressionCache;
-  LSpy: TSpyCompressor;
+  LSpy: TMockCertificateCompressor;
   LCompressors: TArray<ICertificateCompressor>;
   LChainA, LChainB: TArray<TBytes>;
   LMsgA, LMsgB: TTlsHandshakeMessage;
   LDecodedA, LDecodedB: TTlsCompressedCertificate;
 begin
   LCache := TInMemoryCertificateCompressionCache.Create;
-  LSpy := TSpyCompressor.Create;
+  LSpy := TMockCertificateCompressor.Create(TCertificateCompressionAlgorithms.Zlib,
+    TMockCompressorMode.Normal);
   LCompressors := TArray<ICertificateCompressor>.Create(LSpy as ICertificateCompressor);
   LChainA := CompressibleChain(0);
   LChainB := CompressibleChain(1); // a different Certificate body (staple/chain change)
@@ -559,12 +508,14 @@ begin
   CheckEqualBytes('body A decompresses to its plaintext Certificate',
     PlaintextCertBody(LChainA), TCertificateCompression.Decompress(
     TZlibCertificateCompression.DefaultDecompressors, LDecodedA.Algorithm,
-    LDecodedA.Compressed, LDecodedA.UncompressedLength));
+    LDecodedA.Compressed, LDecodedA.UncompressedLength,
+    TCertificateChainLimits.Defaults.MaxTotalChainLength));
   LDecodedB := THandshakeMessages.DecodeCompressedCertificate(LMsgB.Body);
   CheckEqualBytes('body B decompresses to its plaintext Certificate',
     PlaintextCertBody(LChainB), TCertificateCompression.Decompress(
     TZlibCertificateCompression.DefaultDecompressors, LDecodedB.Algorithm,
-    LDecodedB.Compressed, LDecodedB.UncompressedLength));
+    LDecodedB.Compressed, LDecodedB.UncompressedLength,
+    TCertificateChainLimits.Defaults.MaxTotalChainLength));
 end;
 
 initialization

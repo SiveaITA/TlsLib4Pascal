@@ -31,6 +31,9 @@ uses
   TlpISecretBuffer,
   TlpSecretBuffer,
   TlpICryptoProvider,
+  TlpIKeyExchangePrivateKey,
+  TlpAeadUtilities,
+  TlpDer,
   TlpCryptoDomainTypes,
   TlsLibTestBase;
 
@@ -46,24 +49,47 @@ type
     // and that a fresh opener round-trips every record.
     procedure CheckAeadReuseParity(AAlgorithm: TAeadAlgorithm;
       AKeySize, AMinLength: Int32);
+    // the in-place AEAD span behaviours, run against whichever provider is passed so the
+    // same guarantees are asserted for the portable adapter and the OS-native overlay
+    procedure DoAeadInPlaceRoundTrip(const AProvider: ICryptoProvider);
+    procedure DoAeadOpenTamperWipes(const AProvider: ICryptoProvider);
+    procedure DoAeadSpanGuards(const AProvider: ICryptoProvider);
+    procedure DoAeadNonceReuseRejected(const AProvider: ICryptoProvider);
+    // a key handle from one primitive must never agree under another (the same-width foreign
+    // scalar that once nil-cast to an AV)
+    procedure DoAgreeRejectsForeignKeyHandle(const AProvider: ICryptoProvider);
+    procedure DoAgreeRejectsCompressedPeerPoint(const AProvider: ICryptoProvider);
+    procedure DoAeadSealWithoutInitRaisesTyped(const AProvider: ICryptoProvider);
   published
     procedure TestSha256Kat;
     procedure TestSha384Kat;
     procedure TestHashCloneIsIndependent;
+    procedure TestHashReuseAcrossDoFinal;
+    procedure TestHmacReuseAcrossDoFinal;
     procedure TestHmacSha256Kat;
     procedure TestHkdfSha256Rfc5869;
+    procedure TestHkdfExpandRejectsOverCapAndNegative;
     procedure TestAesGcmKat;
     procedure TestAes256GcmKat;
     procedure TestAesGcmRoundTrip;
     procedure TestChaCha20Poly1305Kat;
     procedure TestAeadOpenAuthFailureRaisesBadRecordMac;
+    procedure TestAeadInPlaceRoundTripMatchesAllocating;
+    procedure TestAeadInPlaceOpenTamperWipesDestination;
+    procedure TestAeadSpanGuardsRejectBadOffsetsAndOverlap;
     procedure TestAeadReuseParityAes128Gcm;
     procedure TestAeadReuseParityAes256Gcm;
     procedure TestAeadReuseParityChaCha20Poly1305;
     procedure TestAeadLongConnectionRoundTrip;
     procedure TestAeadNonceReuseRejected;
     procedure TestRandomDistinctNonZero;
-    procedure TestHasHardwareAesReturnsBoolean;
+    procedure TestHasHardwareAesIsStable;
+    procedure TestAgreeRejectsForeignKeyHandle;
+    procedure TestX25519AgreeRejectsWrongLengthPeerKeyAsPeerInput;
+    procedure TestAgreeRejectsCompressedPeerPoint;
+    procedure TestDerEncodeLengthRoundTripsAcrossForms;
+    procedure TestDerReadTlvRejectsOverflowAndNonMinimalLengths;
+    procedure TestAeadSealWithoutInitRaisesTyped;
   end;
 
 implementation
@@ -96,7 +122,7 @@ var
 begin
   LVec := LoadVectorFields('Crypto/Digest/Sha2.txt');
   try
-    LHash := Provider.Primitives.CreateHash(THashAlgorithm.SHA_256);
+    LHash := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256);
     CheckEquals(32, LHash.HashSize, 'SHA-256 size');
     LMsg := DecodeHex(LVec.Values['sha256_msg']);
     LHash.Update(LMsg, 0, System.Length(LMsg));
@@ -115,7 +141,7 @@ var
 begin
   LVec := LoadVectorFields('Crypto/Digest/Sha2.txt');
   try
-    LHash := Provider.Primitives.CreateHash(THashAlgorithm.SHA_384);
+    LHash := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_384);
     CheckEquals(48, LHash.HashSize, 'SHA-384 size');
     LMsg := DecodeHex(LVec.Values['sha384_msg']);
     LHash.Update(LMsg, 0, System.Length(LMsg));
@@ -131,12 +157,66 @@ var
   LHash, LClone: IHash;
 begin
   // both should finish as SHA-256("abc")
-  LHash := Provider.Primitives.CreateHash(THashAlgorithm.SHA_256);
+  LHash := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256);
   LHash.Update(DecodeHex('61'), 0, 1); // 'a'
   LClone := LHash.Clone;
   LHash.Update(DecodeHex('6263'), 0, 2); // 'bc'
   LClone.Update(DecodeHex('6263'), 0, 2);
   CheckEqualBytes('clone independent', LHash.DoFinal, LClone.DoFinal);
+end;
+
+procedure TTestCryptoProvider.TestHashReuseAcrossDoFinal;
+var
+  LHash, LClone: IHash;
+  LMsg, LFirst, LSecond, LFresh: TBytes;
+begin
+  // a reusable hash object resets itself at DoFinal, so a second use of the same instance must
+  // digest identically to a fresh instance
+  LMsg := DecodeHex('616263'); // 'abc'
+  LHash := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256);
+  LHash.Update(LMsg, 0, System.Length(LMsg));
+  LFirst := LHash.DoFinal;
+  LHash.Update(LMsg, 0, System.Length(LMsg)); // reuse the same instance
+  LSecond := LHash.DoFinal;
+  LHash := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256);
+  LHash.Update(LMsg, 0, System.Length(LMsg));
+  LFresh := LHash.DoFinal;
+  CheckEqualBytes('the reused hash matches its first digest', LFirst, LSecond);
+  CheckEqualBytes('and matches a fresh instance', LFresh, LSecond);
+  // a clone of a reusable hash must itself reset+reuse after its own DoFinal (the duplicated
+  // handle has to carry the reusable attribute)
+  LHash := Crypto.Primitives.CreateHash(THashAlgorithm.SHA_256);
+  LHash.Update(LMsg, 0, System.Length(LMsg));
+  LClone := LHash.Clone;
+  LFirst := LClone.DoFinal;
+  LClone.Update(LMsg, 0, System.Length(LMsg)); // reuse the clone
+  LSecond := LClone.DoFinal;
+  CheckEqualBytes('the reused clone matches its first digest', LFirst, LSecond);
+  CheckEqualBytes('and the reused clone matches a fresh instance', LFresh, LSecond);
+end;
+
+procedure TTestCryptoProvider.TestHmacReuseAcrossDoFinal;
+var
+  LHmac: IHmac;
+  LKey: ISecretBuffer;
+  LData, LFirst, LSecond, LFresh: TBytes;
+begin
+  // a reusable HMAC object re-keys with the same key at DoFinal, so a second use of the same
+  // instance must match a fresh instance under the same key
+  LKey := TSecretBuffer.From(DecodeHex('0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b'));
+  LData := DecodeHex('4869205468657265'); // 'Hi There'
+  LHmac := Crypto.Primitives.CreateHmac(THashAlgorithm.SHA_256);
+  LHmac.Init(LKey);
+  LHmac.Update(LData, 0, System.Length(LData));
+  LFirst := LHmac.DoFinal;
+  LHmac.Update(LData, 0, System.Length(LData)); // reuse the same instance, same key
+  LSecond := LHmac.DoFinal;
+  LHmac := Crypto.Primitives.CreateHmac(THashAlgorithm.SHA_256);
+  LHmac.Init(LKey);
+  LHmac.Update(LData, 0, System.Length(LData));
+  LFresh := LHmac.DoFinal;
+  CheckEqualBytes('the reused HMAC matches its first MAC', LFirst, LSecond);
+  CheckEqualBytes('and matches a fresh instance', LFresh, LSecond);
 end;
 
 procedure TTestCryptoProvider.TestHmacSha256Kat;
@@ -147,7 +227,7 @@ var
 begin
   LVec := LoadVectorFields('Crypto/Hmac/HmacSha256.txt');
   try
-    LHmac := Provider.Primitives.CreateHmac(THashAlgorithm.SHA_256);
+    LHmac := Crypto.Primitives.CreateHmac(THashAlgorithm.SHA_256);
     LHmac.Init(TSecretBuffer.From(DecodeHex(LVec.Values['key'])));
     LData := DecodeHex(LVec.Values['data']);
     LHmac.Update(LData, 0, System.Length(LData));
@@ -165,8 +245,8 @@ var
 begin
   LVec := LoadVectorFields('Crypto/Hkdf/HkdfSha256.txt');
   try
-    LHkdf := Provider.Primitives.CreateHkdf(THashAlgorithm.SHA_256);
-    LPrk := LHkdf.Extract(DecodeHex(LVec.Values['salt']),
+    LHkdf := Crypto.Primitives.CreateHkdf(THashAlgorithm.SHA_256);
+    LPrk := LHkdf.Extract(TSecretBuffer.From(DecodeHex(LVec.Values['salt'])),
       TSecretBuffer.From(DecodeHex(LVec.Values['ikm'])));
     CheckEqualBytes('HKDF-Extract PRK', DecodeHex(LVec.Values['prk']),
       SecretBytes(LPrk));
@@ -179,6 +259,42 @@ begin
   end;
 end;
 
+procedure TTestCryptoProvider.TestHkdfExpandRejectsOverCapAndNegative;
+const
+  CHashLen = 32;
+var
+  LHkdf: IHkdf;
+  LPrk, LOkm: ISecretBuffer;
+  LInfo: TBytes;
+  LRaised: Boolean;
+begin
+  LHkdf := Crypto.Primitives.CreateHkdf(THashAlgorithm.SHA_256);
+  LPrk := LHkdf.Extract(TSecretBuffer.From(DecodeHex('000102030405060708090a0b0c0d0e0f')),
+    TSecretBuffer.From(DecodeHex('0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b')));
+  LInfo := DecodeHex('f0f1f2f3f4f5f6f7f8f9');
+
+  LRaised := False;
+  try
+    LHkdf.Expand(LPrk, LInfo, 255 * CHashLen + 1);
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'Expand beyond 255 * HashLen must raise EArgumentTlsLibException');
+
+  LRaised := False;
+  try
+    LHkdf.Expand(LPrk, LInfo, -1);
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'Expand with a negative length must raise EArgumentTlsLibException');
+
+  LOkm := LHkdf.Expand(LPrk, LInfo, 255 * CHashLen);
+  CheckEquals(255 * CHashLen, LOkm.Len, 'Expand at the exact cap must succeed');
+end;
+
 procedure TTestCryptoProvider.TestAesGcmKat;
 var
   LVec: TStringList;
@@ -187,16 +303,16 @@ var
 begin
   LVec := LoadVectorFields('Crypto/Gcm/Aes128Gcm.txt');
   try
-    LAead := Provider.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
+    LAead := Crypto.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
     LAead.Init(TSecretBuffer.From(DecodeHex(LVec.Values['key'])));
     LNonce := DecodeHex(LVec.Values['nonce']);
     LAad := DecodeHex(LVec.Values['aad']);
     LExpected := ConcatBytes(DecodeHex(LVec.Values['ciphertext']),
       DecodeHex(LVec.Values['tag']));
-    LSealed := LAead.Seal(LNonce, LAad, DecodeHex(LVec.Values['plaintext']));
+    LSealed := TAeadUtilities.Seal(LAead, LNonce, LAad, DecodeHex(LVec.Values['plaintext']));
     CheckEqualBytes('AES-128-GCM seal', LExpected, LSealed);
     CheckEqualBytes('AES-128-GCM open', DecodeHex(LVec.Values['plaintext']),
-      LAead.Open(LNonce, LAad, LSealed));
+      TAeadUtilities.Open(LAead, LNonce, LAad, LSealed));
   finally
     LVec.Free;
   end;
@@ -210,17 +326,17 @@ var
 begin
   LVec := LoadVectorFields('Crypto/Gcm/Aes256Gcm.txt');
   try
-    LAead := Provider.Primitives.CreateAead(TAeadAlgorithm.AES_256_GCM);
+    LAead := Crypto.Primitives.CreateAead(TAeadAlgorithm.AES_256_GCM);
     CheckEquals(32, LAead.KeySize, 'AES-256-GCM key size');
     LAead.Init(TSecretBuffer.From(DecodeHex(LVec.Values['key'])));
     LNonce := DecodeHex(LVec.Values['nonce']);
     LAad := DecodeHex(LVec.Values['aad']);
     LExpected := ConcatBytes(DecodeHex(LVec.Values['ciphertext']),
       DecodeHex(LVec.Values['tag']));
-    LSealed := LAead.Seal(LNonce, LAad, DecodeHex(LVec.Values['plaintext']));
+    LSealed := TAeadUtilities.Seal(LAead, LNonce, LAad, DecodeHex(LVec.Values['plaintext']));
     CheckEqualBytes('AES-256-GCM seal', LExpected, LSealed);
     CheckEqualBytes('AES-256-GCM open', DecodeHex(LVec.Values['plaintext']),
-      LAead.Open(LNonce, LAad, LSealed));
+      TAeadUtilities.Open(LAead, LNonce, LAad, LSealed));
   finally
     LVec.Free;
   end;
@@ -231,15 +347,15 @@ var
   LAead: IAead;
   LNonce, LAad, LPlain, LSealed: TBytes;
 begin
-  LAead := Provider.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
+  LAead := Crypto.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
   LAead.Init(TSecretBuffer.From(DecodeHex('000102030405060708090a0b0c0d0e0f')));
   LNonce := DecodeHex('101112131415161718191a1b');
   LAad := DecodeHex('cafe');
   LPlain := DecodeHex('48656c6c6f2c20544c5321'); // "Hello, TLS!"
-  LSealed := LAead.Seal(LNonce, LAad, LPlain);
-  CheckEquals(System.Length(LPlain) + LAead.Overhead, System.Length(LSealed),
-    'sealed length = plaintext + overhead');
-  CheckEqualBytes('AES-GCM round-trip', LPlain, LAead.Open(LNonce, LAad, LSealed));
+  LSealed := TAeadUtilities.Seal(LAead, LNonce, LAad, LPlain);
+  CheckEquals(System.Length(LPlain) + LAead.TagSize, System.Length(LSealed),
+    'sealed length = plaintext + tag');
+  CheckEqualBytes('AES-GCM round-trip', LPlain, TAeadUtilities.Open(LAead, LNonce, LAad, LSealed));
 end;
 
 procedure TTestCryptoProvider.TestChaCha20Poly1305Kat;
@@ -250,16 +366,16 @@ var
 begin
   LVec := LoadVectorFields('Crypto/ChaCha/ChaCha20Poly1305.txt');
   try
-    LAead := Provider.Primitives.CreateAead(TAeadAlgorithm.CHACHA20_POLY1305);
+    LAead := Crypto.Primitives.CreateAead(TAeadAlgorithm.CHACHA20_POLY1305);
     LAead.Init(TSecretBuffer.From(DecodeHex(LVec.Values['key'])));
     LNonce := DecodeHex(LVec.Values['nonce']);
     LAad := DecodeHex(LVec.Values['aad']);
     LExpected := ConcatBytes(DecodeHex(LVec.Values['ciphertext']),
       DecodeHex(LVec.Values['tag']));
-    LSealed := LAead.Seal(LNonce, LAad, DecodeHex(LVec.Values['plaintext']));
+    LSealed := TAeadUtilities.Seal(LAead, LNonce, LAad, DecodeHex(LVec.Values['plaintext']));
     CheckEqualBytes('ChaCha20-Poly1305 seal', LExpected, LSealed);
     CheckEqualBytes('ChaCha20-Poly1305 open', DecodeHex(LVec.Values['plaintext']),
-      LAead.Open(LNonce, LAad, LSealed));
+      TAeadUtilities.Open(LAead, LNonce, LAad, LSealed));
   finally
     LVec.Free;
   end;
@@ -271,21 +387,203 @@ var
   LNonce, LAad, LSealed: TBytes;
   LRaised: Boolean;
 begin
-  LAead := Provider.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
+  LAead := Crypto.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
   LAead.Init(TSecretBuffer.From(DecodeHex('000102030405060708090a0b0c0d0e0f')));
   LNonce := DecodeHex('101112131415161718191a1b');
   LAad := DecodeHex('');
-  LSealed := LAead.Seal(LNonce, LAad, DecodeHex('deadbeef'));
+  LSealed := TAeadUtilities.Seal(LAead, LNonce, LAad, DecodeHex('deadbeef'));
   // corrupt the last (tag) byte
   LSealed[System.Length(LSealed) - 1] := Byte(LSealed[System.Length(LSealed) - 1] xor $01);
   LRaised := False;
   try
-    LAead.Open(LNonce, LAad, LSealed);
+    TAeadUtilities.Open(LAead, LNonce, LAad, LSealed);
   except
     on E: EFatalAlertTlsLibException do
       LRaised := Ord(E.AlertDescription) = Ord(TTlsAlertDescription.BadRecordMac);
   end;
   CheckTrue(LRaised, 'auth failure must raise bad_record_mac');
+end;
+
+// (algorithm, key size) for each AEAD suite, so the span tests can loop all three
+type
+  TAeadSuiteSpec = record
+    Algorithm: TAeadAlgorithm;
+    KeySize: Int32;
+    Name: string;
+  end;
+
+const
+  AeadSuiteSpecs: array [0 .. 2] of TAeadSuiteSpec = (
+    (Algorithm: TAeadAlgorithm.AES_128_GCM; KeySize: 16; Name: 'AES-128-GCM'),
+    (Algorithm: TAeadAlgorithm.AES_256_GCM; KeySize: 32; Name: 'AES-256-GCM'),
+    (Algorithm: TAeadAlgorithm.CHACHA20_POLY1305; KeySize: 32; Name: 'ChaCha20-Poly1305'));
+  AeadSpanSizes: array [0 .. 5] of Int32 = (0, 1, 16, 17, 255, 1400);
+
+procedure TTestCryptoProvider.DoAeadInPlaceRoundTrip(const AProvider: ICryptoProvider);
+const
+  OFF = 5; // seal at a non-zero offset, as the record layer will
+var
+  LSi, LZi, LLen, LSealed, LOpened: Int32;
+  LKey, LNonce, LAad, LPlain, LRef, LBuf: TBytes;
+  LEnc, LDec, LRefAead: IAead;
+begin
+  for LSi := System.Low(AeadSuiteSpecs) to System.High(AeadSuiteSpecs) do
+    for LZi := System.Low(AeadSpanSizes) to System.High(AeadSpanSizes) do
+    begin
+      LLen := AeadSpanSizes[LZi];
+      LKey := PatternBytes(AeadSuiteSpecs[LSi].KeySize, LSi + 1);
+      LNonce := PatternBytes(12, LSi + 2);
+      LAad := PatternBytes(5, LSi + 3);
+      LPlain := PatternBytes(LLen, LSi + 4);
+      // allocating reference sealed bytes
+      LRefAead := AProvider.Primitives.CreateAead(AeadSuiteSpecs[LSi].Algorithm);
+      LRefAead.Init(TSecretBuffer.From(LKey));
+      LRef := TAeadUtilities.Seal(LRefAead, LNonce, LAad, LPlain);
+      // seal in place into a buffer at OFF, aliasing src = dest
+      LBuf := nil;
+      SetLength(LBuf, OFF + LLen + 16);
+      if LLen > 0 then
+        System.Move(LPlain[0], LBuf[OFF], LLen);
+      LEnc := AProvider.Primitives.CreateAead(AeadSuiteSpecs[LSi].Algorithm);
+      LEnc.Init(TSecretBuffer.From(LKey));
+      LSealed := LEnc.Seal(LNonce, LAad, LBuf, OFF, LLen, LBuf, OFF);
+      CheckEquals(LLen + 16, LSealed, AeadSuiteSpecs[LSi].Name + ': sealed length');
+      CheckEqualBytes(AeadSuiteSpecs[LSi].Name + ': in-place seal matches allocating',
+        LRef, System.Copy(LBuf, OFF, LSealed));
+      // open in place, aliasing src = dest, and recover the plaintext
+      LDec := AProvider.Primitives.CreateAead(AeadSuiteSpecs[LSi].Algorithm);
+      LDec.Init(TSecretBuffer.From(LKey));
+      LOpened := LDec.Open(LNonce, LAad, LBuf, OFF, LSealed, LBuf, OFF);
+      CheckEquals(LLen, LOpened, AeadSuiteSpecs[LSi].Name + ': opened length');
+      CheckEqualBytes(AeadSuiteSpecs[LSi].Name + ': in-place open round-trips',
+        LPlain, System.Copy(LBuf, OFF, LOpened));
+    end;
+end;
+
+procedure TTestCryptoProvider.DoAeadOpenTamperWipes(const AProvider: ICryptoProvider);
+const
+  OFF = 3;
+var
+  LSi, LI, LSealed: Int32;
+  LKey, LNonce, LAad, LPlain, LBuf: TBytes;
+  LEnc, LDec: IAead;
+  LRaised, LWiped: Boolean;
+begin
+  // the wipe-on-auth-failure path differs per cipher mode, so assert it for every suite
+  for LSi := System.Low(AeadSuiteSpecs) to System.High(AeadSuiteSpecs) do
+  begin
+    LKey := PatternBytes(AeadSuiteSpecs[LSi].KeySize, LSi + 7);
+    LNonce := PatternBytes(12, LSi + 8);
+    LAad := PatternBytes(5, LSi + 9);
+    LPlain := PatternBytes(64, LSi + 10);
+    LBuf := nil;
+    SetLength(LBuf, OFF + 64 + 16);
+    System.Move(LPlain[0], LBuf[OFF], 64);
+    LEnc := AProvider.Primitives.CreateAead(AeadSuiteSpecs[LSi].Algorithm);
+    LEnc.Init(TSecretBuffer.From(LKey));
+    LSealed := LEnc.Seal(LNonce, LAad, LBuf, OFF, 64, LBuf, OFF);
+    LBuf[OFF + LSealed - 1] := Byte(LBuf[OFF + LSealed - 1] xor $01); // corrupt the tag
+    LDec := AProvider.Primitives.CreateAead(AeadSuiteSpecs[LSi].Algorithm);
+    LDec.Init(TSecretBuffer.From(LKey));
+    LRaised := False;
+    try
+      LDec.Open(LNonce, LAad, LBuf, OFF, LSealed, LBuf, OFF);
+    except
+      on E: EFatalAlertTlsLibException do
+        LRaised := Ord(E.AlertDescription) = Ord(TTlsAlertDescription.BadRecordMac);
+    end;
+    CheckTrue(LRaised, AeadSuiteSpecs[LSi].Name + ': a tampered tag raises bad_record_mac');
+    LWiped := True;
+    for LI := OFF to OFF + 64 - 1 do
+      if LBuf[LI] <> 0 then
+        LWiped := False;
+    CheckTrue(LWiped, AeadSuiteSpecs[LSi].Name +
+      ': no unverified plaintext is left in the destination after a failed open');
+  end;
+end;
+
+procedure TTestCryptoProvider.DoAeadSpanGuards(const AProvider: ICryptoProvider);
+  function SealRaises(const AAead: IAead; const ANonce, AAad, ASrc: TBytes;
+    ASrcOff, ALen: Int32; const ADest: TBytes; ADestOff: Int32): Boolean;
+  begin
+    Result := False;
+    try
+      AAead.Seal(ANonce, AAad, ASrc, ASrcOff, ALen, ADest, ADestOff);
+    except
+      on E: EArgumentTlsLibException do
+        Result := True;
+    end;
+  end;
+  function OpenRaisesArg(const AAead: IAead; const ANonce, AAad, ASrc: TBytes;
+    ASrcOff, ALen: Int32; const ADest: TBytes; ADestOff: Int32): Boolean;
+  begin
+    Result := False;
+    try
+      AAead.Open(ANonce, AAad, ASrc, ASrcOff, ALen, ADest, ADestOff);
+    except
+      on E: EArgumentTlsLibException do
+        Result := True;
+    end;
+  end;
+var
+  LKey, LNonce, LAad, LSrc, LDest, LCt, LOut: TBytes;
+  LAead, LSealer: IAead;
+  LRaised: Boolean;
+begin
+  LKey := PatternBytes(16, 1);
+  LNonce := PatternBytes(12, 2);
+  LAad := PatternBytes(5, 3);
+  LSrc := PatternBytes(32, 4);
+  LDest := nil;
+  SetLength(LDest, 32 + 16);
+  LAead := AProvider.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
+  LAead.Init(TSecretBuffer.From(LKey));
+  // Seal guards (validated before any keyed work, so one instance serves them all)
+  CheckTrue(SealRaises(LAead, LNonce, LAad, LSrc, -1, 32, LDest, 0),
+    'seal: a negative source offset is rejected');
+  CheckTrue(SealRaises(LAead, LNonce, LAad, LSrc, 0, 40, LDest, 0),
+    'seal: a length past the source end is rejected');
+  CheckTrue(SealRaises(LAead, LNonce, LAad, LSrc, 0, 32, LDest, 8),
+    'seal: a destination too small for ciphertext + tag is rejected');
+  // same array, different offsets: only an exact alias is allowed
+  CheckTrue(SealRaises(LAead, LNonce, LAad, LSrc, 0, 8, LSrc, 4),
+    'seal: a partial overlap (same array, unequal offset) is rejected');
+  // Open guards: produce one valid sealed buffer, then probe the Open-side checks
+  LSealer := AProvider.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
+  LSealer.Init(TSecretBuffer.From(LKey));
+  LCt := TAeadUtilities.Seal(LSealer, LNonce, LAad, LSrc); // 32 + 16 = 48 bytes
+  LOut := nil;
+  SetLength(LOut, 32);
+  CheckTrue(OpenRaisesArg(LAead, LNonce, LAad, LCt, -1, 48, LOut, 0),
+    'open: a negative source offset is rejected');
+  CheckTrue(OpenRaisesArg(LAead, LNonce, LAad, LCt, 0, 60, LOut, 0),
+    'open: a length past the source end is rejected');
+  CheckTrue(OpenRaisesArg(LAead, LNonce, LAad, LCt, 0, 48, LOut, 20),
+    'open: a destination too small for the plaintext is rejected');
+  // a length below the tag size cannot authenticate: bad_record_mac, not an argument error
+  LRaised := False;
+  try
+    LAead.Open(LNonce, LAad, LCt, 0, 8, LOut, 0);
+  except
+    on E: EFatalAlertTlsLibException do
+      LRaised := Ord(E.AlertDescription) = Ord(TTlsAlertDescription.BadRecordMac);
+  end;
+  CheckTrue(LRaised, 'open: a length shorter than the tag raises bad_record_mac');
+end;
+
+procedure TTestCryptoProvider.TestAeadInPlaceRoundTripMatchesAllocating;
+begin
+  DoAeadInPlaceRoundTrip(Crypto);
+end;
+
+procedure TTestCryptoProvider.TestAeadInPlaceOpenTamperWipesDestination;
+begin
+  DoAeadOpenTamperWipes(Crypto);
+end;
+
+procedure TTestCryptoProvider.TestAeadSpanGuardsRejectBadOffsetsAndOverlap;
+begin
+  DoAeadSpanGuards(Crypto);
 end;
 
 function TTestCryptoProvider.PatternBytes(ALength, ASeed: Int32): TBytes;
@@ -321,7 +619,7 @@ var
 begin
   LKeyBytes := PatternBytes(AKeySize, 99);
   LKey := TSecretBuffer.From(LKeyBytes);
-  LReused := Provider.Primitives.CreateAead(AAlgorithm);
+  LReused := Crypto.Primitives.CreateAead(AAlgorithm);
   LReused.Init(LKey);
   LNonceSize := LReused.NonceSize;
   // a long stream: cycle the length matrix many times so the reused cipher is
@@ -342,16 +640,16 @@ begin
       LAad := PatternBytes(5 + (LRecord mod 11), LRecord + 3);
     LNonce := CounterNonce(LNonceSize, LRecord);
     // reference: a fresh adapter per record reproduces the old create-per-record path
-    LFresh := Provider.Primitives.CreateAead(AAlgorithm);
+    LFresh := Crypto.Primitives.CreateAead(AAlgorithm);
     LFresh.Init(LKey);
-    LViaFresh := LFresh.Seal(LNonce, LAad, LPlain);
-    LViaReused := LReused.Seal(LNonce, LAad, LPlain);
+    LViaFresh := TAeadUtilities.Seal(LFresh, LNonce, LAad, LPlain);
+    LViaReused := TAeadUtilities.Seal(LReused, LNonce, LAad, LPlain);
     CheckEqualBytes('reused seal == fresh seal', LViaFresh, LViaReused);
     // a fresh opener must round-trip the reused adapter's output
-    LOpener := Provider.Primitives.CreateAead(AAlgorithm);
+    LOpener := Crypto.Primitives.CreateAead(AAlgorithm);
     LOpener.Init(LKey);
     CheckEqualBytes('open round-trips reused seal', LPlain,
-      LOpener.Open(LNonce, LAad, LViaReused));
+      TAeadUtilities.Open(LOpener, LNonce, LAad, LViaReused));
   end;
 end;
 
@@ -382,43 +680,58 @@ begin
   for LEpoch := 0 to 1 do
   begin
     LKey := TSecretBuffer.From(PatternBytes(16, 40 + LEpoch));
-    LSender := Provider.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
+    LSender := Crypto.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
     LSender.Init(LKey);
-    LReceiver := Provider.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
+    LReceiver := Crypto.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
     LReceiver.Init(LKey);
     for LRecord := 0 to 255 do
     begin
       LPlain := PatternBytes(1 + (LRecord mod 200), LRecord + LEpoch);
       LAad := PatternBytes(5, LRecord);
       LNonce := CounterNonce(LSender.NonceSize, LRecord);
-      LSealed := LSender.Seal(LNonce, LAad, LPlain);
+      LSealed := TAeadUtilities.Seal(LSender, LNonce, LAad, LPlain);
       CheckEqualBytes('long-connection record round-trips', LPlain,
-        LReceiver.Open(LNonce, LAad, LSealed));
+        TAeadUtilities.Open(LReceiver, LNonce, LAad, LSealed));
     end;
   end;
 end;
 
-procedure TTestCryptoProvider.TestAeadNonceReuseRejected;
+procedure TTestCryptoProvider.DoAeadNonceReuseRejected(const AProvider: ICryptoProvider);
 var
   LAead: IAead;
-  LNonce, LAad: TBytes;
+  LNonce, LOtherNonce, LAad: TBytes;
   LRaised: Boolean;
 begin
-  // the reused live cipher lets CL4P's encrypt-side guard catch a forced
+  // the reused live cipher lets the provider's encrypt-side guard catch a forced
   // (key, nonce) repeat - a net the old create-per-record adapter never had
-  LAead := Provider.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
+  LAead := AProvider.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
   LAead.Init(TSecretBuffer.From(DecodeHex('000102030405060708090a0b0c0d0e0f')));
   LNonce := DecodeHex('101112131415161718191a1b');
   LAad := nil;
-  LAead.Seal(LNonce, LAad, DecodeHex('deadbeef'));
+  TAeadUtilities.Seal(LAead, LNonce, LAad, DecodeHex('deadbeef'));
   LRaised := False;
   try
-    LAead.Seal(LNonce, LAad, DecodeHex('cafebabe'));
+    TAeadUtilities.Seal(LAead, LNonce, LAad, DecodeHex('cafebabe'));
   except
-    on E: Exception do
+    on E: EArgumentTlsLibException do
       LRaised := True;
   end;
   CheckTrue(LRaised, 'reusing a (key, nonce) for seal must be rejected');
+  // no false positive: a different nonce under the same key still seals
+  LOtherNonce := DecodeHex('101112131415161718191a1c');
+  CheckEquals(4 + LAead.TagSize,
+    System.Length(TAeadUtilities.Seal(LAead, LOtherNonce, LAad, DecodeHex('cafebabe'))),
+    'a fresh nonce under the same key seals');
+  // the guard tracks the current key: re-keying opens a fresh nonce space
+  LAead.Init(TSecretBuffer.From(DecodeHex('0f0e0d0c0b0a09080706050403020100')));
+  CheckEquals(4 + LAead.TagSize,
+    System.Length(TAeadUtilities.Seal(LAead, LOtherNonce, LAad, DecodeHex('cafebabe'))),
+    'the last nonce is forgotten on re-Init');
+end;
+
+procedure TTestCryptoProvider.TestAeadNonceReuseRejected;
+begin
+  DoAeadNonceReuseRejected(Crypto);
 end;
 
 procedure TTestCryptoProvider.TestRandomDistinctNonZero;
@@ -426,7 +739,7 @@ var
   LRandom: IRandom;
   LA, LB: TBytes;
 begin
-  LRandom := Provider.Primitives.GetRandom;
+  LRandom := Crypto.Primitives.GetRandom;
   LA := LRandom.GenerateBytes(32);
   LB := LRandom.GenerateBytes(32);
   CheckEquals(32, System.Length(LA), 'length');
@@ -434,13 +747,207 @@ begin
   CheckFalse(AreEqual(LA, LB), 'two draws must differ');
 end;
 
-procedure TTestCryptoProvider.TestHasHardwareAesReturnsBoolean;
-var
-  LValue: Boolean;
+procedure TTestCryptoProvider.TestHasHardwareAesIsStable;
 begin
-  // the contract is only that it returns a Boolean without throwing
-  LValue := Provider.Primitives.HasHardwareAes;
-  CheckTrue((LValue = True) or (LValue = False), 'HasHardwareAes is a Boolean');
+  // the default suite order reads it more than once per pass, so it must not flip
+  CheckEquals(Crypto.Primitives.HasHardwareAes, Crypto.Primitives.HasHardwareAes,
+    'HasHardwareAes answers the same twice');
+end;
+
+procedure TTestCryptoProvider.DoAgreeRejectsForeignKeyHandle(
+  const AProvider: ICryptoProvider);
+var
+  LX, LP: IKeyAgreement;
+  LXPriv, LPPriv: IKeyExchangePrivateKey;
+  LXPub, LPPub: TBytes;
+  LRaised: Boolean;
+begin
+  LX := AProvider.Primitives.CreateKeyAgreement(TKeyAgreementAlgorithm.X25519);
+  LX.GenerateKeyPair(LXPriv, LXPub);
+  LP := AProvider.Primitives.CreateKeyAgreement(TKeyAgreementAlgorithm.SECP256R1);
+  LP.GenerateKeyPair(LPPriv, LPPub);
+  // a same-width foreign scalar must be refused, not agreed under the wrong domain (once an AV)
+  LRaised := False;
+  try
+    LP.Agree(LXPriv, LPPub);
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a P-256 agreement must reject an X25519 key handle');
+  LRaised := False;
+  try
+    LX.Agree(LPPriv, LXPub);
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'an X25519 agreement must reject a P-256 key handle');
+end;
+
+procedure TTestCryptoProvider.TestAgreeRejectsForeignKeyHandle;
+begin
+  DoAgreeRejectsForeignKeyHandle(Crypto);
+end;
+
+procedure TTestCryptoProvider.DoAgreeRejectsCompressedPeerPoint(
+  const AProvider: ICryptoProvider);
+var
+  LP: IKeyAgreement;
+  LPriv: IKeyExchangePrivateKey;
+  LPub, LCompressed, LHybrid: TBytes;
+  LI: Int32;
+  LRaised: Boolean;
+begin
+  LP := AProvider.Primitives.CreateKeyAgreement(TKeyAgreementAlgorithm.SECP256R1);
+  LP.GenerateKeyPair(LPriv, LPub); // SEC1 uncompressed: 0x04 || X(32) || Y(32)
+  // a SEC1 compressed encoding (0x02/0x03 || X, 33 bytes) is forbidden for TLS and HPKE EC points
+  // (RFC 9846 4.3.8.2 / RFC 8422 5.1.2 / RFC 9180 7.1.1); the agreement must reject it, never decode it
+  SetLength(LCompressed, 1 + 32);
+  LCompressed[0] := $02 or (LPub[64] and 1);
+  for LI := 1 to 32 do
+    LCompressed[LI] := LPub[LI];
+  LRaised := False;
+  try
+    LP.Agree(LPriv, LCompressed);
+  except
+    on E: EPeerInputTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a P-256 agreement must reject a compressed peer point');
+  // a SEC1 hybrid encoding (0x06/0x07 || X || Y) is full 65-byte width, so the length check passes
+  // and only the prefix check stops it; DecodePoint would otherwise accept hybrid
+  LHybrid := System.Copy(LPub);
+  LHybrid[0] := $06 or (LPub[64] and 1);
+  LRaised := False;
+  try
+    LP.Agree(LPriv, LHybrid);
+  except
+    on E: EPeerInputTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a P-256 agreement must reject a hybrid-form peer point');
+end;
+
+procedure TTestCryptoProvider.TestX25519AgreeRejectsWrongLengthPeerKeyAsPeerInput;
+var
+  LX: IKeyAgreement;
+  LPriv: IKeyExchangePrivateKey;
+  LPub, LShort, LLong: TBytes;
+  LRaised: Boolean;
+  LI: Int32;
+begin
+  LX := Crypto.Primitives.CreateKeyAgreement(TKeyAgreementAlgorithm.X25519);
+  LX.GenerateKeyPair(LPriv, LPub);
+  LShort := System.Copy(LPub, 0, System.Length(LPub) - 1);
+  LLong := ConcatBytes(LPub, TBytes.Create(0));
+  // a peer key of the wrong length is peer input (the engine turns it into illegal_parameter), not
+  // a raw backend exception
+  for LI := 0 to 1 do
+  begin
+    LRaised := False;
+    try
+      if LI = 0 then
+        LX.Agree(LPriv, LShort)
+      else
+        LX.Agree(LPriv, LLong);
+    except
+      on E: EPeerInputTlsLibException do
+        LRaised := True;
+    end;
+    CheckTrue(LRaised, 'a wrong-length X25519 peer key is peer input');
+  end;
+end;
+
+procedure TTestCryptoProvider.TestAgreeRejectsCompressedPeerPoint;
+begin
+  DoAgreeRejectsCompressedPeerPoint(Crypto);
+end;
+
+procedure TTestCryptoProvider.DoAeadSealWithoutInitRaisesTyped(
+  const AProvider: ICryptoProvider);
+var
+  LAead: IAead;
+  LNonce, LDest: TBytes;
+  LRaised: Boolean;
+begin
+  // Seal before Init has no key: a typed state error, never a nil key passed to the mode
+  LAead := AProvider.Primitives.CreateAead(TAeadAlgorithm.AES_128_GCM);
+  LNonce := DecodeHex('101112131415161718191a1b');
+  LDest := nil;
+  SetLength(LDest, 4 + LAead.TagSize);
+  LRaised := False;
+  try
+    LAead.Seal(LNonce, nil, DecodeHex('deadbeef'), 0, 4, LDest, 0);
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'sealing before Init raises a typed state error');
+end;
+
+procedure TTestCryptoProvider.TestAeadSealWithoutInitRaisesTyped;
+begin
+  DoAeadSealWithoutInitRaisesTyped(Crypto);
+end;
+
+procedure TTestCryptoProvider.TestDerEncodeLengthRoundTripsAcrossForms;
+var
+  LLengths: array [0 .. 8] of Int32;
+  LI: Int32;
+  LContent, LTlv: TBytes;
+  LTag: Byte;
+  LContentOff, LContentLen, LNext: Int32;
+begin
+  // each length form (short, 0x81, 0x82, 0x83) encodes the minimal way and reads back exactly,
+  // including the 65536 boundary that the two-byte form cannot carry
+  LLengths[0] := 0;
+  LLengths[1] := $7F;
+  LLengths[2] := $80;
+  LLengths[3] := $FF;
+  LLengths[4] := $100;
+  LLengths[5] := $FFFF;
+  LLengths[6] := $10000;
+  LLengths[7] := $10001;
+  LLengths[8] := $123456;
+  for LI := 0 to System.High(LLengths) do
+  begin
+    LContent := nil;
+    SetLength(LContent, LLengths[LI]);
+    LTlv := TDer.Tlv($04, LContent);
+    CheckTrue(TDer.ReadTlv(LTlv, 0, LTag, LContentOff, LContentLen, LNext),
+      'a TLV with this length form parses');
+    CheckEquals(LLengths[LI], LContentLen, 'the encoded length reads back');
+    CheckEquals(System.Length(LTlv), LNext, 'the TLV ends where its length says');
+  end;
+end;
+
+procedure TTestCryptoProvider.TestDerReadTlvRejectsOverflowAndNonMinimalLengths;
+var
+  LTag: Byte;
+  LContentOff, LContentLen, LNext: Int32;
+begin
+  // tag 0x04, then a 4-byte length 0x7FFFFFFF whose content end would overflow Int32: rejected
+  CheckFalse(TDer.ReadTlv(DecodeHex('04847FFFFFFF'), 0, LTag, LContentOff, LContentLen, LNext),
+    'an overflowing 4-byte length is rejected');
+  // each non-minimal vector carries its full content, so only minimality can refuse it
+  CheckFalse(TDer.ReadTlv(DecodeHex('0481050102030405'), 0, LTag, LContentOff, LContentLen, LNext),
+    'a length under 0x80 in long form is non-minimal');
+  CheckFalse(TDer.ReadTlv(DecodeHex('048200050102030405'), 0, LTag, LContentOff, LContentLen, LNext),
+    'a multi-byte length with a leading zero byte is non-minimal');
+  CheckFalse(TDer.ReadTlv(DecodeHex('04820080' + StringOfChar('A', 256)), 0, LTag, LContentOff,
+    LContentLen, LNext), 'a leading zero byte is non-minimal even when the length is 0x80 or more');
+  CheckTrue(TDer.ReadTlv(DecodeHex('048180' + StringOfChar('A', 256)), 0, LTag, LContentOff,
+    LContentLen, LNext), 'control: the minimal long form of 128 parses');
+  CheckEquals(128, LContentLen, 'long-form content length');
+  // the same content under the minimal short form parses
+  CheckTrue(TDer.ReadTlv(DecodeHex('04050102030405'), 0, LTag, LContentOff, LContentLen, LNext),
+    'control: the minimal encoding of the same TLV parses');
+  CheckEquals(5, LContentLen, 'minimal-form content length');
+  // a well-formed short-form TLV still parses
+  CheckTrue(TDer.ReadTlv(DecodeHex('0403AABBCC'), 0, LTag, LContentOff, LContentLen, LNext),
+    'a short-form TLV parses');
+  CheckEquals(3, LContentLen, 'short-form content length');
 end;
 
 initialization

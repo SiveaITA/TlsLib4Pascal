@@ -19,125 +19,158 @@ interface
 
 uses
   SysUtils,
-  Classes,
 {$IFDEF FPC}
   fpcunit,
   testregistry,
 {$ELSE}
   TestFramework,
 {$ENDIF FPC}
-  TlpICertificateTrust,
-  TlpCertificateVerifier,
-  TlpTlsCredential,
+  TlpCertificateVerifierSource,
   TlpTlsPresets,
   TlpTlsEngineFactory,
+  TlpINegotiation,
+  TlpNegotiationTypes,
+  TlpCipherSuiteRegistry,
+  TlpICryptoProvider,
   TlpITlsEngine,
-  TlsLibTestBase;
+  TlpTlsAlert,
+  TlpTlsError,
+  TlpHandshakeMessages,
+  TlpHandshakeMessage,
+  TlpHandshakeEffect,
+  TlpIHandshakeMachine,
+  TlpIKeySchedule,
+  TlpTls13KeySchedule,
+  TlpCryptoDomainTypes,
+  TlpSecretBuffer,
+  TlpCoreExtensions,
+  TlpExtensionVector,
+  TlpWireReader,
+  TlpITlsConfig,
+  TlpTls13HandshakeBase,
+  MockCryptoProvider,
+  TlsLibHandshakeTestBase,
+  TlsLibTestCertificates,
+  TlsLibTestHandshakeDecoder;
 
 type
-  TTestTls13KeyUpdate = class(TTlsLibAlgorithmTestCase)
+  TTestTls13KeyUpdate = class(TTlsLibHandshakeTestCase)
   private
   const
     ServerHost = 'localhost';
   var
-    FCerts: TStringList;
-    function ServerCredential: TTlsCredential;
-    function ClientTrust: ITrustAnchorStore;
+    function AesGcmRegistry(const AProvider: ICryptoProvider): ICipherSuiteRegistry;
     function NewClient: ITlsEngine;
     function NewServer: ITlsEngine;
-    function Drain(const AEngine: ITlsEngine): TBytes;
-    procedure Feed(const AEngine: ITlsEngine; const AWire: TBytes);
-    procedure Pump(const ASrc, ADst: ITlsEngine);
     procedure Exchange(const AClient, AServer: ITlsEngine);
-    function ReadAllApp(const AEngine: ITlsEngine): TBytes;
     /// <summary>Drains the event queue and counts the KeyUpdateReceived events.</summary>
     function CountKeyUpdateEvents(const AEngine: ITlsEngine): Int32;
     procedure CheckAppDataBothWays(const AClient, AServer: ITlsEngine;
       const AMsg: string);
     procedure Handshake(out AClient, AServer: ITlsEngine);
+    /// <summary>A completed handshake whose client seals through ASwitch, then drains both
+    /// engines.</summary>
+    procedure HandshakeWithFaultableClient(const ASwitch: TAeadFaultSwitch;
+      out AClient, AServer: ITlsEngine);
   published
     procedure TestClientKeyUpdateNoRequestRekeysServerRead;
     procedure TestClientKeyUpdateRequestedTriggersOneResponse;
     procedure TestServerInitiatedKeyUpdate;
     procedure TestRepeatedKeyUpdatesStayInSync;
     procedure TestConsecutiveKeyUpdateFloodIsRefused;
+    procedure TestConsecutiveKeyUpdateFloodSaysWhy;
+    procedure TestSendAlertWhoseSealFailsStillEndsTheEngine;
+    procedure TestFloodRefusalWhoseAlertSealFailsKeepsItsAlert;
+    procedure TestUndrainedEventQueueIsBounded;
+    procedure TestWriteAtUsageLimitRekeysAutomatically;
     procedure TestServerExportsKeyingMaterialInHalfRtt;
     procedure TestExportKeyingMaterialSurvivesKeyUpdate;
     procedure TestExportUnavailableAfterFatal;
+    procedure TestKeyUpdateStopsAtTheEpochCap;
+    procedure TestSecondUpdateRequestedIsSentAsNotRequested;
+    procedure TestDowngradedUpdateCountsTowardTheEpochCap;
+    procedure TestDowngradedUpdateStillRekeysTheWriteSide;
+    procedure TestUpdateRequestedAfterPeerKeyUpdateIsRequestedAgain;
+    procedure TestUpdateNotRequestedLeavesNoRequestOutstanding;
+    procedure TestRepeatedUpdateRequestedKeepsClientAndServerInSync;
+    procedure TestKeySharesAreFreshPerConnection;
   end;
 
 implementation
 
-{ TTestTls13KeyUpdate }
-
-function TTestTls13KeyUpdate.ServerCredential: TTlsCredential;
-begin
-  FCerts := LoadVectorFields('Certs/EcP256Chain.txt');
-  try
-    Result.CertificateChain := TArray<TBytes>.Create(
-      DecodeHex(FCerts.Values['leaf_cert']));
-    Result.PrivateKey := Provider.Signing.ImportSigningKey(DecodeHex(FCerts.Values['leaf_key']));
-  finally
-    FreeAndNil(FCerts);
+type
+  // a connected 1.3 base over a real key schedule, with the sent-KeyUpdate count settable to reach the cap
+  TKeyUpdateCapProbe = class sealed(TTls13HandshakeBase)
+  strict protected
+    function WriteDirection: TTlsDirection; override;
+    function ReadDirection: TTlsDirection; override;
+    function Route(const AMessage: TTlsHandshakeMessage)
+      : TArray<THandshakeEffect>; override;
+  public
+    constructor Create(const ACrypto: ICryptoProvider);
+    function Start: TArray<THandshakeEffect>; override;
+    procedure SetSent(ASent: UInt64);
   end;
-end;
 
-function TTestTls13KeyUpdate.ClientTrust: ITrustAnchorStore;
+constructor TKeyUpdateCapProbe.Create(const ACrypto: ICryptoProvider);
 var
-  LCerts: TStringList;
+  LSuites: ICipherSuiteRegistry;
+  LZeros: TBytes;
 begin
-  LCerts := LoadVectorFields('Certs/EcP256Chain.txt');
-  try
-    Result := TTrustAnchorStore.Create(
-      TArray<TBytes>.Create(DecodeHex(LCerts.Values['root_cert']))) as ITrustAnchorStore;
-  finally
-    LCerts.Free;
-  end;
+  inherited Create(TCoreExtensions.CreateDefaultRegistry);
+  LSuites := TCipherSuiteRegistry.CreateDefault(ACrypto);
+  if not LSuites.TryGet(TCipherSuites13.Aes128GcmSha256, FSelectedSuite) then
+    raise Exception.Create('the AES-128-GCM suite is not registered');
+  FSchedule := TTls13KeySchedule.Create(ACrypto, THashAlgorithm.SHA_256, 16);
+  SetLength(LZeros, 32);
+  FSchedule.SetSharedSecret(TSecretBuffer.From(LZeros));
+  FSchedule.DeriveEpochSecrets(TTlsEpoch.Handshake, LZeros);
+  FSchedule.DeriveEpochSecrets(TTlsEpoch.Application, LZeros);
+  MarkConnected;
 end;
+
+function TKeyUpdateCapProbe.WriteDirection: TTlsDirection;
+begin
+  Result := TTlsDirection.ClientWrite;
+end;
+
+function TKeyUpdateCapProbe.ReadDirection: TTlsDirection;
+begin
+  Result := TTlsDirection.ServerWrite;
+end;
+
+function TKeyUpdateCapProbe.Route(const AMessage: TTlsHandshakeMessage)
+  : TArray<THandshakeEffect>;
+begin
+  Result := HandleInboundKeyUpdate(AMessage);
+end;
+
+function TKeyUpdateCapProbe.Start: TArray<THandshakeEffect>;
+begin
+  Result := nil;
+end;
+
+procedure TKeyUpdateCapProbe.SetSent(ASent: UInt64);
+begin
+  FKeyUpdatesSent := ASent;
+end;
+
+{ TTestTls13KeyUpdate }
 
 function TTestTls13KeyUpdate.NewClient: ITlsEngine;
 begin
   // Hardened is TLS 1.3-only, the version that has KeyUpdate
   Result := TTlsEngineFactory.CreateClientEngine(
-    TTlsPresets.Hardened(Provider).Client.WithTrustStore(ClientTrust).Build, ServerHost);
+    TTlsPresets.Hardened(Crypto, Pkix).Client
+    .WithServerVerification(
+      TServerVerification.WebPki(TTlsLibTestCertificates.EcP256RootStore).Build)
+    .Build, ServerHost);
 end;
 
 function TTestTls13KeyUpdate.NewServer: ITlsEngine;
 begin
   Result := TTlsEngineFactory.CreateServerEngine(
-    TTlsPresets.Hardened(Provider).Server.WithCredential(ServerCredential).Build);
-end;
-
-function TTestTls13KeyUpdate.Drain(const AEngine: ITlsEngine): TBytes;
-var
-  LChunk: TBytes;
-  LGot: Int32;
-begin
-  Result := nil;
-  SetLength(LChunk, 65536);
-  repeat
-    LGot := AEngine.TakeOutgoing(LChunk, 0);
-    if LGot > 0 then
-      Result := ConcatBytes(Result, System.Copy(LChunk, 0, LGot));
-  until LGot = 0;
-end;
-
-procedure TTestTls13KeyUpdate.Feed(const AEngine: ITlsEngine; const AWire: TBytes);
-var
-  LPos, LLen: Int32;
-begin
-  LPos := 0;
-  while LPos + 5 <= System.Length(AWire) do
-  begin
-    LLen := (AWire[LPos + 3] shl 8) or AWire[LPos + 4];
-    AEngine.ProcessInput(AWire, LPos, 5 + LLen);
-    Inc(LPos, 5 + LLen);
-  end;
-end;
-
-procedure TTestTls13KeyUpdate.Pump(const ASrc, ADst: ITlsEngine);
-begin
-  Feed(ADst, Drain(ASrc));
+    TTlsPresets.Hardened(Crypto, Pkix).Server.WithCredential(ServerCredential).Build);
 end;
 
 procedure TTestTls13KeyUpdate.Exchange(const AClient, AServer: ITlsEngine);
@@ -145,20 +178,6 @@ begin
   // one full round-trip so an initiated KeyUpdate reaches the peer and any response returns
   Pump(AClient, AServer);
   Pump(AServer, AClient);
-end;
-
-function TTestTls13KeyUpdate.ReadAllApp(const AEngine: ITlsEngine): TBytes;
-var
-  LChunk: TBytes;
-  LGot: Int32;
-begin
-  Result := nil;
-  SetLength(LChunk, 65536);
-  repeat
-    LGot := AEngine.ReadAppData(LChunk, 0, System.Length(LChunk));
-    if LGot > 0 then
-      Result := ConcatBytes(Result, System.Copy(LChunk, 0, LGot));
-  until LGot = 0;
 end;
 
 function TTestTls13KeyUpdate.CountKeyUpdateEvents(const AEngine: ITlsEngine): Int32;
@@ -189,23 +208,98 @@ begin
 end;
 
 procedure TTestTls13KeyUpdate.Handshake(out AClient, AServer: ITlsEngine);
-var
-  LIterations: Int32;
 begin
   AClient := NewClient;
   AServer := NewServer;
-  AClient.StartHandshake;
-  LIterations := 0;
-  while (AClient.IsHandshaking or AServer.IsHandshaking) and (LIterations < 16) do
-  begin
-    Exchange(AClient, AServer);
-    Inc(LIterations);
-  end;
+  RunHandshake(AClient, AServer);
   CheckFalse(AClient.IsHandshaking, 'the client completed the handshake');
   CheckFalse(AServer.IsHandshaking, 'the server completed the handshake');
-  // clear the handshake-phase events (KeysInstalled, SessionTicketReceived, ...)
+  // clear the handshake-phase events (SessionTicketReceived, ...)
   CountKeyUpdateEvents(AClient);
   CountKeyUpdateEvents(AServer);
+end;
+
+procedure TTestTls13KeyUpdate.HandshakeWithFaultableClient(const ASwitch: TAeadFaultSwitch;
+  out AClient, AServer: ITlsEngine);
+var
+  LFaulty: ICryptoProvider;
+begin
+  // the usage limit sits far above the rekey lead, so only the switch can make a seal fail
+  LFaulty := TCappedAeadProvider.Create(Crypto, UInt64(1) shl 24, ASwitch) as ICryptoProvider;
+  AClient := TTlsEngineFactory.CreateClientEngine(
+    TTlsPresets.Hardened(LFaulty, Pkix).Client
+    .WithServerVerification(
+      TServerVerification.WebPki(TTlsLibTestCertificates.EcP256RootStore).Build)
+    .Build, ServerHost);
+  AServer := NewServer;
+  RunHandshake(AClient, AServer);
+  CheckFalse(AClient.IsHandshaking, 'the client completed the handshake');
+  CheckFalse(AServer.IsHandshaking, 'the server completed the handshake');
+  Drain(AClient);
+  Drain(AServer);
+end;
+
+function TTestTls13KeyUpdate.AesGcmRegistry(
+  const AProvider: ICryptoProvider): ICipherSuiteRegistry;
+var
+  LBuilder: ICipherSuiteRegistryBuilder;
+begin
+  // AES-128-GCM only: its record-count usage limit is the bound the auto-rekey defends. The
+  // CPU-adaptive default prefers ChaCha20 (limited only by the 2^64 sequence, so it never rekeys
+  // by count) on a host without hardware AES, which would make the rekey test host-dependent.
+  LBuilder := TCipherSuiteRegistry.CreateDefault(AProvider).ToBuilder;
+  LBuilder.Prune(TCipherSuites13.ChaCha20Poly1305Sha256);
+  LBuilder.Prune(TCipherSuites13.Aes256GcmSha384);
+  Result := LBuilder.Build;
+end;
+
+procedure TTestTls13KeyUpdate.TestWriteAtUsageLimitRekeysAutomatically;
+var
+  LClient, LServer: ITlsEngine;
+  LCapped: ICryptoProvider;
+  LRegistry: ICipherSuiteRegistry;
+  LMsg: TBytes;
+  LI, LUpdates: Int32;
+begin
+  // a capped AEAD (usage limit 32) brings the auto-rekey point within reach of a short write
+  // loop, so the real limit path is exercised without sealing millions of records. Both endpoints
+  // share the cap, so their AEAD nonces advance and rotate in step.
+  LCapped := TCappedAeadProvider.Create(Crypto, 32) as ICryptoProvider;
+  LRegistry := AesGcmRegistry(LCapped);
+  LClient := TTlsEngineFactory.CreateClientEngine(
+    TTlsPresets.Hardened(LCapped, Pkix).Client
+    .WithServerVerification(
+      TServerVerification.WebPki(TTlsLibTestCertificates.EcP256RootStore).Build)
+    .WithCipherSuites(LRegistry).Build, ServerHost);
+  LServer := TTlsEngineFactory.CreateServerEngine(
+    TTlsPresets.Hardened(LCapped, Pkix).Server.WithCredential(ServerCredential)
+    .WithCipherSuites(LRegistry).Build);
+  RunHandshake(LClient, LServer);
+  CheckFalse(LClient.IsHandshaking, 'the handshake completed');
+  CountKeyUpdateEvents(LClient); // clear handshake-phase events
+  CountKeyUpdateEvents(LServer);
+  CheckEquals(Integer(TCipherSuites13.Aes128GcmSha256),
+    Integer(LClient.ConnectionInfo.CipherSuite),
+    'AES-128-GCM was negotiated so the record limit is deterministic');
+
+  // write a run of application records: as the write epoch nears its (capped) usage limit the
+  // client must auto-emit a KeyUpdate ahead of the data (RFC 9846 5.5) and rotate its write
+  // epoch, transparently, with the server decrypting every record across the rotation. Data flows
+  // each round, so the run is never mistaken for a KeyUpdate flood.
+  LMsg := DecodeHex('7061737420746865206c696d6974'); // "past the limit"
+  LUpdates := 0;
+  for LI := 1 to 40 do
+  begin
+    LClient.Write(LMsg, 0, System.Length(LMsg));
+    Pump(LClient, LServer);
+    CheckEqualBytes('the server decrypts each record written across the auto-rekey', LMsg,
+      ReadAllApp(LServer));
+    Inc(LUpdates, CountKeyUpdateEvents(LServer));
+    CheckFalse(LClient.IsTerminal or LServer.IsTerminal,
+      'neither side failed across the auto-rekey run');
+  end;
+  CheckTrue(LUpdates >= 1, 'the client automatically rekeyed at least once at the usage limit');
+  CheckAppDataBothWays(LClient, LServer, 'after the automatic rekey');
 end;
 
 procedure TTestTls13KeyUpdate.TestClientKeyUpdateNoRequestRekeysServerRead;
@@ -214,7 +308,7 @@ var
 begin
   Handshake(LClient, LServer);
   // a plain KeyUpdate: the server rekeys its read epoch and does not respond
-  LClient.RequestKeyUpdate(False);
+  LClient.RequestKeyUpdate(TKeyUpdateRequest.UpdateNotRequested);
   Exchange(LClient, LServer);
   CheckEquals(1, CountKeyUpdateEvents(LServer), 'the server saw one KeyUpdate');
   CheckEquals(0, CountKeyUpdateEvents(LClient),
@@ -230,8 +324,8 @@ var
 begin
   Handshake(LClient, LServer);
   // update_requested: the server rekeys read now and owes one coalesced response, which it
-  // flushes just before its next application write (RFC 8446 4.6.3)
-  LClient.RequestKeyUpdate(True);
+  // flushes just before its next application write (RFC 9846 4.7.3)
+  LClient.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
   Exchange(LClient, LServer);
   CheckEquals(1, CountKeyUpdateEvents(LServer), 'the server saw one KeyUpdate');
   CheckFalse(LClient.IsTerminal, 'the client did not fail');
@@ -248,7 +342,7 @@ var
 begin
   Handshake(LClient, LServer);
   // the server initiates; the client rekeys its read epoch
-  LServer.RequestKeyUpdate(False);
+  LServer.RequestKeyUpdate(TKeyUpdateRequest.UpdateNotRequested);
   Exchange(LServer, LClient);
   CheckEquals(1, CountKeyUpdateEvents(LClient), 'the client saw the server KeyUpdate');
   CheckFalse(LClient.IsTerminal, 'the client did not fail');
@@ -266,7 +360,7 @@ begin
   Handshake(LClient, LServer);
   for LI := 0 to 39 do
   begin
-    LClient.RequestKeyUpdate(True);
+    LClient.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
     Exchange(LClient, LServer);
     CheckFalse(LClient.IsTerminal, 'the client stayed healthy across repeated updates');
     CheckFalse(LServer.IsTerminal, 'the server stayed healthy across repeated updates');
@@ -287,10 +381,95 @@ begin
   Handshake(LClient, LServer);
   for LI := 0 to 40 do
   begin
-    LServer.RequestKeyUpdate(False);
+    LServer.RequestKeyUpdate(TKeyUpdateRequest.UpdateNotRequested);
     Pump(LServer, LClient);
   end;
   CheckTrue(LClient.IsTerminal, 'the client refuses a consecutive KeyUpdate flood');
+end;
+
+procedure TTestTls13KeyUpdate.TestConsecutiveKeyUpdateFloodSaysWhy;
+var
+  LClient, LServer: ITlsEngine;
+  LI: Int32;
+begin
+  Handshake(LClient, LServer);
+  for LI := 0 to 40 do
+  begin
+    LServer.RequestKeyUpdate(TKeyUpdateRequest.UpdateNotRequested);
+    Pump(LServer, LClient);
+  end;
+  CheckEquals('the peer sent too many post-handshake messages without application data',
+    LClient.LastError.Message, 'the flood refusal names its cause');
+end;
+
+procedure TTestTls13KeyUpdate.TestSendAlertWhoseSealFailsStillEndsTheEngine;
+var
+  LSwitch: TAeadFaultSwitch;
+  LClient, LServer: ITlsEngine;
+begin
+  LSwitch := Own<TAeadFaultSwitch>(TAeadFaultSwitch.Create);
+  HandshakeWithFaultableClient(LSwitch, LClient, LServer);
+  LSwitch.Armed := True;
+  LClient.SendAlert(TTlsAlertDescription.HandshakeFailure);
+  CheckTrue(LClient.IsTerminal, 'an alert that cannot be sealed still ends the engine');
+  CheckEquals(Ord(TTlsErrorOrigin.Local), Ord(LClient.LastError.Origin),
+    'the failure is recorded as our own');
+  CheckEquals(Ord(TTlsAlertDescription.HandshakeFailure),
+    Ord(LClient.LastError.Alert.Description), 'the recorded alert is the one asked for');
+  CheckEquals(0, System.Length(Drain(LClient)), 'no alert was queued');
+end;
+
+procedure TTestTls13KeyUpdate.TestFloodRefusalWhoseAlertSealFailsKeepsItsAlert;
+var
+  LSwitch: TAeadFaultSwitch;
+  LClient, LServer: ITlsEngine;
+  LI: Int32;
+begin
+  // the flood refusal is a handshake Fail effect, so its alert goes through SendAlert
+  LSwitch := Own<TAeadFaultSwitch>(TAeadFaultSwitch.Create);
+  HandshakeWithFaultableClient(LSwitch, LClient, LServer);
+  LSwitch.Armed := True;
+  for LI := 0 to 40 do
+  begin
+    LServer.RequestKeyUpdate(TKeyUpdateRequest.UpdateNotRequested);
+    Pump(LServer, LClient);
+  end;
+  CheckTrue(LClient.IsTerminal, 'the client refuses the flood');
+  CheckEquals(Ord(TTlsAlertDescription.UnexpectedMessage),
+    Ord(LClient.LastError.Alert.Description),
+    'the flood alert survives the failed seal instead of becoming internal_error');
+  CheckEquals('the peer sent too many post-handshake messages without application data',
+    LClient.LastError.Message, 'the flood reason survives the failed seal');
+  CheckEquals(0, System.Length(Drain(LClient)), 'no alert was queued');
+end;
+
+procedure TTestTls13KeyUpdate.TestUndrainedEventQueueIsBounded;
+const
+  MAX_QUEUED_EVENTS = 64;
+  ROUNDS = MAX_QUEUED_EVENTS + 16;
+var
+  LClient, LServer: ITlsEngine;
+  LFromClient: TBytes;
+  LI: Int32;
+begin
+  // a host that never services NextEvent must not grow the queue without bound: past the cap
+  // the informational KeyUpdateReceived events are dropped and the connection stays healthy.
+  // Application data flows between the updates so the exchange is never mistaken for a flood.
+  Handshake(LClient, LServer);
+  LFromClient := DecodeHex('68656c6c6f2066726f6d2074686520636c69656e74');
+  for LI := 1 to ROUNDS do
+  begin
+    LClient.RequestKeyUpdate(TKeyUpdateRequest.UpdateNotRequested);
+    Exchange(LClient, LServer);
+    LClient.Write(LFromClient, 0, System.Length(LFromClient));
+    Pump(LClient, LServer);
+    CheckEqualBytes('the server reads the data under the current keys', LFromClient,
+      ReadAllApp(LServer));
+  end;
+  CheckFalse(LClient.IsTerminal, 'the client stayed healthy across the undrained rounds');
+  CheckFalse(LServer.IsTerminal, 'the server stayed healthy across the undrained rounds');
+  CheckEquals(MAX_QUEUED_EVENTS, CountKeyUpdateEvents(LServer),
+    'the undrained queue kept exactly the cap of KeyUpdate events and dropped the rest');
 end;
 
 procedure TTestTls13KeyUpdate.TestServerExportsKeyingMaterialInHalfRtt;
@@ -307,7 +486,7 @@ begin
   CheckTrue(LServer.IsHandshaking,
     'the server is in half-RTT (the client Finished is not yet processed)');
   LCtx := DecodeHex('00010203');
-  LHalfRtt := LServer.ExportKeyingMaterial('EXPORTER-test', LCtx, True, 32);
+  LHalfRtt := LServer.ExportKeyingMaterial('EXPORTER-test', LCtx, 32);
   CheckEquals(32, System.Length(LHalfRtt),
     'the server exports keying material in half-RTT');
   // finish the handshake
@@ -316,8 +495,8 @@ begin
   CheckFalse(LServer.IsHandshaking, 'the server completed');
   CheckFalse(LClient.IsHandshaking, 'the client completed');
   // the half-RTT value is byte-identical to the post-completion export, on both endpoints
-  LServerFinal := LServer.ExportKeyingMaterial('EXPORTER-test', LCtx, True, 32);
-  LClientFinal := LClient.ExportKeyingMaterial('EXPORTER-test', LCtx, True, 32);
+  LServerFinal := LServer.ExportKeyingMaterial('EXPORTER-test', LCtx, 32);
+  LClientFinal := LClient.ExportKeyingMaterial('EXPORTER-test', LCtx, 32);
   CheckEqualBytes('the half-RTT export equals the server post-completion export',
     LHalfRtt, LServerFinal);
   CheckEqualBytes('the half-RTT export equals the client export', LHalfRtt, LClientFinal);
@@ -330,13 +509,13 @@ var
 begin
   Handshake(LClient, LServer);
   LCtx := DecodeHex('aabbcc');
-  LBefore := LServer.ExportKeyingMaterial('EXPORTER-test', LCtx, True, 48);
+  LBefore := LServer.ExportKeyingMaterial('EXPORTER-test', LCtx, 48);
   CheckEquals(48, System.Length(LBefore), 'the server exported keying material');
-  // a KeyUpdate rotates the application traffic secrets; the exporter secret is fixed (RFC 8446
+  // a KeyUpdate rotates the application traffic secrets; the exporter secret is fixed (RFC 9846
   // 7.5), so the exported value must not change
-  LClient.RequestKeyUpdate(True);
+  LClient.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
   Exchange(LClient, LServer);
-  LAfter := LServer.ExportKeyingMaterial('EXPORTER-test', LCtx, True, 48);
+  LAfter := LServer.ExportKeyingMaterial('EXPORTER-test', LCtx, 48);
   CheckEqualBytes('the exported keying material is unchanged after a KeyUpdate',
     LBefore, LAfter);
 end;
@@ -348,13 +527,197 @@ var
 begin
   Handshake(LClient, LServer);
   CheckEquals(32, System.Length(LServer.ExportKeyingMaterial('EXPORTER-test',
-    DecodeHex('00'), True, 32)), 'the exporter is available on an established connection');
+    DecodeHex('00'), 32)), 'the exporter is available on an established connection');
   // an application_data record that fails to decrypt makes the connection terminal
   LGarbage := DecodeHex('170303001000112233445566778899aabbccddeeff');
   LServer.ProcessInput(LGarbage, 0, System.Length(LGarbage));
   CheckTrue(LServer.IsTerminal, 'a bad record made the connection terminal');
   CheckEquals(0, System.Length(LServer.ExportKeyingMaterial('EXPORTER-test',
-    DecodeHex('00'), True, 32)), 'a terminal connection exports nothing');
+    DecodeHex('00'), 32)), 'a terminal connection exports nothing');
+end;
+
+procedure TTestTls13KeyUpdate.TestKeyUpdateStopsAtTheEpochCap;
+var
+  LProbe: TKeyUpdateCapProbe;
+  LMachine: IHandshakeMachine;
+  LRequested: TTlsHandshakeMessage;
+const
+  // RFC 9846 4.7.3
+  MaxSent = UInt64($FFFFFFFFFFFF);
+begin
+  LProbe := TKeyUpdateCapProbe.Create(Crypto);
+  LMachine := LProbe as IHandshakeMachine;
+  LRequested := TTlsLibTestHandshakeDecoder.HandshakeMessage(
+    THandshakeFraming.Frame(TTlsHandshakeType.KeyUpdate, TBytes.Create(1)));
+  LProbe.SetSent(MaxSent - 1);
+  CheckEquals(2, System.Length(LMachine.RequestKeyUpdate(TKeyUpdateRequest.UpdateNotRequested)),
+    'the last permitted KeyUpdate is sent');
+  CheckEquals(0, System.Length(LMachine.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested)),
+    'none is sent at the cap');
+  LProbe.SetSent(MaxSent - 1);
+  LMachine.ProcessMessage(LRequested);
+  CheckEquals(2, System.Length(LMachine.TakePendingKeyUpdate),
+    'the last permitted response is sent');
+  LMachine.ProcessMessage(LRequested);
+  CheckEquals(0, System.Length(LMachine.TakePendingKeyUpdate),
+    'update_requested is ignored at the cap');
+  LProbe.SetSent(0);
+  CheckEquals(0, System.Length(LMachine.TakePendingKeyUpdate),
+    'the ignored request is not left pending');
+end;
+
+procedure TTestTls13KeyUpdate.TestSecondUpdateRequestedIsSentAsNotRequested;
+var
+  LProbe: TKeyUpdateCapProbe;
+  LMachine: IHandshakeMachine;
+  LFirst, LSecond: TArray<THandshakeEffect>;
+begin
+  LProbe := TKeyUpdateCapProbe.Create(Crypto);
+  LMachine := LProbe as IHandshakeMachine;
+  LFirst := LMachine.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
+  LSecond := LMachine.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
+  // the framed KeyUpdate is a 4-byte header then the request_update byte (RFC 9846 4.7.3)
+  CheckEquals(1, LFirst[0].Bytes[4], 'the first request is update_requested');
+  CheckEquals(0, LSecond[0].Bytes[4],
+    'a repeat before the peer replies is update_not_requested');
+end;
+
+procedure TTestTls13KeyUpdate.TestDowngradedUpdateCountsTowardTheEpochCap;
+var
+  LProbe: TKeyUpdateCapProbe;
+  LMachine: IHandshakeMachine;
+const
+  // RFC 9846 4.7.3
+  MaxSent = UInt64($FFFFFFFFFFFF);
+begin
+  LProbe := TKeyUpdateCapProbe.Create(Crypto);
+  LMachine := LProbe as IHandshakeMachine;
+  LProbe.SetSent(MaxSent - 2);
+  LMachine.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
+  LMachine.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
+  CheckEquals(0, System.Length(LMachine.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested)),
+    'the downgraded update used up a permitted KeyUpdate');
+end;
+
+procedure TTestTls13KeyUpdate.TestDowngradedUpdateStillRekeysTheWriteSide;
+var
+  LProbe: TKeyUpdateCapProbe;
+  LMachine: IHandshakeMachine;
+  LSecond: TArray<THandshakeEffect>;
+begin
+  LProbe := TKeyUpdateCapProbe.Create(Crypto);
+  LMachine := LProbe as IHandshakeMachine;
+  LMachine.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
+  LSecond := LMachine.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
+  CheckEquals(2, System.Length(LSecond), 'the downgraded update is still sent with a rekey');
+  CheckTrue(LSecond[1].Kind = THandshakeEffectKind.InstallKeys,
+    'the downgraded update rekeys the write side');
+end;
+
+procedure TTestTls13KeyUpdate.TestUpdateRequestedAfterPeerKeyUpdateIsRequestedAgain;
+var
+  LProbe: TKeyUpdateCapProbe;
+  LMachine: IHandshakeMachine;
+  LPeerUpdate: TTlsHandshakeMessage;
+  LThird: TArray<THandshakeEffect>;
+begin
+  LProbe := TKeyUpdateCapProbe.Create(Crypto);
+  LMachine := LProbe as IHandshakeMachine;
+  LPeerUpdate := TTlsLibTestHandshakeDecoder.HandshakeMessage(
+    THandshakeFraming.Frame(TTlsHandshakeType.KeyUpdate, TBytes.Create(0)));
+  LMachine.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
+  LMachine.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
+  LMachine.ProcessMessage(LPeerUpdate);
+  LThird := LMachine.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
+  CheckEquals(1, LThird[0].Bytes[4],
+    'update_requested is sent again once the peer KeyUpdate arrived');
+end;
+
+procedure TTestTls13KeyUpdate.TestUpdateNotRequestedLeavesNoRequestOutstanding;
+var
+  LProbe: TKeyUpdateCapProbe;
+  LMachine: IHandshakeMachine;
+  LRequested: TArray<THandshakeEffect>;
+begin
+  LProbe := TKeyUpdateCapProbe.Create(Crypto);
+  LMachine := LProbe as IHandshakeMachine;
+  LMachine.RequestKeyUpdate(TKeyUpdateRequest.UpdateNotRequested);
+  LRequested := LMachine.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
+  CheckEquals(1, LRequested[0].Bytes[4],
+    'update_not_requested does not block a later update_requested');
+end;
+
+procedure TTestTls13KeyUpdate.TestRepeatedUpdateRequestedKeepsClientAndServerInSync;
+var
+  LClient, LServer: ITlsEngine;
+  LI: Int32;
+begin
+  Handshake(LClient, LServer);
+  for LI := 1 to 3 do
+  begin
+    LClient.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
+    LServer.RequestKeyUpdate(TKeyUpdateRequest.UpdateRequested);
+  end;
+  Exchange(LClient, LServer);
+  Exchange(LServer, LClient);
+  CheckFalse(LClient.IsTerminal, 'the client stayed healthy');
+  CheckFalse(LServer.IsTerminal, 'the server stayed healthy');
+  CheckAppDataBothWays(LClient, LServer, 'after repeated update_requested from both roles');
+end;
+
+procedure TTestTls13KeyUpdate.TestKeySharesAreFreshPerConnection;
+var
+  LClientConfig: ITlsClientConfig;
+  LServerConfig: ITlsServerConfig;
+  LClient, LServer: ITlsEngine;
+  LFlight, LServerFlight: TBytes;
+  LEntry: TExtensionEntry;
+  LReader, LList, LShare: TWireReader;
+  LGroup: UInt16;
+  LHello: TTlsServerHello;
+  LClientShares, LServerShares: array [0 .. 1] of TBytes;
+  LI: Int32;
+begin
+  // one config for every connection, so a cached share would repeat (RFC 9846 4.3.8)
+  LClientConfig := TTlsPresets.Hardened(Crypto, Pkix).Client
+    .WithServerVerification(
+      TServerVerification.WebPki(TTlsLibTestCertificates.EcP256RootStore).Build).Build;
+  LServerConfig := TTlsPresets.Hardened(Crypto, Pkix).Server
+    .WithCredential(ServerCredential).Build;
+  for LI := 0 to 1 do
+  begin
+    LClient := TTlsEngineFactory.CreateClientEngine(LClientConfig, ServerHost);
+    LServer := TTlsEngineFactory.CreateServerEngine(LServerConfig);
+    LClient.StartHandshake;
+    LFlight := Drain(LClient);
+    CheckTrue(TTlsLibTestHandshakeDecoder.ClientHelloExtensions(LFlight)
+      .TryFind(TExtensionTypes.KeyShare, LEntry), 'the ClientHello carries a key_share');
+    // the GREASE share varies on its own, so compare the real one
+    LReader := TWireReader.Create(LEntry.Data);
+    LList := LReader.OpenVector(2);
+    while LList.Remaining > 0 do
+    begin
+      LGroup := LList.ReadUInt16;
+      LShare := LList.OpenVector(2);
+      if (LGroup and $0F0F) <> $0A0A then
+        LClientShares[LI] := LShare.ReadBytes(LShare.Remaining);
+    end;
+    Feed(LServer, LFlight);
+    LServerFlight := Drain(LServer);
+    LHello := THandshakeMessages.DecodeServerHello(
+      TTlsLibTestHandshakeDecoder.HandshakeMessage(System.Copy(LServerFlight, 5,
+      System.Length(LServerFlight) - 5)).Body);
+    CheckFalse(CompareMem(@LHello.Random[0], @HelloRetryRequestSentinel[0],
+      System.Length(HelloRetryRequestSentinel)), 'the first server flight is a ServerHello');
+    CheckTrue(TExtensionVector.Parse(LHello.Extensions)
+      .TryFind(TExtensionTypes.KeyShare, LEntry), 'the ServerHello carries a key_share');
+    LServerShares[LI] := LEntry.Data;
+  end;
+  CheckTrue(System.Length(LClientShares[0]) > 0, 'a real client key share was sent');
+  CheckFalse(AreEqual(LClientShares[0], LClientShares[1]),
+    'two connections never send the same client key share');
+  CheckFalse(AreEqual(LServerShares[0], LServerShares[1]),
+    'two connections never send the same server key share');
 end;
 
 initialization

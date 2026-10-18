@@ -19,19 +19,24 @@ interface
 
 uses
   SysUtils,
+  Classes,
 {$IFDEF FPC}
   fpcunit,
   testregistry,
 {$ELSE}
   TestFramework,
 {$ENDIF FPC}
+{$IF DEFINED(FPC) AND DEFINED(UNIX)}
+  BaseUnix,
+{$ELSEIF DEFINED(POSIX)}
+  Posix.SysStat,
+{$IFEND}
   TlpCryptoDomainTypes,
   TlpPem,
   TlpICryptoProvider,
   TlpISecretBuffer,
   TlpIWireWriter,
   TlpWireWriter,
-  TlpWireVectorMarker,
   TlpEchConfig,
   TlpInMemoryEchKeyStore,
   TlpIEch,
@@ -50,21 +55,47 @@ type
   strict private
     function BuildHttpsRdata(APriority: UInt16; AIncludeEch: Boolean;
       const AEchConfigList: TBytes): TBytes;
+    /// <summary>A ServiceMode record whose TargetName is four 62-octet labels and a last label of
+    /// ALastLabelLength, so its wire length is 254 + ALastLabelLength, followed by an ech value.</summary>
+    function BuildNameRdata(ALastLabelLength: Int32): TBytes;
     function BuildEchConfigFor(out APublicKey: TBytes;
       out APrivateKey: ISecretBuffer): TEchConfig;
+    /// <summary>Asserts APath is owner-only: mode 0600 on POSIX, and on Windows a protected access
+    /// list granting only the owner. A failure to read it fails the test rather than skipping.</summary>
+    procedure CheckOwnerOnly(const APath, AWhat: string);
   published
+    procedure TestKeyGenWritesPrivateFileOwnerOnly;
+    procedure TestKeyGenRefusesToOverwriteAnExistingKeyFile;
+    procedure TestKeyGenReportsAnUncreatableKeyFile;
+    procedure TestKeyGenWritesAnEmptyPrivateFile;
     procedure TestKeyGenPemRoundTripsThroughStore;
     procedure TestKeyGenKeyPairSealsAndOpens;
+    procedure TestKeyGenDnsLineNamesOrigin;
+    procedure TestKeyGenRejectsInvalidOrigin;
+    procedure TestKeyGenRejectsUnsupportedKem;
+    procedure TestKeyGenRejectsExportOnlyAead;
+    procedure TestKeyGenRejectsUnknownKdf;
+    procedure TestKeyGenDefaultMaximumNameLengthHasAFloorOf64;
+    procedure TestKeyGenDefaultMaximumNameLengthCoversALongerOrigin;
+    procedure TestKeyGenDefaultMaximumNameLengthIgnoresATrailingDot;
+    procedure TestKeyGenDefaultMaximumNameLengthIsCappedAtTheFieldWidth;
+    procedure TestKeyGenAllKemsPemRoundTripThroughStore;
     procedure TestSvcbExtractsEchConfigList;
     procedure TestSvcbAliasModeHasNoEch;
     procedure TestSvcbWithoutEchParamReturnsFalse;
     procedure TestSvcbRejectsOutOfOrderKeys;
     procedure TestSvcbRejectsDuplicateKeys;
+    procedure TestSvcbFailedRecordHandsOutNoEchConfigList;
+    procedure TestSvcbRejectsALabelOver63Octets;
+    procedure TestSvcbRejectsANameOver255Octets;
+    procedure TestSvcbAcceptsANameOf255Octets;
     procedure TestSvcbRejectsTrailingBytes;
     procedure TestSvcbRejectsEmptyEchValue;
+    procedure TestSvcbTruncatedRdataReturnsFalse;
     procedure TestPemKeyMismatchRejected;
     procedure TestFromConfigKeyMismatchRejected;
     procedure TestStoreWithNoRetryEntriesRejected;
+    procedure TestStoreRejectsConfigNoClientCouldUse;
     procedure TestFromConfigSkipsUnsupportedVersion;
     procedure TestFromConfigAllUnsupportedRejected;
     procedure TestKeyMismatchDetectedPastExportOnlySuite;
@@ -72,7 +103,47 @@ type
 
 implementation
 
+{$IFDEF MSWINDOWS}
+const
+  DACL_SECURITY_INFORMATION = 4;
+  SDDL_REVISION_1 = 1;
+
+// the two compilers' Windows units disagree on these or lack them
+function GetFileSecurityW(AName: PWideChar; AInfo: UInt32; ADescriptor: Pointer;
+  ALength: UInt32; out ANeeded: UInt32): LongBool; stdcall;
+  external 'advapi32.dll' name 'GetFileSecurityW';
+function ConvertSecurityDescriptorToStringSecurityDescriptorW(ADescriptor: Pointer;
+  ARevision, AInfo: UInt32; out AText: PWideChar; ALength: Pointer): LongBool; stdcall;
+  external 'advapi32.dll' name 'ConvertSecurityDescriptorToStringSecurityDescriptorW';
+function LocalFree(AMem: Pointer): Pointer; stdcall; external 'kernel32.dll' name 'LocalFree';
+{$ENDIF MSWINDOWS}
+
 { TTestEchTooling }
+
+function TTestEchTooling.BuildNameRdata(ALastLabelLength: Int32): TBytes;
+var
+  LWriter: IWireWriter;
+  LLabel: TBytes;
+  LI: Int32;
+begin
+  SetLength(LLabel, 62);
+  for LI := 0 to 61 do
+    LLabel[LI] := $61;
+  LWriter := TWireWriter.Create;
+  LWriter.WriteUInt16(1);
+  for LI := 1 to 4 do
+  begin
+    LWriter.WriteUInt8(62);
+    LWriter.WriteBytes(LLabel);
+  end;
+  LWriter.WriteUInt8(ALastLabelLength);
+  LWriter.WriteBytes(System.Copy(LLabel, 0, ALastLabelLength));
+  LWriter.WriteUInt8(0);
+  LWriter.WriteUInt16(5);
+  LWriter.WriteUInt16(2);
+  LWriter.WriteBytes(TBytes.Create($AB, $CD));
+  Result := LWriter.ToBytes;
+end;
 
 function TTestEchTooling.BuildHttpsRdata(APriority: UInt16;
   AIncludeEch: Boolean; const AEchConfigList: TBytes): TBytes;
@@ -100,17 +171,172 @@ begin
   Result := LWriter.ToBytes;
 end;
 
+procedure TTestEchTooling.CheckOwnerOnly(const APath, AWhat: string);
+{$IF DEFINED(FPC) AND DEFINED(UNIX)}
+var
+  LInfo: Stat;
+{$ELSEIF DEFINED(POSIX)}
+var
+  LInfo: _stat;
+{$ELSEIF DEFINED(MSWINDOWS)}
+var
+  LPath: UnicodeString;
+  LNeeded: UInt32;
+  LDescriptor: TBytes;
+  LSddl: PWideChar;
+{$IFEND}
+begin
+{$IF DEFINED(FPC) AND DEFINED(UNIX)}
+  CheckEquals(0, FpStat(APath, LInfo), 'stat ' + AWhat);
+  CheckEquals($180, Integer(LInfo.st_mode) and $1FF, AWhat + ' mode is 0600');
+{$ELSEIF DEFINED(POSIX)}
+  CheckEquals(0, stat(PAnsiChar(AnsiString(APath)), LInfo), 'stat ' + AWhat);
+  CheckEquals($180, Integer(LInfo.st_mode) and $1FF, AWhat + ' mode is 0600');
+{$ELSEIF DEFINED(MSWINDOWS)}
+  LPath := UnicodeString(APath);
+  GetFileSecurityW(PWideChar(LPath), DACL_SECURITY_INFORMATION, nil, 0, LNeeded);
+  SetLength(LDescriptor, LNeeded);
+  CheckTrue(GetFileSecurityW(PWideChar(LPath), DACL_SECURITY_INFORMATION, @LDescriptor[0],
+    LNeeded, LNeeded), 'read ' + AWhat + ' access list');
+  CheckTrue(ConvertSecurityDescriptorToStringSecurityDescriptorW(@LDescriptor[0],
+    SDDL_REVISION_1, DACL_SECURITY_INFORMATION, LSddl, nil), 'format ' + AWhat + ' access list');
+  try
+    // protected (nothing inherited from the directory), one entry: full access for the owner
+    CheckEquals('D:P(A;;FA;;;OW)', string(LSddl), AWhat + ' access list');
+  finally
+    LocalFree(LSddl);
+  end;
+{$IFEND}
+end;
+
+procedure TTestEchTooling.TestKeyGenWritesPrivateFileOwnerOnly;
+var
+  LPath: string;
+  LData, LReadBack: TBytes;
+  LStream: TFileStream;
+begin
+  LData := TBytes.Create($01, $02, $03, $04, $05);
+  LPath := TempPath('tlslib_echkey_perm_test.pem');
+  // a key file is never overwritten on POSIX, so clear any leftover from an aborted run
+  if FileExists(LPath) then
+    DeleteFile(LPath);
+  try
+    TEchKeyGenerator.WritePrivateFile(LPath, LData);
+    // the bytes land intact
+    LStream := TFileStream.Create(LPath, fmOpenRead);
+    try
+      SetLength(LReadBack, LStream.Size);
+      if LStream.Size > 0 then
+        LStream.ReadBuffer(LReadBack[0], LStream.Size);
+    finally
+      LStream.Free;
+    end;
+    CheckEqualBytes('the key file round-trips', LData, LReadBack);
+    // owner-only from creation: mode 0600 on POSIX, a protected owner-only access list on Windows
+    CheckOwnerOnly(LPath, 'the key file');
+  finally
+    if FileExists(LPath) then
+      DeleteFile(LPath);
+  end;
+end;
+
+procedure TTestEchTooling.TestKeyGenRefusesToOverwriteAnExistingKeyFile;
+var
+  LPath, LMessage: string;
+  LRefused: Boolean;
+  LStream: TFileStream;
+  LByte: Byte;
+begin
+  LPath := TempPath('tlslib_echkey_exists_test.pem');
+  if FileExists(LPath) then
+    DeleteFile(LPath);
+  try
+    TEchKeyGenerator.WritePrivateFile(LPath, TBytes.Create($01));
+    LRefused := False;
+    LMessage := '';
+    try
+      TEchKeyGenerator.WritePrivateFile(LPath, TBytes.Create($02));
+    except
+      on E: EInOutError do
+      begin
+        LRefused := True;
+        LMessage := E.Message;
+      end;
+    end;
+    CheckTrue(LRefused, 'an existing key file is refused, not overwritten');
+    CheckTrue(Pos(LPath, LMessage) > 0, 'the refusal names the file');
+    // the refusal neither removes nor truncates the file it protects
+    LStream := TFileStream.Create(LPath, fmOpenRead);
+    try
+      CheckEquals(1, Int32(LStream.Size), 'the existing key file is untouched');
+      LStream.ReadBuffer(LByte, 1);
+      CheckEquals($01, LByte, 'and still holds its original byte');
+    finally
+      LStream.Free;
+    end;
+  finally
+    if FileExists(LPath) then
+      DeleteFile(LPath);
+  end;
+end;
+
+procedure TTestEchTooling.TestKeyGenReportsAnUncreatableKeyFile;
+var
+  LPath, LMessage: string;
+  LFailed: Boolean;
+begin
+  LPath := TempPath('tlslib_echkey_no_such_dir_test') + PathDelim + 'key.pem';
+  LFailed := False;
+  LMessage := '';
+  try
+    TEchKeyGenerator.WritePrivateFile(LPath, TBytes.Create($01));
+  except
+    on E: EInOutError do
+    begin
+      LFailed := True;
+      LMessage := E.Message;
+    end;
+  end;
+  CheckTrue(LFailed, 'a path that cannot be created is an I/O error');
+  CheckTrue(Pos(LPath, LMessage) > 0, 'the error names the file');
+  CheckFalse(FileExists(LPath), 'and nothing is left behind');
+end;
+
+procedure TTestEchTooling.TestKeyGenWritesAnEmptyPrivateFile;
+var
+  LPath: string;
+  LStream: TFileStream;
+begin
+  LPath := TempPath('tlslib_echkey_empty_test.pem');
+  if FileExists(LPath) then
+    DeleteFile(LPath);
+  try
+    TEchKeyGenerator.WritePrivateFile(LPath, nil);
+    CheckTrue(FileExists(LPath), 'an empty key still creates the file');
+    LStream := TFileStream.Create(LPath, fmOpenRead);
+    try
+      CheckEquals(0, Int32(LStream.Size), 'and the file is empty');
+    finally
+      LStream.Free;
+    end;
+    CheckOwnerOnly(LPath, 'the empty file');
+  finally
+    if FileExists(LPath) then
+      DeleteFile(LPath);
+  end;
+end;
+
 procedure TTestEchTooling.TestKeyGenPemRoundTripsThroughStore;
 var
   LGen: TEchKeyGenResult;
   LStore: IEchServerKeyStore;
   LEntries: TArray<TEchKeyEntry>;
 begin
-  LGen := TEchKeyGenerator.Generate(Provider, 'public.example', 42,
+  LGen := TEchKeyGenerator.Generate(Crypto, 'public.example', 'secret.example', 42,
     THpkeKem.DHKEM_X25519_HKDF_SHA256, THpkeKdf.HKDF_SHA256,
     THpkeAead.AES_128_GCM, 64);
   // the generated PEM loads through the server key store (PKCS#8 private key + ECHCONFIG)
-  LStore := TInMemoryEchKeyStore.FromPem(LGen.Pem, Provider);
+  LStore := TInMemoryEchKeyStore.FromPem(LGen.Pem, Crypto);
   LEntries := LStore.Entries;
   CheckEquals(1, System.Length(LEntries), 'the store parsed one ECH config');
   CheckEquals(42, LEntries[0].Config.ConfigId, 'the config id round-tripped');
@@ -133,12 +359,12 @@ var
   LOpener: IHpkeOpener;
   LEnc, LPlain, LCipher, LOut: TBytes;
 begin
-  LGen := TEchKeyGenerator.Generate(Provider, 'public.example', 5,
+  LGen := TEchKeyGenerator.Generate(Crypto, 'public.example', 'secret.example', 5,
     THpkeKem.DHKEM_X25519_HKDF_SHA256, THpkeKdf.HKDF_SHA256,
     THpkeAead.AES_128_GCM, 0);
-  LStore := TInMemoryEchKeyStore.FromPem(LGen.Pem, Provider);
+  LStore := TInMemoryEchKeyStore.FromPem(LGen.Pem, Crypto);
   LEntry := LStore.Entries[0];
-  CheckTrue(LEntry.Config.TrySelectSuite(Provider, LSuite),
+  CheckTrue(LEntry.Config.TrySelectSuite(Crypto, LSuite),
     'the config advertises a supported suite');
   // seal to the generated public key, open with the imported private key: a mismatch
   // (a wrong PKCS#8 encode/decode) would fail the AEAD authentication
@@ -150,12 +376,150 @@ begin
   CheckEqualBytes('the generated key pair seals and opens', LPlain, LOut);
 end;
 
+procedure TTestEchTooling.TestKeyGenDnsLineNamesOrigin;
+var
+  LGen: TEchKeyGenResult;
+  LStore: IEchServerKeyStore;
+begin
+  // the DNS line is published at the origin (the name clients connect to), while the public_name
+  // lives only inside the ECHConfig (RFC 9460 2.3 / 9; RFC 9849 sec. 4)
+  LGen := TEchKeyGenerator.Generate(Crypto, 'public.example', 'secret.example', 7,
+    THpkeKem.DHKEM_X25519_HKDF_SHA256, THpkeKdf.HKDF_SHA256, THpkeAead.AES_128_GCM, 0);
+  CheckEquals(1, Pos('secret.example. HTTPS 1 . ech="', LGen.DnsLine),
+    'the DNS line is owned by the origin');
+  CheckEquals(0, Pos('public.example', LGen.DnsLine),
+    'the public_name does not appear in the DNS owner name');
+  LStore := TInMemoryEchKeyStore.FromPem(LGen.Pem, Crypto);
+  CheckEquals('public.example', LStore.Entries[0].Config.PublicName,
+    'the public_name is carried inside the ECHConfig');
+end;
+
+procedure TTestEchTooling.TestKeyGenRejectsInvalidOrigin;
+var
+  LRaised: Boolean;
+begin
+  LRaised := False;
+  try
+    TEchKeyGenerator.Generate(Crypto, 'public.example', 'bad_origin!', 1,
+      THpkeKem.DHKEM_X25519_HKDF_SHA256, THpkeKdf.HKDF_SHA256, THpkeAead.AES_128_GCM, 0);
+  except
+    on E: EArgumentException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'an invalid origin host name is rejected');
+end;
+
+procedure TTestEchTooling.TestKeyGenRejectsUnsupportedKem;
+var
+  LRaised: Boolean;
+begin
+  // x448 is a valid HPKE codepoint but the provider does not build it; the tool must refuse it
+  // up front, not publish a config no server could serve
+  LRaised := False;
+  try
+    TEchKeyGenerator.Generate(Crypto, 'public.example', 'secret.example', 1,
+      THpkeKem.DHKEM_X448_HKDF_SHA512, THpkeKdf.HKDF_SHA512, THpkeAead.AES_256_GCM, 0);
+  except
+    on E: EArgumentException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'an unsupported KEM is rejected');
+end;
+
+procedure TTestEchTooling.TestKeyGenRejectsExportOnlyAead;
+var
+  LRaised: Boolean;
+begin
+  LRaised := False;
+  try
+    TEchKeyGenerator.Generate(Crypto, 'public.example', 'secret.example', 1,
+      THpkeKem.DHKEM_X25519_HKDF_SHA256, THpkeKdf.HKDF_SHA256, THpkeAead.EXPORT_ONLY, 0);
+  except
+    on E: EArgumentException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'an export-only AEAD is rejected');
+end;
+
+procedure TTestEchTooling.TestKeyGenRejectsUnknownKdf;
+var
+  LRaised: Boolean;
+begin
+  LRaised := False;
+  try
+    TEchKeyGenerator.Generate(Crypto, 'public.example', 'secret.example', 1,
+      THpkeKem.DHKEM_X25519_HKDF_SHA256, UInt16($7777), THpkeAead.AES_128_GCM, 0);
+  except
+    on E: EArgumentException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'an unknown KDF is rejected');
+end;
+
+procedure TTestEchTooling.TestKeyGenDefaultMaximumNameLengthHasAFloorOf64;
+begin
+  // a DNS label is at most 63, so 64 pads every single-label name; a shorter origin still gets 64
+  CheckEquals(64, TEchKeyGenerator.DefaultMaximumNameLength('secret.example'),
+    'a short origin gets the floor');
+  CheckEquals(64, TEchKeyGenerator.DefaultMaximumNameLength(StringOfChar('a', 63)),
+    'an origin just under the floor gets the floor');
+  CheckEquals(64, TEchKeyGenerator.DefaultMaximumNameLength(StringOfChar('a', 64)),
+    'an origin exactly at the floor gets the floor');
+end;
+
+procedure TTestEchTooling.TestKeyGenDefaultMaximumNameLengthCoversALongerOrigin;
+begin
+  CheckEquals(65, TEchKeyGenerator.DefaultMaximumNameLength(StringOfChar('a', 65)),
+    'an origin one past the floor is fully padded');
+  CheckEquals(200, TEchKeyGenerator.DefaultMaximumNameLength(StringOfChar('a', 200)),
+    'a long origin is fully padded');
+end;
+
+procedure TTestEchTooling.TestKeyGenDefaultMaximumNameLengthIgnoresATrailingDot;
+begin
+  // the inner SNI is sent without the root dot, so it does not count toward the name length
+  CheckEquals(65, TEchKeyGenerator.DefaultMaximumNameLength(StringOfChar('a', 65) + '.'),
+    'the root dot is not part of the name');
+end;
+
+procedure TTestEchTooling.TestKeyGenDefaultMaximumNameLengthIsCappedAtTheFieldWidth;
+begin
+  CheckEquals(255, TEchKeyGenerator.DefaultMaximumNameLength(StringOfChar('a', 255)),
+    'the field is one octet, so 255 is the largest value');
+  CheckEquals(255, TEchKeyGenerator.DefaultMaximumNameLength(StringOfChar('a', 300)),
+    'a longer name is capped at the field width');
+end;
+
+procedure TTestEchTooling.TestKeyGenAllKemsPemRoundTripThroughStore;
+var
+  LGen: TEchKeyGenResult;
+  LStore: IEchServerKeyStore;
+  LEntries: TArray<TEchKeyEntry>;
+  LKems: TArray<UInt16>;
+  LI: Int32;
+begin
+  // every supported KEM's PEM must load back through the server key store: X25519 and the three EC
+  // curves exercise distinct PKCS#8 encodings (the EC path pads the scalar), so cover all four
+  LKems := TArray<UInt16>.Create(THpkeKem.DHKEM_X25519_HKDF_SHA256,
+    THpkeKem.DHKEM_P256_HKDF_SHA256, THpkeKem.DHKEM_P384_HKDF_SHA384,
+    THpkeKem.DHKEM_P521_HKDF_SHA512);
+  for LI := 0 to System.High(LKems) do
+  begin
+    LGen := TEchKeyGenerator.Generate(Crypto, 'public.example', 'secret.example', 9,
+      LKems[LI], THpkeKdf.HKDF_SHA256, THpkeAead.AES_128_GCM, 0);
+    LStore := TInMemoryEchKeyStore.FromPem(LGen.Pem, Crypto);
+    LEntries := LStore.Entries;
+    CheckEquals(1, System.Length(LEntries), 'the store parsed one ECH config');
+    CheckEquals(LKems[LI], LEntries[0].Config.KemId, 'the KEM round-tripped');
+  end;
+end;
+
 procedure TTestEchTooling.TestSvcbExtractsEchConfigList;
 var
   LGen: TEchKeyGenResult;
   LRdata, LOut: TBytes;
 begin
-  LGen := TEchKeyGenerator.Generate(Provider, 'public.example', 1,
+  LGen := TEchKeyGenerator.Generate(Crypto, 'public.example', 'secret.example', 1,
     THpkeKem.DHKEM_X25519_HKDF_SHA256, THpkeKdf.HKDF_SHA256,
     THpkeAead.AES_128_GCM, 0);
   LRdata := BuildHttpsRdata(1, True, LGen.EchConfigList);
@@ -166,12 +530,17 @@ end;
 
 procedure TTestEchTooling.TestSvcbAliasModeHasNoEch;
 var
+  LGen: TEchKeyGenResult;
   LRdata, LOut: TBytes;
 begin
-  // priority 0 is AliasMode and carries no SvcParams
-  LRdata := BuildHttpsRdata(0, False, nil);
+  // priority 0 is AliasMode: an ech SvcParam it carries is ignored, never handed out
+  LGen := TEchKeyGenerator.Generate(Crypto, 'public.example', 'secret.example', 1,
+    THpkeKem.DHKEM_X25519_HKDF_SHA256, THpkeKdf.HKDF_SHA256,
+    THpkeAead.AES_128_GCM, 0);
+  LRdata := BuildHttpsRdata(0, True, LGen.EchConfigList);
   CheckFalse(TEchConfigFromSvcb.TryFromServiceBinding(LRdata, LOut),
-    'AliasMode yields no ECHConfigList');
+    'AliasMode yields no ECHConfigList even with an ech SvcParam present');
+  CheckEquals(0, System.Length(LOut), 'nothing is handed out');
 end;
 
 procedure TTestEchTooling.TestSvcbWithoutEchParamReturnsFalse;
@@ -219,6 +588,67 @@ begin
     'duplicate SvcParam keys are rejected');
 end;
 
+procedure TTestEchTooling.TestSvcbFailedRecordHandsOutNoEchConfigList;
+var
+  LWriter: IWireWriter;
+  LOut: TBytes;
+begin
+  // the ech value is read before a later key is found out of order: the record is rejected, and
+  // the list read on the way must not be handed out with the False
+  LWriter := TWireWriter.Create;
+  LWriter.WriteUInt16(1);
+  LWriter.WriteUInt8(0);
+  LWriter.WriteUInt16(5);  // ech
+  LWriter.WriteUInt16(2);
+  LWriter.WriteBytes(TBytes.Create($AB, $CD));
+  LWriter.WriteUInt16(3);  // descending
+  LWriter.WriteUInt16(0);
+  CheckFalse(TEchConfigFromSvcb.TryFromServiceBinding(LWriter.ToBytes, LOut),
+    'the mis-ordered record is rejected');
+  CheckEquals(0, System.Length(LOut), 'no ECHConfigList comes out with the False');
+end;
+
+procedure TTestEchTooling.TestSvcbRejectsALabelOver63Octets;
+var
+  LWriter: IWireWriter;
+  LOut: TBytes;
+begin
+  // a length byte above 63 is a compression pointer or a corrupt label (RFC 9460 sec. 2.2 forbids
+  // pointers here), not a label to skip
+  LWriter := TWireWriter.Create;
+  LWriter.WriteUInt16(1);
+  LWriter.WriteUInt8(64);
+  LWriter.WriteBytes(TBytes.Create($61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61,
+    $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61,
+    $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61,
+    $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61, $61));
+  LWriter.WriteUInt8(0);
+  LWriter.WriteUInt16(5);
+  LWriter.WriteUInt16(2);
+  LWriter.WriteBytes(TBytes.Create($AB, $CD));
+  CheckFalse(TEchConfigFromSvcb.TryFromServiceBinding(LWriter.ToBytes, LOut),
+    'a 64-octet label is rejected');
+end;
+
+procedure TTestEchTooling.TestSvcbRejectsANameOver255Octets;
+var
+  LOut: TBytes;
+begin
+  // four 62-octet labels and one of 2 make a 256-octet name on the wire, one past the limit
+  CheckFalse(TEchConfigFromSvcb.TryFromServiceBinding(BuildNameRdata(2), LOut),
+    'a name over 255 octets is rejected');
+end;
+
+procedure TTestEchTooling.TestSvcbAcceptsANameOf255Octets;
+var
+  LOut: TBytes;
+begin
+  // the same name with a last label of 1 is exactly 255 octets, which a name may be
+  CheckTrue(TEchConfigFromSvcb.TryFromServiceBinding(BuildNameRdata(1), LOut),
+    'a name of 255 octets is accepted');
+  CheckEqualBytes('the ech value comes out', TBytes.Create($AB, $CD), LOut);
+end;
+
 procedure TTestEchTooling.TestSvcbRejectsTrailingBytes;
 var
   LWriter: IWireWriter;
@@ -253,6 +683,23 @@ begin
     'an empty ech SvcParam value yields no usable config');
 end;
 
+procedure TTestEchTooling.TestSvcbTruncatedRdataReturnsFalse;
+var
+  LWriter: IWireWriter;
+  LOut: TBytes;
+begin
+  // an ech SvcParam whose declared value length runs past the RDATA is a truncated resolver
+  // answer: a plain "no usable ech" (a wire-decode error), never a raised fault
+  LWriter := TWireWriter.Create;
+  LWriter.WriteUInt16(1);
+  LWriter.WriteUInt8(0);
+  LWriter.WriteUInt16(5);  // ech
+  LWriter.WriteUInt16(10); // claims 10 bytes but only 2 follow
+  LWriter.WriteBytes(TBytes.Create($AB, $CD));
+  CheckFalse(TEchConfigFromSvcb.TryFromServiceBinding(LWriter.ToBytes, LOut),
+    'a truncated ech SvcParam value yields no usable config');
+end;
+
 procedure TTestEchTooling.TestPemKeyMismatchRejected;
 var
   LGen1, LGen2: TEchKeyGenResult;
@@ -274,10 +721,10 @@ var
 begin
   // pair one config's PRIVATE KEY with a different config's ECHCONFIG: the store must reject the
   // mismatch at load, not accept a store that would silently reject every ECH handshake
-  LGen1 := TEchKeyGenerator.Generate(Provider, 'a.example', 1,
+  LGen1 := TEchKeyGenerator.Generate(Crypto, 'a.example', 'a-origin.example', 1,
     THpkeKem.DHKEM_X25519_HKDF_SHA256, THpkeKdf.HKDF_SHA256,
     THpkeAead.AES_128_GCM, 0);
-  LGen2 := TEchKeyGenerator.Generate(Provider, 'b.example', 2,
+  LGen2 := TEchKeyGenerator.Generate(Crypto, 'b.example', 'b-origin.example', 2,
     THpkeKem.DHKEM_X25519_HKDF_SHA256, THpkeKdf.HKDF_SHA256,
     THpkeAead.AES_128_GCM, 0);
   LBlocks1 := TPem.ReadBlocks(LGen1.Pem);
@@ -288,7 +735,7 @@ begin
   LMixedPem := TPem.WriteBlocks(LMixed);
   LRaised := False;
   try
-    TInMemoryEchKeyStore.FromPem(LMixedPem, Provider);
+    TInMemoryEchKeyStore.FromPem(LMixedPem, Crypto);
   except
     on E: EArgumentTlsLibException do
       LRaised := True;
@@ -301,7 +748,7 @@ function TTestEchTooling.BuildEchConfigFor(out APublicKey: TBytes;
 var
   LSuite: TEchCipherSuite;
 begin
-  Provider.Hpke.GenerateKeyPair(THpkeKem.DHKEM_X25519_HKDF_SHA256,
+  Crypto.Hpke.GenerateKeyPair(THpkeKem.DHKEM_X25519_HKDF_SHA256,
     APublicKey, APrivateKey);
   LSuite.KdfId := THpkeKdf.HKDF_SHA256;
   LSuite.AeadId := THpkeAead.AES_128_GCM;
@@ -325,7 +772,7 @@ begin
   LRaised := False;
   try
     // the config's public key is LPub1, but LSk2 is a different key
-    TInMemoryEchKeyStore.FromConfig(LConfigList, LSk2, Provider);
+    TInMemoryEchKeyStore.FromConfig(LConfigList, LSk2, Crypto);
   except
     on E: EArgumentTlsLibException do
       LRaised := True;
@@ -339,22 +786,80 @@ var
   LPub: TBytes;
   LSk: ISecretBuffer;
   LEntries: TArray<TEchKeyEntry>;
+  LStore: IEchServerKeyStore;
   LRaised: Boolean;
 begin
   SetLength(LEntries, 1);
   LEntries[0].Config := BuildEchConfigFor(LPub, LSk);
-  LEntries[0].RecipientKey := Provider.Hpke.ImportRecipientKey(
+  LEntries[0].RecipientKey := Crypto.Hpke.ImportRecipientKey(
     THpkeKem.DHKEM_X25519_HKDF_SHA256, LSk);
   LEntries[0].IsRetry := False; // a store that advertises no retry_configs
   LRaised := False;
   try
-    TInMemoryEchKeyStore.Create(LEntries);
+    LStore := TInMemoryEchKeyStore.Create(LEntries) as IEchServerKeyStore;
   except
     on E: EArgumentTlsLibException do
       LRaised := True;
   end;
   CheckTrue(LRaised,
     'a non-empty store with no is_retry entry is rejected (RFC 9849 7.1)');
+end;
+
+procedure TTestEchTooling.TestStoreRejectsConfigNoClientCouldUse;
+var
+  LPub: TBytes;
+  LSk: ISecretBuffer;
+  LSuite: TEchCipherSuite;
+  LEntries: TArray<TEchKeyEntry>;
+  LMandatory, LDupA, LDupB: TEchConfigExtension;
+
+  function Refused(const AConfig: TEchConfig): Boolean;
+  var
+    LStore: IEchServerKeyStore;
+  begin
+    SetLength(LEntries, 1);
+    LEntries[0].Config := AConfig;
+    LEntries[0].RecipientKey := Crypto.Hpke.ImportRecipientKey(
+      THpkeKem.DHKEM_X25519_HKDF_SHA256, LSk);
+    LEntries[0].IsRetry := True;
+    Result := False;
+    try
+      LStore := TInMemoryEchKeyStore.Create(LEntries) as IEchServerKeyStore;
+    except
+      on E: EArgumentTlsLibException do
+        Result := Pos('no client could use', E.Message) > 0;
+    end;
+  end;
+
+begin
+  BuildEchConfigFor(LPub, LSk);
+  LSuite.KdfId := THpkeKdf.HKDF_SHA256;
+  LSuite.AeadId := THpkeAead.AES_128_GCM;
+  LMandatory.ExtType := $8001;
+  LMandatory.Data := nil;
+  LDupA.ExtType := $0042;
+  LDupA.Data := nil;
+  LDupB := LDupA;
+  // each of these is advertised and then skipped by every client
+  CheckTrue(Refused(TEchConfig.Build(TEchConfig.SupportedVersion, 3,
+    THpkeKem.DHKEM_X25519_HKDF_SHA256, LPub, TArray<TEchCipherSuite>.Create(LSuite), 0,
+    TEncoding.ASCII.GetBytes('p.example'), TArray<TEchConfigExtension>.Create(LMandatory))),
+    'a mandatory extension (high bit set) is refused');
+  CheckTrue(Refused(TEchConfig.Build(TEchConfig.SupportedVersion, 3,
+    THpkeKem.DHKEM_X25519_HKDF_SHA256, LPub, TArray<TEchCipherSuite>.Create(LSuite), 0,
+    TEncoding.ASCII.GetBytes('p.example'), TArray<TEchConfigExtension>.Create(LDupA, LDupB))),
+    'a duplicated extension type is refused');
+  CheckTrue(Refused(TEchConfig.Build(TEchConfig.SupportedVersion, 3,
+    THpkeKem.DHKEM_X25519_HKDF_SHA256, LPub, TArray<TEchCipherSuite>.Create(LSuite), 0,
+    TEncoding.ASCII.GetBytes('bad_name.example'), nil)),
+    'an invalid public_name is refused');
+  CheckTrue(Refused(TEchConfig.Build(TEchConfig.SupportedVersion, 3,
+    THpkeKem.DHKEM_X25519_HKDF_SHA256, LPub, nil, 0,
+    TEncoding.ASCII.GetBytes('p.example'), nil)), 'a config with no cipher suite is refused');
+  // control: the same shape without the defect is accepted
+  CheckFalse(Refused(TEchConfig.Build(TEchConfig.SupportedVersion, 3,
+    THpkeKem.DHKEM_X25519_HKDF_SHA256, LPub, TArray<TEchCipherSuite>.Create(LSuite), 0,
+    TEncoding.ASCII.GetBytes('p.example'), nil)), 'a servable config is accepted');
 end;
 
 procedure TTestEchTooling.TestFromConfigSkipsUnsupportedVersion;
@@ -375,7 +880,7 @@ begin
     TEncoding.ASCII.GetBytes('b.example'), nil);
   LConfigList := TEchConfigList.Encode(
     TArray<TEchConfig>.Create(LStale, LSupported));
-  LStore := TInMemoryEchKeyStore.FromConfig(LConfigList, LSk, Provider);
+  LStore := TInMemoryEchKeyStore.FromConfig(LConfigList, LSk, Crypto);
   CheckEquals(1, System.Length(LStore.Entries),
     'only the supported-version config becomes a key');
 end;
@@ -399,7 +904,7 @@ begin
   LRaised := False;
   try
     // a list with no config of a version this library serves must not yield an empty store
-    TInMemoryEchKeyStore.FromConfig(LConfigList, LSk, Provider);
+    TInMemoryEchKeyStore.FromConfig(LConfigList, LSk, Crypto);
   except
     on E: EArgumentTlsLibException do
       LRaised := True;
@@ -430,7 +935,7 @@ begin
   LRaised := False;
   try
     // the check must skip the export-only suite and still detect the mismatched key
-    TInMemoryEchKeyStore.FromConfig(LConfigList, LSk2, Provider);
+    TInMemoryEchKeyStore.FromConfig(LConfigList, LSk2, Crypto);
   except
     on E: EArgumentTlsLibException do
       LRaised := True;

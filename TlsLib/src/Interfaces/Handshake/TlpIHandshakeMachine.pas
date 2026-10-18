@@ -20,8 +20,13 @@ uses
   TlpTlsAlert,
   TlpTlsVersion,
   TlpITlsEngine,
+  TlpHandshakeStage,
+  TlpHandshakeMessages,
   TlpHandshakeMessage,
-  TlpHandshakeEffect;
+  TlpHandshakeEffect,
+  TlpTrustPolicy,
+  TlpIKeySchedule,
+  TlpIRecordProtection;
 
 type
   /// <summary>
@@ -32,18 +37,22 @@ type
   /// by raising.
   /// </summary>
   IHandshakeMachine = interface(IInterface)
-    ['{4B9E2C71-6A05-4D38-8F14-3E7C0B5A92D6}']
+    ['{D797ED55-685B-4FD7-8CD6-5F1A0DB03060}']
     /// <summary>Whether this endpoint initiates the handshake (a client sending the first
     /// ClientHello) rather than responding to it (a server). Drives the initial
-    /// legacy_record_version (RFC 8446 5.1).</summary>
+    /// legacy_record_version (RFC 9846 5.1).</summary>
     function Initiates: Boolean;
+    /// <summary>The coarse handshake stage (Handshaking / ParkedForVerdict / Connected), read by
+    /// the engine and conductor to gate KeyUpdate, exporter availability, and completion without
+    /// scanning effects or proxy flags.</summary>
+    function Stage: THandshakeStage;
     function Start: TArray<THandshakeEffect>;
     function ProcessMessage(const AMessage: TTlsHandshakeMessage)
       : TArray<THandshakeEffect>;
     /// <summary>Initiates a post-handshake KeyUpdate (TLS 1.3 only), returning the effects
     /// the driver applies. A no-op (empty) for machines/versions without KeyUpdate or when
     /// the connection is not yet established.</summary>
-    function RequestKeyUpdate(ARequestPeerUpdate: Boolean): TArray<THandshakeEffect>;
+    function RequestKeyUpdate(ARequest: TKeyUpdateRequest): TArray<THandshakeEffect>;
     /// <summary>Emits the one coalesced response owed to a peer update_requested, if any;
     /// the engine flushes it just before the next application write. Empty when none is
     /// pending or the machine/version has no KeyUpdate.</summary>
@@ -54,15 +63,35 @@ type
     /// initial-certificate park (the buffered server flight drives that) and for every
     /// machine/version that does not park at a message-less point.</summary>
     function ResumeAfterVerdict: TArray<THandshakeEffect>;
-    /// <summary>Exported keying material over the established secrets (RFC 8446 7.5 / RFC
-    /// 5705). Empty unless CanExportKeyingMaterial (the exporter secret has been derived).</summary>
+    /// <summary>Exported keying material over the established secrets with no context value (RFC
+    /// 9846 7.5 / RFC 5705). Empty unless CanExportKeyingMaterial (the exporter secret has been
+    /// derived).</summary>
+    function ExportKeyingMaterial(const ALabel: string;
+      ALength: Int32): TBytes; overload;
+    /// <summary>Exported keying material over the established secrets bound to AContext (empty
+    /// allowed, distinct from no context; RFC 9846 7.5 / RFC 5705). Empty unless
+    /// CanExportKeyingMaterial (the exporter secret has been derived).</summary>
     function ExportKeyingMaterial(const ALabel: string; const AContext: TBytes;
-      AUseContext: Boolean; ALength: Int32): TBytes;
+      ALength: Int32): TBytes; overload;
     /// <summary>Whether the exporter secret is available: for a TLS 1.3 server that is true in
-    /// half-RTT (after it sent its Finished), before the peer's Finished (RFC 8446 7.5); TLS 1.2
-    /// stays gated on completion. The client withholds it while a reverify-on-resume verdict is
-    /// still open.</summary>
+    /// half-RTT (after it sent its Finished), before the peer's Finished (RFC 9846 7.5); TLS 1.2
+    /// stays gated on completion. Never available while the machine is parked on an out-of-band
+    /// peer-certificate verdict (Stage = ParkedForVerdict) - neither side exports over a peer
+    /// identity still being decided.</summary>
     function CanExportKeyingMaterial: Boolean;
+    /// <summary>Early-data (0-RTT) keying material (RFC 9846 7.5). TLS 1.3 only: available on a
+    /// client from when it offers 0-RTT until the server rejects it, and on a server once it accepts
+    /// 0-RTT; empty otherwise, once 0-RTT is rejected, on TLS 1.2, and on a failed connection.</summary>
+    function ExportEarlyKeyingMaterial(const ALabel: string; const AContext: TBytes;
+      ALength: Int32): TBytes;
+    /// <summary>Whether the early_exporter_secret is available (see
+    /// ExportEarlyKeyingMaterial).</summary>
+    function CanExportEarlyKeyingMaterial: Boolean;
+    /// <summary>Called once the connection ended in a fatal alert, sent or received: drops the
+    /// resumable sessions and tickets this connection stored or minted, so a failed connection is
+    /// never resumed (RFC 5246 7.2.2, RFC 9846 6). A resumption the peer never proved is left alone.
+    /// Idempotent; a stateless ticket holds nothing to drop.</summary>
+    procedure ForgetSessionsOnFatal;
   end;
 
   /// <summary>
@@ -71,19 +100,30 @@ type
   /// this to bridge the handshake to its own queues.
   /// </summary>
   IHandshakeSink = interface(IInterface)
-    ['{8D3F6A24-5C90-4E71-B2A6-1F4E0C7B85D3}']
+    ['{DBD1663E-3E27-4B45-BD70-EC6B3BBEB1DA}']
     procedure OnHandshakeEvent(AEvent: TTlsEventKind);
-    procedure OnAlpnSelected(const AProtocol: string);
+    procedure OnAlpnSelected(const AProtocol: TBytes);
     procedure OnOcspStapleReceived(const AStaple: TBytes);
     procedure OnHandshakeEstablished;
-    procedure OnHandshakeFailed(AAlert: TTlsAlertDescription);
+    procedure OnHandshakeFailed(AAlert: TTlsAlertDescription; const AReason: string);
+  end;
+
+  /// <summary>
+  /// An optional companion the driver reaches with Supports on the sink to emit a warning-level
+  /// alert the machine chose to raise without failing (e.g. no_renegotiation): the engine writes
+  /// it under the current epoch and stays live. Kept off IHandshakeSink so existing sinks (and
+  /// their test doubles) need not implement it; only the engine bridge does.
+  /// </summary>
+  IWarningAlertSink = interface(IInterface)
+    ['{4A9E2C71-6D38-4B05-9F17-3C8A0E5B7D42}']
+    procedure OnWarningAlert(AAlert: TTlsAlertDescription);
   end;
 
   /// <summary>
   /// An optional companion the driver reaches with Supports on the sink to report the
   /// negotiated protocol version once an epoch's keys are installed. Kept off IHandshakeSink
   /// so existing sinks (and their test doubles) need not implement it; only the engine bridge
-  /// does, surfacing the version on ITlsEngine.NegotiatedVersion.
+  /// does, surfacing the version on ITlsEngine.ConnectionInfo.
   /// </summary>
   IHandshakeVersionSink = interface(IInterface)
     ['{5E7A1C63-2D48-4F91-8B0A-6C3E5D7F1A29}']
@@ -92,35 +132,43 @@ type
 
   /// <summary>
   /// An optional companion the driver reaches with Supports on the sink to report that the
-  /// handshake has parked for an out-of-band peer-certificate verdict (RFC 8446 - the
+  /// handshake has parked for an out-of-band peer-certificate verdict (the library's
   /// deferred-verdict seam). The driver hands over the peer chain (leaf first, DER) and the
   /// expected host name; the host later resumes with the engine's SetCertificateVerdict.
   /// Kept off IHandshakeSink so existing sinks (and their test doubles) need not implement
   /// it; only the engine bridge does, when async certificate verdicts are enabled.
   /// </summary>
   IHandshakeVerdictSink = interface(IInterface)
-    ['{6F1B4D28-7A93-4C05-9E16-2D7C4B8F0A31}']
-    procedure OnCertificateVerdictNeeded(const AChain: TArray<TBytes>;
-      const AHostName: string; const AStaple: TBytes);
+    ['{359BC235-C73B-450D-83CC-38475B5F5C71}']
+    procedure OnCertificateVerdictNeeded(const AChain, AValidatedPath: TArray<TBytes>;
+      const AHostName: string; const AStaple: TBytes; APosture: TRevocationPosture);
   end;
 
   /// <summary>
   /// An optional companion the driver reaches with Supports on the sink to report read-only
-  /// connection-info the negotiation resolved (currently the validated peer certificate
-  /// chain). Kept off IHandshakeSink so existing sinks and their test doubles need not
-  /// implement it; only the engine bridge does, surfacing it on ITlsEngine.
+  /// connection-info the negotiation resolved (currently the peer certificate chain as presented
+  /// and the path the pipeline validated). Kept off IHandshakeSink so existing sinks and their test
+  /// doubles need not implement it; only the engine bridge does, surfacing it on ITlsEngine.ConnectionInfo.
   /// </summary>
   IHandshakeConnectionInfoSink = interface(IInterface)
-    ['{2B8D5F14-9C60-4A73-B1E8-4F0A7C6D3B95}']
-    procedure OnPeerCertificateChain(const AChain: TArray<TBytes>);
+    ['{C198C67C-A830-4CC0-9D96-A85378713FA5}']
+    procedure OnPeerCertificateChain(const AChain, AValidatedPath: TArray<TBytes>);
     /// <summary>Reports the DER DistinguishedName certificate_authorities a peer named in its
-    /// CertificateRequest (RFC 8446 4.2.4 / RFC 5246 7.4.4) - surfaced read-only on ITlsEngine.</summary>
-    procedure OnRequestedCertificateAuthorities(const AAuthorities: TArray<TBytes>);
+    /// CertificateRequest (RFC 9846 4.3.4 / RFC 5246 7.4.4) and the signature_algorithms it listed -
+    /// surfaced read-only on ITlsEngine.ConnectionInfo.</summary>
+    procedure OnRequestedCertificateAuthorities(const AAuthorities: TArray<TBytes>;
+      const ASchemes: TArray<UInt16>);
+    /// <summary>Reports the identity of the pre-shared key that authenticated the connection - surfaced
+    /// read-only on ITlsEngine.ConnectionInfo.</summary>
+    procedure OnPskIdentity(const AIdentity: TBytes);
     /// <summary>Reports the negotiated cipher suite, named group (0 when none / non-(EC)DHE),
-    /// whether the handshake resumed, and the SNI server_name in play (the host a client
-    /// requested, as seen by a server; empty when none) - surfaced read-only on ITlsEngine.</summary>
-    procedure OnConnectionParams(ACipherSuite, ANamedGroup: UInt16; AResumed: Boolean;
-      const AServerName: string);
+    /// whether the handshake resumed, whether the session used Extended Master Secret (RFC 7627;
+    /// always true on TLS 1.3), and the SNI server_name in play (the host a client requested, as
+    /// seen by a server; empty when none), plus the handshake's AFacts - surfaced read-only on
+    /// ITlsEngine.ConnectionInfo.</summary>
+    procedure OnConnectionParams(ACipherSuite, ANamedGroup: UInt16;
+      AResumed, AExtendedMasterSecret: Boolean; const AServerName: string;
+      const AFacts: TNegotiationFacts);
   end;
 
   /// <summary>
@@ -138,6 +186,89 @@ type
     procedure OnEchBackend;
     procedure OnEchServerRejected;
     procedure OnEchRejected(const ARetryConfigs: TBytes; AIsRetryAttempt: Boolean);
+  end;
+
+  /// <summary>
+  /// Makes a TLS 1.3 client machine emit a supplied framed ClientHello verbatim instead of
+  /// building one, for byte-exact replay of a recorded trace (RFC 8448 vectors, whose hello's
+  /// extension order and padding differ from a built one). Reached with Supports on the machine;
+  /// kept off IHandshakeMachine, and not reachable through a factory-built engine (which never
+  /// exposes its machine). A verbatim ClientHello offers no PSK and no ECH, so the setter rejects
+  /// a machine configured with either.
+  /// </summary>
+  ITls13ClientReplay = interface(IInterface)
+    ['{7B0BCE0E-3CA0-47DA-A65F-76FC641C20E9}']
+    procedure SetVerbatimClientHello(const AFramed: TBytes);
+  end;
+
+  /// <summary>
+  /// Makes a TLS 1.3 server machine emit supplied HelloRetryRequest cookie / EncryptedExtensions /
+  /// Certificate / CertificateVerify bytes verbatim, for byte-exact replay of a recorded trace (a
+  /// produced CertificateVerify carries a random RSA-PSS salt, and the RFC 8448 EncryptedExtensions
+  /// and cookie are bound to that trace). Reached with Supports on the machine; kept off
+  /// IHandshakeMachine, and not reachable through a factory-built engine (which never exposes its
+  /// machine). Each empty value leaves that message built normally.
+  /// </summary>
+  ITls13ServerReplay = interface(IInterface)
+    ['{C8DC8971-07BB-4A26-9F0D-F6DADA0CC137}']
+    procedure SetVerbatimRetryCookie(const ACookie: TBytes);
+    procedure SetVerbatimEncryptedExtensions(const AFramed: TBytes);
+    procedure SetVerbatimCertificate(const AFramed: TBytes);
+    procedure SetVerbatimCertificateVerify(const AFramed: TBytes);
+  end;
+
+  /// <summary>
+  /// The internal seam the handshake driver uses to install record-protection
+  /// epochs as they become available, turning the plaintext engine into a
+  /// protected one and, on the write side, marking the handshake established.
+  /// Deliberately kept off the public ITlsEngine surface (a caller never installs
+  /// epochs directly); reach it with Supports(engine, IRecordEpochInstaller, x).
+  /// </summary>
+  IRecordEpochInstaller = interface(IInterface)
+    ['{246A6265-F4D7-4490-8DB5-8FCB9B2F71A6}']
+    procedure InstallReadProtection(const AProtection: IRecordProtection);
+    /// <summary>Installs the write epoch AEpoch's protection. The engine gates application writes
+    /// on the Application epoch, which a TLS 1.3 server reaches at its Finished (half-RTT).</summary>
+    procedure InstallWriteProtection(const AProtection: IRecordProtection;
+      AEpoch: TTlsEpoch);
+    /// <summary>
+    /// Arms a read epoch to activate on the peer's next change_cipher_spec instead of
+    /// immediately (the TLS 1.2 read-cipher switch, RFC 5246 7.1). The active read epoch
+    /// stays put until that plaintext CCS is consumed, so a peer's plaintext alert sent
+    /// before its CCS is read under the right epoch. TLS 1.3 installs the read epoch
+    /// directly via InstallReadProtection; only TLS 1.2 read installs use this.
+    /// </summary>
+    procedure ArmReadProtectionOnChangeCipherSpec(const AProtection: IRecordProtection);
+    /// <summary>
+    /// Reverts the write epoch to plaintext, abandoning an installed early-data write
+    /// protection when a HelloRetryRequest rejects offered 0-RTT (RFC 9846 4.3.10): the
+    /// second ClientHello and the rest of the client's flight are sent in the clear.
+    /// </summary>
+    procedure RevertWriteToPlaintext;
+    /// <summary>Applies the raw negotiated record_size_limit values (RFC 8449
+    /// TLSInnerPlaintext caps); 0 means the extension was not negotiated.</summary>
+    procedure SetRecordSizeLimit(AOutboundLimit, AInboundLimit: Int32);
+    /// <summary>
+    /// Enters the 0-RTT reject skip mode (RFC 9846 4.3.10): undecryptable early-data
+    /// application records are dropped, up to AMaxBytes, until a record decrypts under
+    /// the installed epoch. Used when the server rejects offered early data.
+    /// </summary>
+    procedure SetEarlyDataSkip(AMaxBytes: Int32);
+    /// <summary>
+    /// Caps outbound 0-RTT at the ticket's max_early_data (RFC 9846 4.7.1): the client
+    /// sends at most AMaxBytes of early data; WriteEarlyData returns how much was accepted and
+    /// the caller resends the rest as 1-RTT once the handshake completes. Set when the client
+    /// opens the early-data write window.
+    /// </summary>
+    procedure SetEarlyDataLimit(AMaxBytes: Int32);
+    /// <summary>
+    /// Opens (AActive) or closes the accepted-0-RTT early-data read window (RFC 9846 4.3.10):
+    /// while open, an application_data record legitimately precedes the handshake completion.
+    /// A server opens it on installing the early read keys, with the ticket's
+    /// max_early_data_size as AMaxBytes (early data beyond it is fatal, RFC 9846 4.7.1), and
+    /// closes it at EndOfEarlyData.
+    /// </summary>
+    procedure SetEarlyReadEpoch(AActive: Boolean; AMaxBytes: Int32);
   end;
 
 implementation

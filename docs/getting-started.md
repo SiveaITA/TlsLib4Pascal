@@ -18,8 +18,8 @@ CryptoLib4Pascal/CryptoLib/src/Packages/FPC/CryptoLib4PascalPackage.lpk
 TlsLib4Pascal/TlsLib/src/Packages/FPC/TlsLib4PascalPackage.lpk
 ```
 
-**Delphi.** Add the matching `.dpk`/`.dproj` under each library's `Packages/Delphi/`, or just add the
-libraries `src` roots to your project search path. The core package is
+**Delphi.** Add the matching `.dpk` under each library's `Packages/Delphi/`, or add every
+subdirectory of each library's `src` to your project search path. The core package is
 `TlsLib/src/Packages/Delphi/TlsLib4PascalPackage.dpk`.
 
 Add an **optional** package only when you use its feature:
@@ -28,28 +28,36 @@ Add an **optional** package only when you use its feature:
 |---|---|
 | Verify against the OS root store | `TlsLib.Trust.System` |
 | An offline PEM CA bundle (loader) | `TlsLib.Trust.Bundle` |
-| Live OCSP/CRL over real sockets | the `TlpSocketHttpFetcher` unit (in `TlsLib.Net/`) |
+| OS-native crypto primitives for the handshake | `TlsLib.Crypto.System` |
+| Live OCSP/CRL over real sockets | the `TlpSocketHttpFetcher` unit (package `TlsLib.Net`) |
+| A TCP client or listener to run a `TTlsConnection` over | the `TlpNetSocket` unit (package `TlsLib.Net`) |
+| An ECH config list from a DNS HTTPS/SVCB record | the `TlpEchConfigFromSvcb` unit (package `TlsLib.Net`) |
 | A mORMot / Indy / Synapse / fcl-net drop-in | the matching `TlsLib.Adapter.*` |
 
 The core references none of these — a build that doesn't use them links none of them.
 
-## 2. The one object everything needs: the provider
+## 2. The objects everything needs: the providers
 
-Every entry point takes an `ICryptoProvider`. The default is a plain constructed instance — there is
-no global singleton to install:
+Every builder entry point takes an `ICryptoProvider` (crypto primitives + CSPRNG) and an
+`IPkixProvider` (certificate parsing + path validation). The defaults are plain constructed instances —
+nothing needs installing globally:
 
 ```pascal
-uses TlpDefaultCryptoProvider, TlpICryptoProvider;
+uses TlpDefaultCryptoProvider, TlpDefaultPkixProvider, TlpICryptoProvider, TlpIPkixProvider;
 
-var P: ICryptoProvider;
+var
+  Crypto: ICryptoProvider;
+  Pkix: IPkixProvider;
 begin
-  P := TDefaultCryptoProvider.Create as ICryptoProvider;
-  // reuse P across as many configs/connections as you like; it holds no per-connection state
+  Crypto := TDefaultCryptoProvider.Create as ICryptoProvider;
+  Pkix := TDefaultPkixProvider.Create as IPkixProvider;
+  // reuse Crypto/Pkix across as many configs/connections as you like; they hold no per-connection state
 end;
 ```
 
-Construction is cheap (a CPU-feature probe plus vtable wiring; the CSPRNG seeds lazily). Build a
-config once, then share it lock-free across many connections.
+Construction is cheap. Build a config once, then share it lock-free across many connections. (The
+`TTlsLib` facade in [Your first client](#3-your-first-client-fully-verified) uses the shared
+default instances, `TDefaultCryptoProvider.Shared` / `TDefaultPkixProvider.Shared`.)
 
 ## 3. Your first client (fully verified)
 
@@ -120,6 +128,37 @@ ITlsTransport = interface(IInterface)
 end;
 ```
 
+`TTlsStream` arms no timeout: a silent peer blocks `Handshake` or `Read` until the transport itself
+gives up. To bound them, run the connection as a `TTlsConnection` (unit `TlpTlsConnection`) over an
+`ITlsTimedTransport` — the `TTcpStream` that `TTcpConnector.Connect` / `TTcpListener.TryAccept`
+return (unit `TlpNetSocket`), or your own `TTlsTimedTransportBase` descendant:
+
+```pascal
+uses SysUtils, TlpITlsConfig, TlpTlsConnection, TlpNetSocket, TlpINetSocket, TlpITlsTransport;
+
+var
+  LConfig: ITlsClientConfig;   // from step 3
+  LConn: TTlsConnection;
+  LConnector: ITcpConnector;
+  LTransport: ITlsTimedTransport;
+  Buf: TBytes;
+begin
+  LConnector := TTcpConnector.Create(10000) as ITcpConnector;
+  LTransport := LConnector.Connect('example.com', 443);
+  LConn := TTlsConnection.CreateClient(LConfig, 'example.com', LTransport, nil, 0);
+  try
+    LConn.Handshake(0);                       // 0 = the 30 s default; raises ETlsHandshakeTimeout
+    SetLength(Buf, 4096);
+    LConn.Read(Buf[0], Length(Buf), 15000);   // raises ETlsReadTimeout when nothing arrives in 15 s
+    LConn.CloseNotify;
+  finally
+    LConn.Free;
+  end;
+end;
+```
+
+`TTlsConnection.CreateServer(LConfig, LTransport, nil, 0)` is the server counterpart.
+
 Already using **mORMot, Indy, Synapse, or fcl-net**? Skip the transport entirely — the adapter for
 your stack wires all of this into the socket type you already use. See the
 [integration recipes](cookbook.md#integrate-with-your-networking-stack).
@@ -142,8 +181,12 @@ begin
   // then, per accepted socket:
   LEngine := TTlsEngineFactory.CreateServerEngine(LConfig);
   LStream := TTlsStream.Create(AcceptedTransport, LEngine, {IsClient=}False, '');
-  LStream.Handshake;
-  // read / write / CloseNotify exactly as the client does
+  try
+    LStream.Handshake;
+    // read / write / CloseNotify exactly as the client does
+  finally
+    LStream.Free;
+  end;
 end;
 ```
 
@@ -156,17 +199,21 @@ After the handshake, `ConnectionInfo` tells you what was negotiated — a good s
 and a modern key-exchange group really engaged:
 
 ```pascal
-uses SysUtils, TlpTlsStream, TlpTlsConnectionInfo;
+uses SysUtils, TlpAlpnProtocols, TlpTlsStream, TlpTlsConnectionInfo;
 
 var
   LStream: TTlsStream;         // from step 4
   LInfo: TTlsConnectionInfo;
+  LAlpn: string;
 begin
   LInfo := LStream.ConnectionInfo;
   WriteLn('version : ', IntToHex(LInfo.NegotiatedVersion.WireValue, 4));  // $0304 = TLS 1.3
   WriteLn('group   : ', IntToHex(LInfo.NamedGroup, 4));                   // $001D X25519 (default); $11EC is the X25519MLKEM768 PQ hybrid
-  WriteLn('alpn    : ', LInfo.AlpnProtocol);
+  if TAlpnProtocols.TryToText(LInfo.AlpnProtocol, LAlpn) then
+    WriteLn('alpn    : ', LAlpn);                                           // empty when none
   WriteLn('resumed : ', BoolToStr(LInfo.Resumed, True));
+  WriteLn('presented / validated : ', System.Length(LInfo.PeerCertificates), ' / ',
+    System.Length(LInfo.ValidatedPath));  // validated is empty on a non-reverified resume
 end;
 ```
 
@@ -184,6 +231,8 @@ Three defaults are worth internalising up front, because they shape everything e
 
 1. **Fail-closed.** A client won't finish a handshake it can't verify, and the builder won't produce
    a client with no trust source. There is no silent-insecure mode.
-2. **PQ-hybrid on by default.** Every preset offers X25519MLKEM768; you don't opt in.
-3. **AEAD-only, forward-secret.** No CBC, RC4, 3DES, static RSA, or TLS compression; resumption is
+2. **PQ-hybrid offered everywhere.** Every preset offers X25519MLKEM768; you don't opt in. It is
+   preferred (negotiated by default) under Hardened and Strict; a Compatible client also
+   negotiates it when the server prefers it.
+3. **AEAD-only, forward-secret.** No CBC, RC4, 3DES, static RSA, or TLS compression; TLS 1.3 resumption is
    `psk_dhe_ke` (forward-secret) and 0-RTT is off unless you explicitly enable it.

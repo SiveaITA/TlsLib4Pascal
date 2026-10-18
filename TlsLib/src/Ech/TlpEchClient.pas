@@ -20,20 +20,39 @@ uses
   TlpCryptoDomainTypes,
   TlpICryptoProvider,
   TlpWireReader,
-  TlpIWireWriter,
-  TlpWireWriter,
-  TlpWireVectorMarker,
   TlpHandshakeMessages,
   TlpCoreExtensions,
+  TlpExtensionVector,
   TlpEchConfig,
   TlpEchExtension,
   TlpEchOuterExtensions,
   TlpIEch,
-  TlpTls13KeySchedule,
+  TlpEchConfirmation,
   TlpArrayUtilities,
+  TlpTlsLibExceptions,
   TlpSecureMemory;
 
 type
+  /// <summary>
+  /// The ways a client offers ECH. Enable and Retry offer a config list for real, so the client
+  /// must be TLS 1.3-only (RFC 9849 sec. 6.1) and the list must hold a usable config; Grease only
+  /// GREASEs (sec. 6.2.1) and leaves the offered versions alone. A caller that wants "ECH, else
+  /// GREASE" catches the Build error of Enable and builds with Grease: a malformed list, like an
+  /// unusable one, raises EArgumentTlsLibException there. A real ECH offer is refused when the
+  /// server certificate is not verified at all (DangerousSkip), since an ECH reject must be
+  /// authenticated against public_name (sec. 6.1.7).
+  /// </summary>
+  TEchClientModes = class sealed(TObject)
+  public
+    /// <summary>Offers AConfigList (typically the DNS HTTPS/SVCB ech parameter).</summary>
+    class function Enable(const AConfigList: TBytes): IEchClientMode; static;
+    /// <summary>As Enable, for the reconnection driven by a reject's retry_configs: a second
+    /// reject is not itself retried (sec. 6.1.6).</summary>
+    class function Retry(const AConfigList: TBytes): IEchClientMode; static;
+    /// <summary>Sends a GREASE ECH extension and offers no real ECH.</summary>
+    class function Grease: IEchClientMode; static;
+  end;
+
   /// <summary>
   /// The frozen client ECH policy (RFC 9849): parses the ECHConfigList once and holds
   /// the GREASE and retry flags. Immutable; safe to share lock-free.
@@ -41,14 +60,19 @@ type
   TEchClientPolicy = class sealed(TInterfacedObject, IEchClientPolicy)
   strict private
   var
-    FConfigs: TArray<TEchConfig>;
     FGrease: Boolean;
     FIsRetry: Boolean;
+    FUsable: Boolean;
+    FSelectedConfig: TEchConfig;
+    FSelectedSuite: IHpkeSuite;
   public
-    constructor Create(const AConfigListBytes: TBytes; AGrease, AIsRetry: Boolean);
-    function Configs: TArray<TEchConfig>;
+    constructor Create(const ACrypto: ICryptoProvider; const AConfigListBytes: TBytes;
+      AGrease, AIsRetry: Boolean);
     function GreaseEnabled: Boolean;
     function IsRetryAttempt: Boolean;
+    function Usable: Boolean;
+    function SelectedConfig: TEchConfig;
+    function SelectedSuite: IHpkeSuite;
   end;
 
   /// <summary>
@@ -58,25 +82,23 @@ type
   /// padding) and drives the HPKE seal against a selected ECHConfig. A per-connection
   /// instance holds the live sealer so a HelloRetryRequest can re-seal at seq=1.
   /// </summary>
-  TEchClientHandshake = class sealed(TInterfacedObject, IEchClientHandshake)
+  TEchClientHandshake = class sealed(TObject)
   strict private
   var
-    FProvider: ICryptoProvider;
+    FCrypto: ICryptoProvider;
     FConfig: TEchConfig;
     FSuite: IHpkeSuite;
     FSealer: IHpkeSealer;
-    FEnc: TBytes;
-    class function ExtensionsBody(const AExtensionsField: TBytes): TBytes; static;
-    class function EncodeExtensionsField(
-      const AEntries: TArray<TEchExtEntry>): TBytes; static;
-    class function ServerNameLength(const AEntries: TArray<TEchExtEntry>;
+    FSpent: Boolean; // set once the secrets are forgotten; the seal methods then refuse
+    procedure EnsureNotSpent;
+    class function ServerNameLength(const AEntries: TExtensionVector;
       out AHasServerName: Boolean): Int32; static;
-    class function MatchesOuter(const AEntry: TEchExtEntry;
-      const AOuter: TArray<TEchExtEntry>): Boolean; static;
-    class function CompressibleRun(const AInner, AOuter: TArray<TEchExtEntry>;
+    class function MatchesOuter(const AEntry: TExtensionEntry;
+      const AOuter: TExtensionVector): Boolean; static;
+    class function CompressibleRun(const AInner, AOuter: TExtensionVector;
       out AStart, ALength: Int32): Boolean; static;
   public
-    constructor Create(const AProvider: ICryptoProvider; const AConfig: TEchConfig;
+    constructor Create(const ACryptoProvider: ICryptoProvider; const AConfig: TEchConfig;
       const ASuite: IHpkeSuite);
 
     /// <summary>
@@ -90,12 +112,12 @@ type
 
     /// <summary>
     /// Builds the EncodedClientHelloInner from the inner ClientHello body AInnerBody and
-    /// the ClientHelloOuter extension entries AOuterEntries: empties legacy_session_id,
+    /// the ClientHelloOuter extensions AOuter: empties legacy_session_id,
     /// replaces the longest contiguous run of compressible extensions that also appear
     /// verbatim in the outer with one ech_outer_extensions block, and appends padding.
     /// </summary>
     function BuildEncodedInner(const AInnerBody: TBytes;
-      const AOuterEntries: TArray<TEchExtEntry>): TBytes;
+      const AOuter: TExtensionVector): TBytes;
 
     /// <summary>
     /// Sets up the HPKE sender against the selected config's public key and returns the
@@ -107,42 +129,121 @@ type
     /// current sequence number (RFC 9849 sec. 5.2).</summary>
     function Seal(const AAad, APlaintext: TBytes): TBytes;
 
+    /// <summary>Forgets the handshake secrets once the outcome is decided and no further sealing is
+    /// needed: the HPKE sealer and its key material are released. The object stays valid (freed by
+    /// its owner at teardown) but its seal methods then refuse. Idempotent.</summary>
+    procedure ForgetSecrets;
+
     /// <summary>
     /// Whether the ECH accept confirmation over the inner transcript matches the last 8
-    /// bytes of ServerHello.random (RFC 9849 sec. 7.2), compared in constant time.
+    /// bytes of ServerHello.random (RFC 9849 sec. 6.1.4 / 7.2), compared in constant time.
     /// AInnerRandom is ClientHelloInner.random; ATranscriptEchConf is the inner
     /// transcript hash with those 8 SH.random bytes zeroed.
     /// </summary>
     class function AcceptConfirmationMatches(const AHkdf: IHkdf;
       const AInnerRandom, ATranscriptEchConf, AServerRandom: TBytes): Boolean; static;
-
-    property Enc: TBytes read FEnc;
   end;
 
 implementation
 
+resourcestring
+  SEchEmptyConfigNoGrease = 'an empty ECHConfigList would send the true SNI in the clear; ' +
+    'supply a config list or use TEchClientModes.Grease';
+  SEchBadConfigList = 'the configured ECHConfigList is malformed (RFC 9849 sec. 4)';
+  SEchNoUsableConfig = 'the configured ECHConfigList has no usable config (unsupported HPKE ' +
+    'suite or KEM) and ECH GREASE is disabled';
+  SEchHandshakeSpent = 'the ECH handshake secrets were forgotten; no further sealing is possible';
+
 const
   ServerHelloRandomLength = Int32(32);
-  ConfirmationOffset = Int32(24);
-  ConfirmationLength = Int32(8);
+
+type
+  TEchClientMode = class sealed(TInterfacedObject, IEchClientMode)
+  strict private
+    FConfigList: TBytes;
+    FIsRetry: Boolean;
+    FIsGrease: Boolean;
+  public
+    constructor Create(const AConfigList: TBytes; AIsRetry, AIsGrease: Boolean);
+    function ConfigList: TBytes;
+    function IsRetry: Boolean;
+    function IsGrease: Boolean;
+  end;
+
+{ TEchClientMode }
+
+constructor TEchClientMode.Create(const AConfigList: TBytes; AIsRetry, AIsGrease: Boolean);
+begin
+  inherited Create;
+  FConfigList := System.Copy(AConfigList);
+  FIsRetry := AIsRetry;
+  FIsGrease := AIsGrease;
+end;
+
+function TEchClientMode.ConfigList: TBytes;
+begin
+  Result := System.Copy(FConfigList);
+end;
+
+function TEchClientMode.IsRetry: Boolean;
+begin
+  Result := FIsRetry;
+end;
+
+function TEchClientMode.IsGrease: Boolean;
+begin
+  Result := FIsGrease;
+end;
+
+{ TEchClientModes }
+
+class function TEchClientModes.Enable(const AConfigList: TBytes): IEchClientMode;
+begin
+  if System.Length(AConfigList) = 0 then
+    raise EArgumentTlsLibException.CreateRes(@SEchEmptyConfigNoGrease);
+  Result := TEchClientMode.Create(AConfigList, False, False) as IEchClientMode;
+end;
+
+class function TEchClientModes.Retry(const AConfigList: TBytes): IEchClientMode;
+begin
+  if System.Length(AConfigList) = 0 then
+    raise EArgumentTlsLibException.CreateRes(@SEchEmptyConfigNoGrease);
+  Result := TEchClientMode.Create(AConfigList, True, False) as IEchClientMode;
+end;
+
+class function TEchClientModes.Grease: IEchClientMode;
+begin
+  Result := TEchClientMode.Create(nil, False, True) as IEchClientMode;
+end;
 
 { TEchClientPolicy }
 
-constructor TEchClientPolicy.Create(const AConfigListBytes: TBytes;
-  AGrease, AIsRetry: Boolean);
+constructor TEchClientPolicy.Create(const ACrypto: ICryptoProvider;
+  const AConfigListBytes: TBytes; AGrease, AIsRetry: Boolean);
+var
+  LConfigs: TArray<TEchConfig>;
 begin
   inherited Create;
-  // a malformed list is a typed decode error at configuration time; an empty list is a
-  // GREASE-only policy
+  // a malformed list is the caller's configuration error, not a peer-wire alert; an empty list
+  // is only meaningful as a GREASE-only policy - without GREASE it would silently send the true SNI
   if System.Length(AConfigListBytes) > 0 then
-    FConfigs := TEchConfigList.Parse(AConfigListBytes);
+  begin
+    try
+      LConfigs := TEchConfigList.Parse(AConfigListBytes);
+    except
+      on EDecodeErrorTlsLibException do
+        raise EArgumentTlsLibException.CreateRes(@SEchBadConfigList);
+    end;
+  end
+  else if not AGrease then
+    raise EArgumentTlsLibException.CreateRes(@SEchEmptyConfigNoGrease);
   FGrease := AGrease;
   FIsRetry := AIsRetry;
-end;
-
-function TEchClientPolicy.Configs: TArray<TEchConfig>;
-begin
-  Result := System.Copy(FConfigs);
+  // resolve the (config, suite) once here so every connection reuses it (no per-handshake KEM
+  // probe) and an unusable config fails at Build, not at connect; the parsed list is not retained
+  FUsable := TEchConfigList.TrySelect(LConfigs, ACrypto, FSelectedConfig, FSelectedSuite);
+  if (not FUsable) and (not FGrease) then
+    raise EArgumentTlsLibException.CreateRes(@SEchNoUsableConfig);
 end;
 
 function TEchClientPolicy.GreaseEnabled: Boolean;
@@ -155,15 +256,42 @@ begin
   Result := FIsRetry;
 end;
 
+function TEchClientPolicy.Usable: Boolean;
+begin
+  Result := FUsable;
+end;
+
+function TEchClientPolicy.SelectedConfig: TEchConfig;
+begin
+  Result := FSelectedConfig;
+end;
+
+function TEchClientPolicy.SelectedSuite: IHpkeSuite;
+begin
+  Result := FSelectedSuite;
+end;
+
 { TEchClientHandshake }
 
-constructor TEchClientHandshake.Create(const AProvider: ICryptoProvider;
+constructor TEchClientHandshake.Create(const ACryptoProvider: ICryptoProvider;
   const AConfig: TEchConfig; const ASuite: IHpkeSuite);
 begin
   inherited Create;
-  FProvider := AProvider;
+  FCrypto := ACryptoProvider;
   FConfig := AConfig;
   FSuite := ASuite;
+end;
+
+procedure TEchClientHandshake.EnsureNotSpent;
+begin
+  if FSpent then
+    raise EInvalidOperationTlsLibException.CreateRes(@SEchHandshakeSpent);
+end;
+
+procedure TEchClientHandshake.ForgetSecrets;
+begin
+  FSealer := nil;
+  FSpent := True;
 end;
 
 class function TEchClientHandshake.PaddingLength(AClientHelloLen,
@@ -188,74 +316,45 @@ begin
   Result := LPad + LRound;
 end;
 
-class function TEchClientHandshake.ExtensionsBody(
-  const AExtensionsField: TBytes): TBytes;
-var
-  LReader, LBody: TWireReader;
-begin
-  // the ClientHello extensions field is a 2-byte-length-prefixed vector; return its body
-  if System.Length(AExtensionsField) = 0 then
-    Exit(nil);
-  LReader := TWireReader.Create(AExtensionsField);
-  LBody := LReader.OpenVector(2);
-  Result := LBody.ReadBytes(LBody.Remaining);
-end;
-
-class function TEchClientHandshake.EncodeExtensionsField(
-  const AEntries: TArray<TEchExtEntry>): TBytes;
-var
-  LWriter: IWireWriter;
-  LMarker: TWireVectorMarker;
-begin
-  LWriter := TWireWriter.Create;
-  LMarker := LWriter.OpenVector(2);
-  LWriter.WriteBytes(TEchOuterExtensions.EncodeExtensions(AEntries));
-  LWriter.CloseVector(LMarker);
-  Result := LWriter.ToBytes;
-end;
-
 class function TEchClientHandshake.ServerNameLength(
-  const AEntries: TArray<TEchExtEntry>; out AHasServerName: Boolean): Int32;
+  const AEntries: TExtensionVector; out AHasServerName: Boolean): Int32;
 var
-  LI: Int32;
+  LEntry: TExtensionEntry;
   LReader, LList, LName: TWireReader;
 begin
   AHasServerName := False;
   Result := 0;
-  for LI := 0 to System.High(AEntries) do
-    if AEntries[LI].ExtType = TExtensionTypes.ServerName then
-    begin
-      // ServerNameList: the first host_name (type 0) entry's HostName length
-      LReader := TWireReader.Create(AEntries[LI].Data);
-      if LReader.Remaining < 1 then
-        Exit;
-      LList := LReader.OpenVector(2);
-      if (LList.Remaining >= 1) and (LList.ReadUInt8 = 0) then
-      begin
-        LName := LList.OpenVector(2);
-        AHasServerName := True;
-        Result := LName.Remaining;
-      end;
-      Exit;
-    end;
+  if not AEntries.TryFind(TExtensionTypes.ServerName, LEntry) then
+    Exit;
+  // ServerNameList: the first host_name (type 0) entry's HostName length
+  LReader := TWireReader.Create(LEntry.Data);
+  if LReader.Remaining < 1 then
+    Exit;
+  LList := LReader.OpenVector(2);
+  if (LList.Remaining >= 1) and (LList.ReadUInt8 = 0) then
+  begin
+    LName := LList.OpenVector(2);
+    AHasServerName := True;
+    Result := LName.Remaining;
+  end;
 end;
 
-class function TEchClientHandshake.MatchesOuter(const AEntry: TEchExtEntry;
-  const AOuter: TArray<TEchExtEntry>): Boolean;
+class function TEchClientHandshake.MatchesOuter(const AEntry: TExtensionEntry;
+  const AOuter: TExtensionVector): Boolean;
 var
   LI: Int32;
 begin
   // inner and outer extension bytes are both public ClientHello material, so a plain
   // variable-time comparison is correct here - no secret is being matched
-  for LI := 0 to System.High(AOuter) do
-    if (AOuter[LI].ExtType = AEntry.ExtType) and
-      TArrayUtilities.AreEqual(AOuter[LI].Data, AEntry.Data) then
+  for LI := 0 to AOuter.Count - 1 do
+    if (AOuter.Entries[LI].ExtensionType = AEntry.ExtensionType) and
+      TArrayUtilities.AreEqual(AOuter.Entries[LI].Data, AEntry.Data) then
       Exit(True);
   Result := False;
 end;
 
 class function TEchClientHandshake.CompressibleRun(const AInner,
-  AOuter: TArray<TEchExtEntry>; out AStart, ALength: Int32): Boolean;
+  AOuter: TExtensionVector; out AStart, ALength: Int32): Boolean;
 var
   LI, LRunStart, LRunLen, LBestStart, LBestLen: Int32;
   LCompressible: Boolean;
@@ -267,10 +366,10 @@ begin
   LBestLen := 0;
   LRunStart := 0;
   LRunLen := 0;
-  for LI := 0 to System.High(AInner) do
+  for LI := 0 to AInner.Count - 1 do
   begin
-    LCompressible := TEchOuterExtensions.IsCompressible(AInner[LI].ExtType) and
-      MatchesOuter(AInner[LI], AOuter);
+    LCompressible := TEchOuterExtensions.IsCompressible(
+      AInner.Entries[LI].ExtensionType) and MatchesOuter(AInner.Entries[LI], AOuter);
     if LCompressible then
     begin
       if LRunLen = 0 then
@@ -293,65 +392,56 @@ begin
 end;
 
 function TEchClientHandshake.BuildEncodedInner(const AInnerBody: TBytes;
-  const AOuterEntries: TArray<TEchExtEntry>): TBytes;
+  const AOuter: TExtensionVector): TBytes;
 var
   LInner: TTlsClientHello;
-  LInnerEntries, LEncodedEntries: TArray<TEchExtEntry>;
-  LStart, LLen, LI, LOut, LSniLen, LPad: Int32;
+  LInnerEntries, LEncodedEntries: TExtensionVector;
+  LStart, LLen, LI, LSniLen, LPad: Int32;
   LHasSni: Boolean;
   LRefTypes: TArray<UInt16>;
   LEncoded: TBytes;
 begin
+  EnsureNotSpent;
   LInner := THandshakeMessages.DecodeClientHello(AInnerBody);
-  LInnerEntries := TEchOuterExtensions.ParseExtensions(
-    ExtensionsBody(LInner.Extensions));
+  LInnerEntries := TExtensionVector.Parse(LInner.Extensions);
 
-  if CompressibleRun(LInnerEntries, AOuterEntries, LStart, LLen) then
+  LEncodedEntries := LInnerEntries;
+  if CompressibleRun(LInnerEntries, AOuter, LStart, LLen) then
   begin
     SetLength(LRefTypes, LLen);
     for LI := 0 to LLen - 1 do
-      LRefTypes[LI] := LInnerEntries[LStart + LI].ExtType;
+      LRefTypes[LI] := LInnerEntries.Entries[LStart + LI].ExtensionType;
     // inner entries with [LStart..LStart+LLen) replaced by one ech_outer_extensions block
-    SetLength(LEncodedEntries, System.Length(LInnerEntries) - LLen + 1);
-    LOut := 0;
-    for LI := 0 to System.High(LInnerEntries) do
-    begin
-      if LI = LStart then
-      begin
-        LEncodedEntries[LOut].ExtType := TExtensionTypes.EchOuterExtensions;
-        LEncodedEntries[LOut].Data := TEchExtension.EncodeOuterExtensions(LRefTypes);
-        Inc(LOut);
-      end
-      else if (LI < LStart) or (LI >= LStart + LLen) then
-      begin
-        LEncodedEntries[LOut] := LInnerEntries[LI];
-        Inc(LOut);
-      end;
-    end;
-  end
-  else
-    LEncodedEntries := LInnerEntries;
+    LEncodedEntries.ReplaceRange(LStart, LLen,
+      TExtensionEntry.Create(TExtensionTypes.EchOuterExtensions,
+      TEchExtension.EncodeOuterExtensions(LRefTypes)));
+  end;
 
   // EncodedClientHelloInner.client_hello: the inner with an empty legacy_session_id
   LInner.LegacySessionId := nil;
-  LInner.Extensions := EncodeExtensionsField(LEncodedEntries);
+  LInner.Extensions := LEncodedEntries.Encode;
   LEncoded := THandshakeMessages.EncodeClientHello(LInner);
 
   LSniLen := ServerNameLength(LInnerEntries, LHasSni);
   LPad := PaddingLength(System.Length(LEncoded), LSniLen, LHasSni,
     FConfig.MaximumNameLength);
-  Result := LEncoded;
+  // the encoded inner up front, then the padding tail zeroed (RFC 9849 sec. 6.1.3)
   SetLength(Result, System.Length(LEncoded) + LPad);
+  if System.Length(LEncoded) > 0 then
+    Move(LEncoded[0], Result[0], System.Length(LEncoded));
+  if LPad > 0 then
+    System.FillChar(Result[System.Length(LEncoded)], LPad, 0);
 end;
 
 function TEchClientHandshake.SetupSeal: TBytes;
 begin
-  FSuite.SetupSealer(FConfig.PublicKey, FConfig.HpkeInfo, FEnc, FSealer);
-  Result := FEnc;
+  EnsureNotSpent;
+  FSuite.SetupSealer(FConfig.PublicKey, FConfig.HpkeInfo, Result, FSealer);
 end;
 
 function TEchClientHandshake.Seal(const AAad, APlaintext: TBytes): TBytes;
 begin
+  EnsureNotSpent;
   Result := FSealer.Seal(AAad, APlaintext);
 end;
 
@@ -363,11 +453,11 @@ var
 begin
   if System.Length(AServerRandom) <> ServerHelloRandomLength then
     Exit(False);
-  LComputed := TTls13KeySchedule.EchAcceptConfirmation(AHkdf, AInnerRandom,
+  LComputed := TEchConfirmation.Accept(AHkdf, AInnerRandom,
     ATranscriptEchConf);
-  SetLength(LReceived, ConfirmationLength);
-  for LI := 0 to ConfirmationLength - 1 do
-    LReceived[LI] := AServerRandom[ConfirmationOffset + LI];
+  SetLength(LReceived, TEchExtension.ConfirmationLength);
+  for LI := 0 to TEchExtension.ConfirmationLength - 1 do
+    LReceived[LI] := AServerRandom[TEchExtension.ServerHelloRandomConfirmationOffset + LI];
   Result := TSecureMemory.ConstantTimeAreEqual(LComputed, LReceived);
 end;
 

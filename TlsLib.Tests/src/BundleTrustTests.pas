@@ -31,22 +31,22 @@ uses
 {$ELSE}
   TestFramework,
 {$ENDIF FPC}
-  TlpICryptoProvider,
-  TlpDefaultCryptoProvider,
-  TlpICertificateTrust,
+  TlpTlsLibExceptions,
+  TlpITrustAnchorStore,
   TlpBundleTrust,
   TlsLibTestBase;
 
 type
   TTestBundleTrust = class(TTlsLibAlgorithmTestCase)
   strict private
-    FProvider: ICryptoProvider;
     FRootDer: TBytes;
   protected
     procedure SetUp; override;
   published
     procedure TestFromPemLoadsRoot;
     procedure TestFromPemFileLoadsRoot;
+    procedure TestFromPemWithoutAProviderRaises;
+    procedure TestFromPemFileWithoutAProviderRaises;
   end;
 
 implementation
@@ -58,7 +58,6 @@ var
   LVectors: TStringList;
 begin
   inherited SetUp;
-  FProvider := TDefaultCryptoProvider.Create as ICryptoProvider;
   // reuse the shared EC P-256 test root (its DER form; LoadCertificateChain accepts it)
   LVectors := LoadVectorFields('Certs/EcP256Chain.txt');
   try
@@ -72,11 +71,11 @@ procedure TTestBundleTrust.TestFromPemLoadsRoot;
 var
   LStore: ITrustAnchorStore;
 begin
-  LStore := TBundleTrust.FromPem(FProvider, FRootDer);
+  LStore := TBundleTrust.FromPem(Pkix, FRootDer);
   CheckTrue(LStore <> nil, 'FromPem returns an anchor store');
   CheckEquals(1, Length(LStore.RootCertificates),
     'the one-cert bundle yields exactly one anchor');
-  CheckTrue(FProvider.Certificates.IsWellFormed(LStore.RootCertificates[0]),
+  CheckTrue(Pkix.Certificates.IsWellFormed(LStore.RootCertificates[0]),
     'the harvested anchor is a well-formed certificate');
 end;
 
@@ -86,21 +85,45 @@ var
   LPath: string;
   LStream: TFileStream;
 begin
-  LPath := IncludeTrailingPathDelimiter(GetCurrentDir) + 'bundle_fixture.der';
+  LPath := TempPath('bundle_fixture.der');
   LStream := TFileStream.Create(LPath, fmCreate);
   try
     LStream.WriteBuffer(FRootDer[0], Length(FRootDer));
   finally
     LStream.Free;
   end;
+  LStore := TBundleTrust.FromPemFile(Pkix, LPath);
+  CheckTrue(LStore <> nil, 'FromPemFile returns an anchor store');
+  CheckEquals(1, Length(LStore.RootCertificates),
+    'the bundle file yields exactly one anchor');
+end;
+
+procedure TTestBundleTrust.TestFromPemWithoutAProviderRaises;
+var
+  LRaised: Boolean;
+begin
+  LRaised := False;
   try
-    LStore := TBundleTrust.FromPemFile(FProvider, LPath);
-    CheckTrue(LStore <> nil, 'FromPemFile returns an anchor store');
-    CheckEquals(1, Length(LStore.RootCertificates),
-      'the bundle file yields exactly one anchor');
-  finally
-    SysUtils.DeleteFile(LPath);
+    TBundleTrust.FromPem(nil, FRootDer);
+  except
+    on EArgumentTlsLibException do
+      LRaised := True;
   end;
+  CheckTrue(LRaised, 'a nil PKIX provider raises an argument error, not an access violation');
+end;
+
+procedure TTestBundleTrust.TestFromPemFileWithoutAProviderRaises;
+var
+  LRaised: Boolean;
+begin
+  LRaised := False;
+  try
+    TBundleTrust.FromPemFile(nil, 'bundle-that-is-never-read.pem');
+  except
+    on EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a nil PKIX provider raises before the file is read');
 end;
 
 initialization

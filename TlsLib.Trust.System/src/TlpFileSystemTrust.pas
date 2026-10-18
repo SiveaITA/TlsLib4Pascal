@@ -18,25 +18,26 @@ interface
 uses
   SysUtils,
   Classes,
-  TlpICryptoProvider,
+  TlpIPkixProvider,
   TlpSystemTrustBase,
   TlpSystemTrustExceptions;
 
 type
   /// <summary>
   /// Harvests trusted roots from the well-known Unix CA-bundle filesystem convention: an
-  /// SSL_CERT_FILE / SSL_CERT_DIR style environment override, else the first
+  /// SSL_CERT_FILE / SSL_CERT_DIR style environment override (both are harvested when both
+  /// are set; the directory value is a path-separator list), else the first
   /// well-known CA bundle file or certificate directory that exists. The chosen
   /// source is authoritative: if it cannot be parsed the harvest fails closed
   /// rather than falling through to a different store. PEM parsing is delegated
-  /// to the crypto provider.
+  /// to the PKIX provider.
   ///
   /// The path resolution is platform-neutral - it only manipulates strings and
   /// files - so this store is driven with injected path lists on any host, and
   /// is the reusable engine every filesystem-based platform builds on (see
   /// TUnixRootSource for the Unix env + path defaults).
   /// </summary>
-  TFileSystemRootSource = class(TSystemRootSource)
+  TFileSystemRootSource = class(TSystemRootSourceBase)
   strict private
     FEnvFile: string;
     FEnvDir: string;
@@ -49,6 +50,8 @@ type
       const AAccumulator: TSystemRootAccumulator);
     procedure HarvestDir(const APath: string;
       const AAccumulator: TSystemRootAccumulator);
+    procedure HarvestEnvDirs(const AList: string;
+      const AAccumulator: TSystemRootAccumulator);
     function FirstExistingFile: string;
     function FirstExistingDir: string;
   strict protected
@@ -58,7 +61,7 @@ type
     /// <summary>The explicit form: the env overrides and candidate lists are all
     /// supplied, decoupled from the process environment and any built-in table.
     /// This is the form tests and advanced callers use.</summary>
-    constructor Create(const AProvider: ICryptoProvider;
+    constructor Create(const APkix: IPkixProvider;
       const AEnvFile, AEnvDir: string;
       const AFiles, ADirs: TArray<string>); overload;
   end;
@@ -69,16 +72,16 @@ resourcestring
   SEnvFileMissing =
     'the SSL_CERT_FILE override names a bundle that could not be read: %s';
   SEnvDirMissing =
-    'the SSL_CERT_DIR override names a directory that does not exist: %s';
+    'the SSL_CERT_DIR override names no directory that exists: %s';
   SBundleUnreadable =
     'the system CA bundle could not be parsed: %s';
 
 { TFileSystemRootSource }
 
-constructor TFileSystemRootSource.Create(const AProvider: ICryptoProvider;
+constructor TFileSystemRootSource.Create(const APkix: IPkixProvider;
   const AEnvFile, AEnvDir: string; const AFiles, ADirs: TArray<string>);
 begin
-  inherited Create(AProvider);
+  inherited Create(APkix);
   FEnvFile := AEnvFile;
   FEnvDir := AEnvDir;
   FFiles := AFiles;
@@ -106,7 +109,7 @@ begin
   if Length(AData) = 0 then
     Result := nil
   else
-    Result := Provider.Certificates.LoadChain(AData);
+    Result := Pkix.Certificates.LoadChain(AData);
 end;
 
 procedure TFileSystemRootSource.HarvestFile(const APath: string;
@@ -158,6 +161,27 @@ begin
   end;
 end;
 
+procedure TFileSystemRootSource.HarvestEnvDirs(const AList: string;
+  const AAccumulator: TSystemRootAccumulator);
+var
+  LEntries: TArray<string>;
+  LI, LHarvested: Integer;
+begin
+  LHarvested := 0;
+  LEntries := AList.Split([PathSep]);
+  for LI := 0 to Length(LEntries) - 1 do
+  begin
+    if DirectoryExists(LEntries[LI]) then
+    begin
+      HarvestDir(LEntries[LI], AAccumulator);
+      Inc(LHarvested);
+    end;
+  end;
+  if LHarvested = 0 then
+    raise ESystemTrustUnavailableTlsLibException.CreateResFmt(
+      @SEnvDirMissing, [AList]);
+end;
+
 function TFileSystemRootSource.FirstExistingFile: string;
 var
   LI: Integer;
@@ -196,21 +220,18 @@ begin
   Result := nil;
   LAcc := TSystemRootAccumulator.Create;
   try
-    // Explicit environment overrides take precedence and are strict: if named, the
-    // source must be usable, otherwise fail closed (no fallback to the table).
-    if FEnvFile <> '' then
+    // a set override replaces the defaults and must resolve, else fail closed
+    if (FEnvFile <> '') or (FEnvDir <> '') then
     begin
-      if not FileExists(FEnvFile) then
-        raise ESystemTrustUnavailableTlsLibException.CreateResFmt(
-          @SEnvFileMissing, [FEnvFile]);
-      HarvestFile(FEnvFile, LAcc);
-    end
-    else if FEnvDir <> '' then
-    begin
-      if not DirectoryExists(FEnvDir) then
-        raise ESystemTrustUnavailableTlsLibException.CreateResFmt(
-          @SEnvDirMissing, [FEnvDir]);
-      HarvestDir(FEnvDir, LAcc);
+      if FEnvFile <> '' then
+      begin
+        if not FileExists(FEnvFile) then
+          raise ESystemTrustUnavailableTlsLibException.CreateResFmt(
+            @SEnvFileMissing, [FEnvFile]);
+        HarvestFile(FEnvFile, LAcc);
+      end;
+      if FEnvDir <> '' then
+        HarvestEnvDirs(FEnvDir, LAcc);
     end
     // Otherwise the first candidate that exists is authoritative.
     else

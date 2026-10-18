@@ -43,9 +43,15 @@ uses
   TlpCryptoDomainTypes,
   TlpICryptoProvider,
   TlpDefaultCryptoProvider,
+  TlpIPkixProvider,
+  TlpDefaultPkixProvider,
   TlpITlsConfig,
   TlpITlsConfigBuilder,
+  TlpCertificateVerifierSource,
   TlpTlsPresets,
+  TlpTlsVersion,
+  TlpEchClient,
+  TlpTlsCredential,
   TlpIEch,
   TlpInMemoryEchKeyStore,
   TlpEchConfig,
@@ -178,7 +184,8 @@ end;
 
 class function TSynapseEchLoopbackExample.Run: Integer;
 var
-  LProvider: ICryptoProvider;
+  LCrypto: ICryptoProvider;
+  LPkix: IPkixProvider;
   LEch: TEchKeyGenResult;
   LServerBuilder: ITlsServerConfigBuilder;
   LClientBuilder: ITlsClientConfigBuilder;
@@ -192,22 +199,24 @@ begin
   GServerError := '';
   GServerEch := TEchStatus.NotOffered;
   TVec.Locate;
-  LProvider := TDefaultCryptoProvider.Create as ICryptoProvider;
+  LCrypto := TDefaultCryptoProvider.Create as ICryptoProvider;
+  LPkix := TDefaultPkixProvider.Create as IPkixProvider;
 
-  LEch := TEchKeyGenerator.Generate(LProvider, PUBLIC_NAME, 1,
+  LEch := TEchKeyGenerator.Generate(LCrypto, PUBLIC_NAME, INNER_HOST, 1,
     THpkeKem.DHKEM_X25519_HKDF_SHA256, THpkeKdf.HKDF_SHA256,
     THpkeAead.AES_128_GCM, 0);
 
-  LServerBuilder := TTlsPresets.Compatible(LProvider).Server
-    .WithCredential(TVec.Bytes('leaf_cert'), TVec.Bytes('leaf_key'), '');
+  LServerBuilder := TTlsPresets.Compatible(LCrypto, LPkix).Server
+    .WithCredential(TTlsCredential.Load(LCrypto, LPkix,
+    TVec.Bytes('leaf_cert'), TVec.Bytes('leaf_key')));
   LServerBuilder.Tls13.WithEchKeyStore(
-    TInMemoryEchKeyStore.FromPem(LEch.Pem, LProvider));
-  LServerBuilder.Tls13.WithEchTrialDecrypt(True);
+    TInMemoryEchKeyStore.FromPem(LEch.Pem, LCrypto), True);
   GServerConfig := LServerBuilder.Build;
 
-  LClientBuilder := TTlsPresets.Compatible(LProvider).Client
-    .WithTrustAnchors(TVec.Bytes('root_cert'));
-  LClientBuilder.Tls13.WithEncryptedClientHello(LEch.EchConfigList);
+  LClientBuilder := TTlsPresets.Compatible(LCrypto, LPkix).Client
+    .WithServerVerification(TServerVerification.WebPki(TVec.Bytes('root_cert')).Build)
+    .WithSupportedVersions(TArray<UInt16>.Create(TlsWireVersionTls13));
+  LClientBuilder.Tls13.WithEch(TEchClientModes.Enable(LEch.EchConfigList));
   LClientConfig := LClientBuilder.Build;
 
   GReady := TEvent.Create(nil, True, False, '');

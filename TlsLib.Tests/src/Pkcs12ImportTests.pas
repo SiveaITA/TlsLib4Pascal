@@ -29,22 +29,30 @@ uses
   TestFramework,
 {$ENDIF FPC}
   TlpICryptoProvider,
+  TlpSecretBuffer,
   TlpCryptoDomainTypes,
   TlpISigningKey,
+  TlpImportedCredential,
   TlpTlsCredential,
+  TlpTlsPresets,
+  TlpITlsConfigBuilder,
+  TlpITlsConfig,
   TlpICertificateTrust,
+  TlpTrustAnchorStore,
+  TlpTrustTypes,
   TlpServerName,
   TlpCertificateVerifier,
   TlpTlsAlert,
   TlpTlsLibExceptions,
+  TlsLibTestProviders,
   TlsLibTestBase;
 
 type
-  /// <summary>Covers ImportPkcs12: a .pfx round-trips into a complete TTlsCredential (chain
+  /// <summary>Covers ImportPkcs12: a .pfx round-trips into a complete TImportedCredential (chain
   /// + a usable ISigningKey) independent of the store's PBE profile, the chain is leaf-first
   /// with any CA present and validates through the certificate-verifier path, and a wrong
   /// password or malformed blob fails closed with a typed TlsLib exception - never a raw
-  /// CryptoLib exception or a partial credential.</summary>
+  /// backend exception or a partial credential.</summary>
   TTestPkcs12Import = class(TTlsLibAlgorithmTestCase)
   private
     FV: TStringList;
@@ -52,10 +60,14 @@ type
     function Blob(const AField: string): TBytes;
     // Signs a fixed probe with the credential's key (its first capable scheme) and verifies
     // it against the leaf certificate's SubjectPublicKeyInfo. True when the key pairs the leaf.
-    function KeyPairsLeaf(const ACredential: TTlsCredential): Boolean;
+    function KeyPairsLeaf(const ACredential: TImportedCredential): Boolean;
+    // Asserts a forged leaf-selection vector imports to [leaf, CA]: the key pairs
+    // CertificateChain[0] and the chain validates to the ca_cert_der anchor.
+    procedure CheckSelectsLeafAndVerifies(const AField: string);
+    // The class and message the portable provider raises importing the plaintext AField store.
+    function ImportFailure(const AField: string): string;
   protected
     procedure SetUp; override;
-    procedure TearDown; override;
   published
     procedure TestRsaPfxImportsToCredential;
     procedure TestEcPfxImportsToCredential;
@@ -64,6 +76,22 @@ type
     procedure TestMultiKeyPfxFailsClosed;
     procedure TestWrongPasswordFailsClosed;
     procedure TestMalformedBlobFailsClosed;
+    // leaf selection by key: the leaf is chosen by matching the private key, not by store
+    // order or the (absent/orphan/wrong) key<->cert link
+    procedure TestNoLinkCaFirstSelectsLeaf;
+    procedure TestOrphanLinkSelectsLeaf;
+    procedure TestWrongLinkSelectsLeaf;
+    procedure TestNoCertForKeyFailsClosed;
+    // TTlsCredential.LoadPkcs12 lifts an imported identity into a staple-free credential
+    // (leaf-first chain, the key pairs the leaf); a wrong password fails closed typed
+    procedure TestLoadPkcs12Credential;
+    // a PKCS#12-loaded credential passes Build's key<->leaf consistency and freezes into a config
+    procedure TestLoadedPkcs12CredentialBuildsServer;
+    // portable-only precedence (a native backend may hide cert-less keys): count and pairing win
+    procedure TestUnsupportedKeyIsReportedAsUnsupported;
+    procedure TestUnsupportedKeyBesideAnotherKeyIsMultipleKeys;
+    procedure TestUnsupportedCurveBesideAnotherKeyIsMultipleKeys;
+    procedure TestUnsupportedCurveWithNoPairingCertIsNoCertForKey;
   end;
 
 implementation
@@ -78,13 +106,7 @@ const
 procedure TTestPkcs12Import.SetUp;
 begin
   inherited SetUp;
-  FV := LoadVectorFields('Certs/Pkcs12.txt');
-end;
-
-procedure TTestPkcs12Import.TearDown;
-begin
-  FV.Free;
-  inherited TearDown;
+  FV := Own<TStringList>(LoadVectorFields('Certs/Pkcs12.txt'));
 end;
 
 function TTestPkcs12Import.Blob(const AField: string): TBytes;
@@ -92,7 +114,7 @@ begin
   Result := DecodeHex(FV.Values[AField]);
 end;
 
-function TTestPkcs12Import.KeyPairsLeaf(const ACredential: TTlsCredential): Boolean;
+function TTestPkcs12Import.KeyPairsLeaf(const ACredential: TImportedCredential): Boolean;
 var
   LScheme: TSignatureScheme;
   LSigner: ISignatureSigner;
@@ -101,21 +123,21 @@ var
 begin
   LScheme := ACredential.PrivateKey.CapableSchemes[0];
   LMessage := DecodeHex(SMessageHex);
-  LSigner := Provider.Signing.CreateSignatureSigner(LScheme, ACredential.PrivateKey);
+  LSigner := Crypto.Signing.CreateSignatureSigner(LScheme, ACredential.PrivateKey);
   LSigner.Update(LMessage, 0, System.Length(LMessage));
   LSignature := LSigner.Sign;
 
-  LSpki := Provider.Certificates.PublicKeyInfo(ACredential.CertificateChain[0]);
-  LVerifier := Provider.Signing.CreateSignatureVerifier(LScheme, LSpki);
+  LSpki := Pkix.Certificates.PublicKeyInfo(ACredential.CertificateChain[0]);
+  LVerifier := Crypto.Signing.CreateSignatureVerifier(LScheme, LSpki);
   LVerifier.Update(LMessage, 0, System.Length(LMessage));
   Result := LVerifier.Verify(LSignature);
 end;
 
 procedure TTestPkcs12Import.TestRsaPfxImportsToCredential;
 var
-  LCredential: TTlsCredential;
+  LCredential: TImportedCredential;
 begin
-  LCredential := Provider.Signing.ImportPkcs12(Blob('rsa_pfx'), SPassword);
+  LCredential := Crypto.Signing.ImportPkcs12(Blob('rsa_pfx'), TSecretBuffer.FromString(SPassword));
   CheckEquals(1, System.Length(LCredential.CertificateChain),
     'a single-leaf .pfx yields a one-certificate chain');
   CheckTrue(TSignatureScheme.RSA_PSS_RSAE_SHA256 =
@@ -126,9 +148,9 @@ end;
 
 procedure TTestPkcs12Import.TestEcPfxImportsToCredential;
 var
-  LCredential: TTlsCredential;
+  LCredential: TImportedCredential;
 begin
-  LCredential := Provider.Signing.ImportPkcs12(Blob('ec_pfx'), SPassword);
+  LCredential := Crypto.Signing.ImportPkcs12(Blob('ec_pfx'), TSecretBuffer.FromString(SPassword));
   CheckEquals(1, System.Length(LCredential.CertificateChain),
     'a single-leaf EC .pfx yields a one-certificate chain');
   CheckTrue(TSignatureScheme.ECDSA_SECP256R1_SHA256 =
@@ -139,13 +161,13 @@ end;
 
 procedure TTestPkcs12Import.TestChainPfxIsLeafFirstAndVerifies;
 var
-  LCredential: TTlsCredential;
+  LCredential: TImportedCredential;
   LVerifier: IServerCertificateVerifier;
   LAlert: TTlsAlertDescription;
-  LValidated: TArray<TBytes>;
+  LVerified: TVerifiedChain;
 begin
   // the store holds a leaf signed by a test CA plus that CA certificate
-  LCredential := Provider.Signing.ImportPkcs12(Blob('chain_pfx'), SPassword);
+  LCredential := Crypto.Signing.ImportPkcs12(Blob('chain_pfx'), TSecretBuffer.FromString(SPassword));
   CheckEquals(2, System.Length(LCredential.CertificateChain),
     'the chain .pfx yields leaf + CA');
   CheckTrue(KeyPairsLeaf(LCredential),
@@ -153,22 +175,22 @@ begin
 
   // feed the imported chain through the real certificate-verifier path: it must validate
   // to the test CA (leaf-first ordering + the CA present prove the chain wired through)
-  LVerifier := TCertificateVerifier.Create(Provider, TSystemClock.Create as ITlsClock,
+  LVerifier := TCertificateVerifier.Create(Pkix, TSystemClock.Create as ITlsClock,
     TTrustAnchorStore.Create(TArray<TBytes>.Create(Blob('ca_cert_der'))), False);
   LAlert := TTlsAlertDescription.InternalError;
   CheckTrue(LVerifier.VerifyServerCertificate(LCredential.CertificateChain, TServerName.DnsName(''), nil,
-    LValidated, LAlert),
+    LVerified, LAlert),
     'the imported chain validates against the test CA anchor');
 end;
 
 procedure TTestPkcs12Import.TestAlternateAlgorithmProfileImports;
 var
-  LCredential: TTlsCredential;
+  LCredential: TImportedCredential;
 begin
   // the same RSA leaf stored under a different PBE profile (PBES2 AES-128-CBC bags + a
   // SHA-1 integrity MAC, versus rsa_pfx's AES-256-CBC + SHA-256) imports the same way:
   // import is driven by the store's declared algorithms, not pinned to one profile
-  LCredential := Provider.Signing.ImportPkcs12(Blob('rsa_altalg_pfx'), SPassword);
+  LCredential := Crypto.Signing.ImportPkcs12(Blob('rsa_altalg_pfx'), TSecretBuffer.FromString(SPassword));
   CheckEquals(1, System.Length(LCredential.CertificateChain),
     'the alternate-profile .pfx yields the leaf');
   CheckTrue(KeyPairsLeaf(LCredential),
@@ -178,13 +200,13 @@ end;
 procedure TTestPkcs12Import.TestMultiKeyPfxFailsClosed;
 var
   LRaised: Boolean;
-  LCredential: TTlsCredential;
+  LCredential: TImportedCredential;
 begin
   // a store with more than one private-key entry is ambiguous for a single credential;
   // alias order is not stable, so it must be rejected rather than binding an arbitrary one
   LRaised := False;
   try
-    LCredential := Provider.Signing.ImportPkcs12(Blob('multikey_pfx'), SPassword);
+    LCredential := Crypto.Signing.ImportPkcs12(Blob('multikey_pfx'), TSecretBuffer.FromString(SPassword));
     CheckEquals(0, System.Length(LCredential.CertificateChain),
       'unreachable: a multi-key store must not return a credential');
   except
@@ -197,12 +219,12 @@ end;
 procedure TTestPkcs12Import.TestWrongPasswordFailsClosed;
 var
   LRaised: Boolean;
-  LCredential: TTlsCredential;
+  LCredential: TImportedCredential;
 begin
   LRaised := False;
   try
     // a bad-MAC/wrong-password store must raise a typed TlsLib exception, not a Clp* one
-    LCredential := Provider.Signing.ImportPkcs12(Blob('rsa_pfx'), 'not-the-password');
+    LCredential := Crypto.Signing.ImportPkcs12(Blob('rsa_pfx'), TSecretBuffer.FromString('not-the-password'));
     CheckEquals(0, System.Length(LCredential.CertificateChain),
       'unreachable: a wrong password must not return a credential');
   except
@@ -215,13 +237,13 @@ end;
 procedure TTestPkcs12Import.TestMalformedBlobFailsClosed;
 var
   LRaised: Boolean;
-  LCredential: TTlsCredential;
+  LCredential: TImportedCredential;
 begin
   LRaised := False;
   try
     // a truncated/garbage blob must fail closed with a typed exception, never an AV
-    LCredential := Provider.Signing.ImportPkcs12(
-      DecodeHex('3082deadbeefdeadbeefdeadbeef'), SPassword);
+    LCredential := Crypto.Signing.ImportPkcs12(
+      DecodeHex('3082deadbeefdeadbeefdeadbeef'), TSecretBuffer.FromString(SPassword));
     CheckEquals(0, System.Length(LCredential.CertificateChain),
       'unreachable: a malformed blob must not return a credential');
   except
@@ -229,6 +251,152 @@ begin
       LRaised := True;
   end;
   CheckTrue(LRaised, 'a malformed PKCS#12 blob raises EArgumentTlsLibException');
+end;
+
+procedure TTestPkcs12Import.CheckSelectsLeafAndVerifies(const AField: string);
+var
+  LCredential: TImportedCredential;
+  LVerifier: IServerCertificateVerifier;
+  LAlert: TTlsAlertDescription;
+  LVerified: TVerifiedChain;
+begin
+  // the forged stores are plaintext (no encryption, no MAC), so no password is used
+  LCredential := Crypto.Signing.ImportPkcs12(Blob(AField), nil);
+  CheckEquals(2, System.Length(LCredential.CertificateChain),
+    AField + ': the selected chain is leaf + CA');
+  CheckTrue(KeyPairsLeaf(LCredential),
+    AField + ': the private key pairs the selected leaf (CertificateChain[0])');
+  LVerifier := TCertificateVerifier.Create(Pkix, TSystemClock.Create as ITlsClock,
+    TTrustAnchorStore.Create(TArray<TBytes>.Create(Blob('ca_cert_der'))), False);
+  LAlert := TTlsAlertDescription.InternalError;
+  CheckTrue(LVerifier.VerifyServerCertificate(LCredential.CertificateChain,
+    TServerName.DnsName(''), nil, LVerified, LAlert),
+    AField + ': the selected chain validates to the test CA');
+end;
+
+procedure TTestPkcs12Import.TestNoLinkCaFirstSelectsLeaf;
+begin
+  // no localKeyId anywhere and the CA bag first: positional linkage leads with the CA, so the
+  // key match must override it and pick the leaf
+  CheckSelectsLeafAndVerifies('nolink_cafirst_pfx');
+end;
+
+procedure TTestPkcs12Import.TestOrphanLinkSelectsLeaf;
+begin
+  // the key's localKeyId matches no certificate: the linked lookup finds nothing, so the scan
+  // must find the leaf by key
+  CheckSelectsLeafAndVerifies('orphanlink_pfx');
+end;
+
+procedure TTestPkcs12Import.TestWrongLinkSelectsLeaf;
+begin
+  // the key's localKeyId points at the CA: the linked leaf is wrong, so the key match must
+  // correct it
+  CheckSelectsLeafAndVerifies('wronglink_pfx');
+end;
+
+procedure TTestPkcs12Import.TestNoCertForKeyFailsClosed;
+var
+  LRaised: Boolean;
+  LCredential: TImportedCredential;
+begin
+  LRaised := False;
+  try
+    // the store holds the key and the CA only - no certificate pairs the key
+    LCredential := Crypto.Signing.ImportPkcs12(Blob('nomatch_pfx'), nil);
+    CheckEquals(0, System.Length(LCredential.CertificateChain),
+      'unreachable: a store with no certificate for its key must not return a credential');
+  except
+    on E: EArgumentTlsLibException do
+      // match the specific message, not just the class: a Load failure (SMalformedPkcs12) is the
+      // same class, so this pins the no-certificate-for-key path
+      LRaised := Pos('no certificate for its private key', E.Message) > 0;
+  end;
+  CheckTrue(LRaised, 'a PKCS#12 store with no certificate for its key raises the no-cert-for-key error');
+end;
+
+procedure TTestPkcs12Import.TestLoadPkcs12Credential;
+var
+  LCred: TTlsCredential;
+  LImp: TImportedCredential;
+  LRaised: Boolean;
+begin
+  LCred := TTlsCredential.LoadPkcs12(Crypto, Blob('chain_pfx'), SPassword);
+  CheckEquals(2, System.Length(LCred.CertificateChain),
+    'the loaded PKCS#12 credential is leaf + CA');
+  CheckEquals(0, System.Length(LCred.OcspStaple),
+    'a PKCS#12-loaded credential carries no staple');
+  CheckFalse(Assigned(LCred.OcspStapleCallback),
+    'a PKCS#12-loaded credential carries no staple callback');
+  LImp.CertificateChain := LCred.CertificateChain;
+  LImp.PrivateKey := LCred.PrivateKey;
+  CheckTrue(KeyPairsLeaf(LImp), 'the loaded key pairs the leaf (entry 0)');
+
+  LRaised := False;
+  try
+    TTlsCredential.LoadPkcs12(Crypto, Blob('chain_pfx'), 'not-the-password');
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a wrong PKCS#12 password raises EArgumentTlsLibException');
+end;
+
+procedure TTestPkcs12Import.TestLoadedPkcs12CredentialBuildsServer;
+var
+  LCred: TTlsCredential;
+  LConfig: ITlsServerConfig;
+begin
+  // the forged plaintext store takes no password; an empty passphrase is treated as none
+  LCred := TTlsCredential.LoadPkcs12(Crypto, Blob('nolink_cafirst_pfx'), '');
+  LConfig := TTlsPresets.Compatible(Crypto, Pkix).Server.WithCredential(LCred).Build;
+  CheckEquals(2, System.Length(LConfig.Credential.CertificateChain),
+    'the PKCS#12-loaded credential freezes leaf + CA into the config');
+end;
+
+function TTestPkcs12Import.ImportFailure(const AField: string): string;
+begin
+  Result := '';
+  try
+    TTlsLibTestProviders.Crypto(TCryptoProviderChoice.Portable).Signing.ImportPkcs12(
+      Blob(AField), nil);
+  except
+    on E: Exception do
+      Result := E.ClassName + ': ' + E.Message;
+  end;
+end;
+
+procedure TTestPkcs12Import.TestUnsupportedKeyIsReportedAsUnsupported;
+begin
+  CheckEquals('ENotSupportedTlsLibException: the private key uses an algorithm this library ' +
+    'cannot sign with', ImportFailure('unsupp_pfx'),
+    'a DSA key is an unsupported algorithm, not a malformed store');
+end;
+
+procedure TTestPkcs12Import.TestUnsupportedKeyBesideAnotherKeyIsMultipleKeys;
+var
+  LFailure: string;
+begin
+  LFailure := ImportFailure('unsupp_multikey_pfx');
+  CheckEquals(1, Pos('EArgumentTlsLibException: the PKCS#12 blob holds more than one private-key',
+    LFailure), 'two keys are ambiguous whatever their algorithms; got: ' + LFailure);
+end;
+
+procedure TTestPkcs12Import.TestUnsupportedCurveBesideAnotherKeyIsMultipleKeys;
+var
+  LFailure: string;
+begin
+  LFailure := ImportFailure('k1_multikey_pfx');
+  CheckEquals(1, Pos('EArgumentTlsLibException: the PKCS#12 blob holds more than one private-key',
+    LFailure), 'a second key makes the store ambiguous before any scheme is derived; got: '
+    + LFailure);
+end;
+
+procedure TTestPkcs12Import.TestUnsupportedCurveWithNoPairingCertIsNoCertForKey;
+begin
+  CheckEquals('EArgumentTlsLibException: the PKCS#12 blob holds no certificate for its ' +
+    'private key', ImportFailure('k1_nocert_pfx'),
+    'the missing certificate is reported before the curve is judged');
 end;
 
 initialization

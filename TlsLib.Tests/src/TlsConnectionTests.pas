@@ -1,0 +1,2606 @@
+{ *********************************************************************************** }
+{ *                                 TlsLib Library                                  * }
+{ *                          Author - Ugochukwu Mmaduekwe                           * }
+{ *                  Github Repository <https://github.com/Xor-el>                  * }
+{ *                                                                                 * }
+{ *  Distributed under the MIT software license, see the accompanying file LICENSE  * }
+{ *          or visit http://www.opensource.org/licenses/mit-license.php.           * }
+{ * ******************************************************************************* * }
+
+(* &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&& *)
+
+unit TlsConnectionTests;
+
+interface
+
+{$IFDEF FPC}
+{$MODE DELPHI}
+{$ENDIF FPC}
+
+uses
+{$IFDEF FPC}
+  fpcunit,
+  testregistry,
+{$ELSE}
+  TestFramework,
+{$ENDIF FPC}
+  Classes,
+  SysUtils,
+  TlpPem,
+  TlpTlsAlert,
+  TlpAlpnProtocols,
+  TlpTlsVersion,
+  TlpIPkixProvider,
+  TlpDefaultCryptoProvider,
+  TlpDefaultPkixProvider,
+  TlpICertificateTrust,
+  TlpITrustAnchorStore,
+  TlpTrustAnchorStore,
+  TlpTrustTypes,
+  TlpServerName,
+  TlpTrustPolicy,
+  TlpICertificateVerifierSource,
+  TlpCertificateVerifierSource,
+  TlpTlsCredential,
+  TlpITlsConfig,
+  TlpITlsConfigBuilder,
+  TlpTlsPresets,
+  TlpISystemTrustInstaller,
+  TlpITlsConfigMemo,
+  TlpTlsConfigMemo,
+  TlpITlsTransport,
+  TlpIClock,
+  MockClock,
+  MockCertificateVerifiers,
+  TlpTlsLibExceptions,
+  TlpTlsConnection,
+  TlpTlsEngineFactory,
+  TlpNegotiationTypes,
+  TlpNegotiationPolicy,
+  TlsLibTestCertificates,
+  TlsLibTestBase;
+
+type
+  TTestTlsConnection = class(TTlsLibAlgorithmTestCase)
+  strict private
+    function StubVerifyCallback(const APresented, AValidated: TArray<TBytes>;
+      const AHostName: string): Boolean;
+    function StubResolver(const ACtx: TCertificateVerdictContext;
+      out ARejectAlert: TTlsAlertDescription): Boolean;
+    function StubResolverAlt(const ACtx: TCertificateVerdictContext;
+      out ARejectAlert: TTlsAlertDescription): Boolean;
+    // client options with a trust source so the build always succeeds
+    function ClientOptsWithStore: TTlsOptions;
+    // server options with a valid credential so the build always succeeds
+    function ServerOptsWithCredential: TTlsOptions;
+    function RaisesStreamError(const AOpts: TTlsOptions;
+      AIsClient: Boolean; out AMessage: string): Boolean;
+    function PemChain: TBytes;
+    function Pkcs12Options(const AField: string): TTlsOptions;
+  published
+    // credential forms
+    procedure TestServerBuildsFromPkcs12;
+    procedure TestClientBuildsFromPkcs12;
+    procedure TestPkcs12WrongPasswordRaises;
+    procedure TestMultiKeyPkcs12Raises;
+    procedure TestServerBuildsFromCredentialFiles;
+    procedure TestPkcs12WithPrivateKeyRaises;
+    procedure TestPemChainOrPkcs12ReadsPemAsChain;
+    procedure TestPemChainOrPkcs12ReadsNonPemWithoutKeyAsPkcs12;
+    procedure TestPemChainOrPkcs12ReadsNonPemWithKeyAsChain;
+    procedure TestClientKeyWithoutCertificateRaises;
+    procedure TestServerNoCredentialNamesTheHint;
+    procedure TestEncryptedKeyWithoutPasswordNamesPassword;
+    procedure TestEncryptedKeyWithPasswordIsDecrypted;
+    procedure TestInlineCredentialBytesAreNotWiped;
+    procedure TestSignatureCredentialFormChangesKey;
+    procedure TestSignaturePkcs12BytesChangeKey;
+    procedure TestGuardConflictOnCredentialFormAndPassword;
+    // composer - client shape (a concern per assertion)
+    procedure TestClientDefaultsToSharedProviders;
+    procedure TestClientUsesInjectedProviders;
+    procedure TestClientCustomStoreComposes;
+    procedure TestClientNoSourceFailsClosedWithHint;
+    procedure TestClientInsecureSkipVerifyBuildsWithSkipFlag;
+    procedure TestClientVerifyPeerOffSetsSkipFlag;
+    procedure TestClientCheckHostNameOffDisablesNameCheck;
+    procedure TestClientServerNameIndicationForwarded;
+    procedure TestClientAlpnForwarded;
+    procedure TestClientVerifyCallbackForwarded;
+    procedure TestClientVerdictResolverArmsLiveRevocation;
+    procedure TestClientNoResolverLeavesInlineVerdict;
+    procedure TestClientResumptionOnAddsCache;
+    procedure TestClientResumptionOffDisablesCache;
+    procedure TestClientSystemTrustInstallerCalledForClientRole;
+    procedure TestClientVerifierComposesAndBuilds;
+    procedure TestClientVerifierWithAnchorConflictPropagates;
+    procedure TestClientDelegateSystemTrustWithHostStoreNamesTheKnobs;
+    procedure TestClientHostVerifierConflictIsNotBlamedOnSystemTrust;
+    procedure TestHostServerConfigWithEarlyDataIsRefused;
+    procedure TestClientVerifierWithVerificationOffIsRefused;
+    procedure TestClientEmptyCustomStoreFailsClosed;
+    procedure TestClientRaisingInstallerPropagates;
+    // composer - server shape
+    procedure TestServerNoCredentialRaises;
+    procedure TestServerCredentialBuilds;
+    procedure TestDefaultOptionsRequestNoClientAuth;
+    procedure TestServerNoClientSourceLeavesNoClientAuth;
+    procedure TestServerRequestedModeComposes;
+    procedure TestServerRequiredModeComposes;
+    procedure TestServerAnchorsWithoutModeAreInert;
+    procedure TestServerVerdictResolverArmsLiveRevocation;
+    procedure TestServerVerdictResolverNoModeIsRefused;
+    procedure TestResolverBesideNoClientAuthServerConfigIsRefused;
+    procedure TestServerVerifyCallbackWithoutClientAuthIsRefused;
+    procedure TestResolverBesideNonDeferringClientConfigIsRefused;
+    procedure TestResolverBesideNonDeferringServerConfigIsRefused;
+    procedure TestServerModeWithVerifyPeerOffRaises;
+    procedure TestServerModeWithSkipVerifyRaises;
+    procedure TestServerClientVerifierWithoutModeRaises;
+    procedure TestServerSystemTrustInertBesidePrivateClientCa;
+    procedure TestServerSystemTrustOnlySourceFailsLoud;
+    procedure TestServerSystemTrustNotInstalledWithoutMode;
+    procedure TestServerResumptionMintsDefaultStek;
+    // signatures
+    procedure TestSignatureEqualOptionsEqualKeys;
+    procedure TestSignatureEachConcernChangesKey;
+    procedure TestConnectionRefusesANilConfigOrTransport;
+    procedure TestConnectionCreateRefusesANilEngineOrTransport;
+    procedure TestSignatureKeysSystemTrustByIdentity;
+    procedure TestSignatureExcludesResolverAndTimeout;
+    procedure TestSignaturePasswordNotInClear;
+    // resolve + memo + config-in + guard
+    procedure TestResolveMemoisesBuildOnce;
+    procedure TestResolveConfigInReturnedAsIs;
+    procedure TestGuardConflictOnEachField;
+    procedure TestGuardConflictOnSecurityToggles;
+    procedure TestGuardIncludesVerifyCallback;
+    procedure TestGuardMessageNamesTheProperty;
+    procedure TestGuardIgnoresResolverAndTimeout;
+    procedure TestServerModeWithoutSourceRaises;
+    procedure TestServerGuardAllowsClientOnlyOptions;
+    procedure TestClientGuardFlagsServerCertVerifier;
+    procedure TestServerVerifyCallbackForwardedUnderClientAuth;
+    procedure TestServerGuardFlagsVerifyCallback;
+    procedure TestTransportCapIsAnAbsoluteDeadline;
+    procedure TestTransportRefusesANilClock;
+    procedure TestRefusedEngineBuildReleasesTheTransport;
+    procedure TestConnectionMeasuresTheCapOnTheConfigsMonotonicClock;
+    // timed transport
+    procedure TestTransportTimesOutWhenSilent;
+    procedure TestApplicationReadTimeoutRaisesTheRetryableReadTimeout;
+    procedure TestCapCheckBetweenRetriesHonoursTheDeadline;
+    procedure TestSupportedVersionsOptionNarrowsTheOffer;
+    procedure TestSupportedVersionsOrderIsPartOfTheMemoKey;
+    procedure TestSupportedVersionsRefusesUnknownAndDuplicateCodes;
+    procedure TestSupportedVersionsConflictsWithASuppliedConfig;
+    procedure TestHostCipherListNarrowsAndOrdersTheBuiltConfig;
+    procedure TestHostCipherListNamingNoTls12SuiteDropsTls12;
+    procedure TestHostCipherListLeavesNoUsableSuiteIsRefused;
+    procedure TestHostCipherListNamingOnlyTls12SuitesRefusesAPinnedTls13Only;
+    procedure TestServerHostCipherListNamingOnlyTls12SuitesRefusesAPinnedTls13Only;
+    procedure TestHostCipherListIsPartOfTheMemoKey;
+    procedure TestHostCipherListConflictsWithASuppliedConfig;
+    procedure TestTransportReturnsDataWhenReadable;
+    procedure TestTransportCapZeroDoesNotWait;
+    procedure TestTransportNegativeReceiveRaisesStreamError;
+    procedure TestTransportZeroReceiveIsEof;
+    procedure TestTransportWriteCompletesOverPartialSends;
+    procedure TestTransportSetReadTimeoutIsObservable;
+  end;
+
+  TTestHostCipherList = class(TTlsLibTestCase)
+  strict private
+    function Refused(const AText: string; out AMessage: string): Boolean;
+    function Codes(const AText: string): TArray<UInt16>;
+  published
+    procedure TestIanaAndOpenSslNamesMapToTheSameCodes;
+    procedure TestSeparatorsAndRunsOfThem;
+    procedure TestCaseIsIgnoredAndDuplicatesKeepTheFirstPosition;
+    procedure TestEmptyAndDefaultMeanTheHostDefault;
+    procedure TestExpressionsAndUnimplementedSuitesAreRefused;
+    procedure TestDefaultBesideNamesIsRefused;
+  end;
+
+implementation
+
+type
+  // records which role method the composer invoked, and with which pkix; installs a real root store
+  // so the surrounding build still succeeds. Optionally raises to prove propagation.
+  TFakeSystemTrustInstaller = class(TInterfacedObject, ISystemTrustInstaller)
+  strict private
+    FRaise: Boolean;
+    FStore: ITrustAnchorStore;
+  public
+    ClientRoleCalled: Boolean;
+    ClientPkix: IPkixProvider;
+    ExtraAnchors: ITrustAnchorStore;
+    // unique per instance unless a test sets it, so two fakes differ the way two installers
+    // installing different roots do
+    InstallerIdentity: string;
+    // refuses host roots beside it
+    DelegateOnly: Boolean;
+    constructor Create(ARaise: Boolean; const AStore: ITrustAnchorStore);
+    function Identity: string;
+    function ServerVerification(const APkix: IPkixProvider;
+      const AExtraAnchors: ITrustAnchorStore): IServerVerification;
+  end;
+
+  // a timed transport over an in-memory inbound buffer, with a switchable readiness answer and a
+  // per-send cap so a partial-write loop can be exercised
+  TTestMemoryTransport = class(TTlsTimedTransportBase)
+  strict private
+    FInbound: TBytes;
+    FInPos: Int32;
+    FReadable: Boolean;
+    FReceiveNegative: Boolean;
+    FMaxSend: Int32;
+    FOutbound: TBytes;
+    FLastWaitMs: Int32;
+    FDestroyedFlag: PBoolean;
+  strict protected
+    function WaitReadable(AMs: Int32): Boolean; override;
+    function ReceiveRaw(var ABuffer: TBytes; AOffset, AMaxLength: Int32): Int32; override;
+    function SendRaw(const ABuffer: TBytes; AOffset, ALength: Int32): Int32; override;
+  public
+    constructor Create(const AInbound: TBytes; AReadable: Boolean); overload;
+    constructor Create(const AInbound: TBytes; AReadable: Boolean;
+      const AClock: ITlsMonotonicClock); overload;
+    destructor Destroy; override;
+    /// <summary>Sets AFlag when this transport is destroyed, so a test can prove it was released.</summary>
+    procedure ReportDestructionTo(AFlag: PBoolean);
+    function ArmedTimeout: Int32;
+    /// <summary>What a host does between receive retries: the base's cap check.</summary>
+    procedure PollCap;
+    property Outbound: TBytes read FOutbound;
+    property ReceiveNegative: Boolean read FReceiveNegative write FReceiveNegative;
+    property MaxSend: Int32 read FMaxSend write FMaxSend;
+    /// <summary>The wait budget the last readiness check was given.</summary>
+    property LastWaitMs: Int32 read FLastWaitMs;
+  end;
+
+{ TFakeSystemTrustInstaller }
+
+constructor TFakeSystemTrustInstaller.Create(ARaise: Boolean;
+  const AStore: ITrustAnchorStore);
+var
+  LGuid: TGuid;
+begin
+  inherited Create;
+  FRaise := ARaise;
+  FStore := AStore;
+  CreateGUID(LGuid);
+  InstallerIdentity := 'fake-' + GuidToString(LGuid);
+end;
+
+function TFakeSystemTrustInstaller.Identity: string;
+begin
+  Result := InstallerIdentity;
+end;
+
+function TFakeSystemTrustInstaller.ServerVerification(const APkix: IPkixProvider;
+  const AExtraAnchors: ITrustAnchorStore): IServerVerification;
+begin
+  if FRaise then
+    raise EInvalidOperationTlsLibException.Create('installer refused');
+  ClientRoleCalled := True;
+  ClientPkix := APkix;
+  ExtraAnchors := AExtraAnchors;
+  if DelegateOnly and (AExtraAnchors <> nil) then
+    raise EInvalidOperationTlsLibException.Create('host roots beside the delegate');
+  Result := TServerVerification.WebPki(FStore).Build;
+end;
+
+{ TTestMemoryTransport }
+
+destructor TTestMemoryTransport.Destroy;
+begin
+  if FDestroyedFlag <> nil then
+    FDestroyedFlag^ := True;
+  inherited Destroy;
+end;
+
+procedure TTestMemoryTransport.ReportDestructionTo(AFlag: PBoolean);
+begin
+  FDestroyedFlag := AFlag;
+end;
+
+constructor TTestMemoryTransport.Create(const AInbound: TBytes; AReadable: Boolean);
+begin
+  Create(AInbound, AReadable, TMockMonotonicClock.Create(0) as ITlsMonotonicClock);
+end;
+
+constructor TTestMemoryTransport.Create(const AInbound: TBytes; AReadable: Boolean;
+  const AClock: ITlsMonotonicClock);
+begin
+  inherited Create;
+  UseClock(AClock);
+  FInbound := AInbound;
+  FInPos := 0;
+  FReadable := AReadable;
+  FMaxSend := System.MaxInt;
+end;
+
+function TTestMemoryTransport.ArmedTimeout: Int32;
+begin
+  Result := ReadTimeoutMs;
+end;
+
+procedure TTestMemoryTransport.PollCap;
+begin
+  CheckReadCap;
+end;
+
+function TTestMemoryTransport.WaitReadable(AMs: Int32): Boolean;
+begin
+  FLastWaitMs := AMs;
+  Result := FReadable;
+end;
+
+function TTestMemoryTransport.ReceiveRaw(var ABuffer: TBytes; AOffset,
+  AMaxLength: Int32): Int32;
+var
+  LN: Int32;
+begin
+  if FReceiveNegative then
+    Exit(-1);
+  LN := System.Length(FInbound) - FInPos;
+  if LN > AMaxLength then
+    LN := AMaxLength;
+  if LN <= 0 then
+    Exit(0);
+  System.Move(FInbound[FInPos], ABuffer[AOffset], LN);
+  Inc(FInPos, LN);
+  Result := LN;
+end;
+
+function TTestMemoryTransport.SendRaw(const ABuffer: TBytes; AOffset,
+  ALength: Int32): Int32;
+var
+  LN, LBase: Int32;
+begin
+  LN := ALength;
+  if LN > FMaxSend then
+    LN := FMaxSend;
+  LBase := System.Length(FOutbound);
+  SetLength(FOutbound, LBase + LN);
+  System.Move(ABuffer[AOffset], FOutbound[LBase], LN);
+  Result := LN;
+end;
+
+{ TTestTlsConnection }
+
+function TTestTlsConnection.StubVerifyCallback(const APresented, AValidated: TArray<TBytes>;
+  const AHostName: string): Boolean;
+begin
+  Result := True;
+end;
+
+function TTestTlsConnection.StubResolver(const ACtx: TCertificateVerdictContext;
+  out ARejectAlert: TTlsAlertDescription): Boolean;
+begin
+  ARejectAlert := TTlsAlertDescription.BadCertificate;
+  Result := True;
+end;
+
+function TTestTlsConnection.StubResolverAlt(const ACtx: TCertificateVerdictContext;
+  out ARejectAlert: TTlsAlertDescription): Boolean;
+begin
+  ARejectAlert := TTlsAlertDescription.BadCertificate;
+  Result := False;
+end;
+
+function TTestTlsConnection.ClientOptsWithStore: TTlsOptions;
+begin
+  Result := TTlsOptions.Default;
+  Result.Crypto := Crypto;
+  Result.Pkix := Pkix;
+  Result.CustomTrustStore := TTlsLibTestCertificates.EcP256RootStore;
+  Result.TrustSourceHint := 'a trust anchor bundle, system trust, or a custom store';
+end;
+
+function TTestTlsConnection.ServerOptsWithCredential: TTlsOptions;
+begin
+  Result := TTlsOptions.Default;
+  Result.Crypto := Crypto;
+  Result.Pkix := Pkix;
+  Result.Certificate := TTlsBlobSource.FromBytes(
+    TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_cert'));
+  Result.PrivateKey := TTlsBlobSource.FromBytes(
+    TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_key'));
+  Result.TrustSourceHint := 'a client-CA bundle';
+  Result.ClientAuthSourceHint := 'a client-CA bundle';
+end;
+
+function TTestTlsConnection.RaisesStreamError(const AOpts: TTlsOptions;
+  AIsClient: Boolean; out AMessage: string): Boolean;
+begin
+  Result := False;
+  AMessage := '';
+  try
+    if AIsClient then
+      TTlsConfigComposer.BuildClientConfig(AOpts)
+    else
+      TTlsConfigComposer.BuildServerConfig(AOpts);
+  except
+    on E: ETlsStreamError do
+    begin
+      Result := True;
+      AMessage := E.Message;
+    end;
+  end;
+end;
+
+function TTestTlsConnection.PemChain: TBytes;
+var
+  LBlocks: TArray<TPemBlock>;
+begin
+  SetLength(LBlocks, 1);
+  LBlocks[0].PemType := 'CERTIFICATE';
+  LBlocks[0].Content :=
+    TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_cert');
+  Result := TPem.WriteBlocks(LBlocks);
+end;
+
+function TTestTlsConnection.Pkcs12Options(const AField: string): TTlsOptions;
+begin
+  Result := TTlsOptions.Default;
+  Result.Crypto := Crypto;
+  Result.Pkix := Pkix;
+  Result.Certificate := TTlsBlobSource.FromBytes(
+    TTlsLibTestCertificates.Field('Certs/Pkcs12.txt', AField));
+  Result.KeyPassword := 'tlslib';
+  Result.CredentialForm := TTlsCredentialForm.Pkcs12;
+end;
+
+procedure TTestTlsConnection.TestServerBuildsFromPkcs12;
+begin
+  CheckNotNull(TTlsConfigComposer.BuildServerConfig(Pkcs12Options('chain_pfx')),
+    'a server config builds from a PKCS#12 identity');
+end;
+
+procedure TTestTlsConnection.TestClientBuildsFromPkcs12;
+var
+  LOpts: TTlsOptions;
+begin
+  LOpts := Pkcs12Options('chain_pfx');
+  LOpts.CustomTrustStore := TTlsLibTestCertificates.EcP256RootStore;
+  CheckNotNull(TTlsConfigComposer.BuildClientConfig(LOpts),
+    'a client config builds from a PKCS#12 identity');
+end;
+
+procedure TTestTlsConnection.TestPkcs12WrongPasswordRaises;
+var
+  LOpts: TTlsOptions;
+  LRaised: Boolean;
+begin
+  LOpts := Pkcs12Options('chain_pfx');
+  LOpts.KeyPassword := 'not-the-password';
+  LRaised := False;
+  try
+    TTlsConfigComposer.BuildServerConfig(LOpts);
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a wrong PKCS#12 password fails closed');
+end;
+
+procedure TTestTlsConnection.TestMultiKeyPkcs12Raises;
+var
+  LRaised: Boolean;
+begin
+  LRaised := False;
+  try
+    TTlsConfigComposer.BuildServerConfig(Pkcs12Options('multikey_pfx'));
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a PKCS#12 store with several keys is refused');
+end;
+
+procedure TTestTlsConnection.TestServerBuildsFromCredentialFiles;
+var
+  LOpts: TTlsOptions;
+  LCertPath, LKeyPath: string;
+
+  procedure WriteFile(const APath: string; const AData: TBytes);
+  var
+    LStream: TFileStream;
+  begin
+    LStream := TFileStream.Create(APath, fmCreate);
+    try
+      LStream.WriteBuffer(AData[0], System.Length(AData));
+    finally
+      LStream.Free;
+    end;
+  end;
+
+begin
+  LCertPath := TempPath('credential_fixture.crt');
+  LKeyPath := TempPath('credential_fixture.key');
+  WriteFile(LCertPath,
+    TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_cert'));
+  WriteFile(LKeyPath,
+    TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_key'));
+  LOpts := TTlsOptions.Default;
+  LOpts.Crypto := Crypto;
+  LOpts.Pkix := Pkix;
+  LOpts.Certificate := TTlsBlobSource.FromFile(LCertPath);
+  LOpts.PrivateKey := TTlsBlobSource.FromFile(LKeyPath);
+  CheckNotNull(TTlsConfigComposer.BuildServerConfig(LOpts),
+    'a server config builds from a certificate file and a key file');
+end;
+
+procedure TTestTlsConnection.TestPkcs12WithPrivateKeyRaises;
+var
+  LOpts: TTlsOptions;
+  LMsg: string;
+begin
+  LOpts := Pkcs12Options('chain_pfx');
+  LOpts.PrivateKey := TTlsBlobSource.FromBytes(
+    TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_key'));
+  CheckTrue(RaisesStreamError(LOpts, False, LMsg),
+    'a PKCS#12 identity beside a separate private key is refused');
+  CheckTrue(Pos('PKCS#12', LMsg) > 0, 'the message names PKCS#12: ' + LMsg);
+end;
+
+procedure TTestTlsConnection.TestPemChainOrPkcs12ReadsPemAsChain;
+var
+  LOpts: TTlsOptions;
+begin
+  LOpts := ServerOptsWithCredential;
+  LOpts.Certificate := TTlsBlobSource.FromBytes(PemChain);
+  LOpts.CredentialForm := TTlsCredentialForm.PemChainOrPkcs12;
+  CheckNotNull(TTlsConfigComposer.BuildServerConfig(LOpts),
+    'a PEM source with a key is read as a chain');
+end;
+
+procedure TTestTlsConnection.TestPemChainOrPkcs12ReadsNonPemWithoutKeyAsPkcs12;
+var
+  LOpts: TTlsOptions;
+begin
+  LOpts := Pkcs12Options('chain_pfx');
+  LOpts.CredentialForm := TTlsCredentialForm.PemChainOrPkcs12;
+  CheckNotNull(TTlsConfigComposer.BuildServerConfig(LOpts),
+    'a non-PEM source with no key is read as a PKCS#12 identity');
+end;
+
+procedure TTestTlsConnection.TestPemChainOrPkcs12ReadsNonPemWithKeyAsChain;
+var
+  LOpts: TTlsOptions;
+begin
+  LOpts := ServerOptsWithCredential;
+  LOpts.CredentialForm := TTlsCredentialForm.PemChainOrPkcs12;
+  CheckNotNull(TTlsConfigComposer.BuildServerConfig(LOpts),
+    'a DER certificate with a key is read as a chain');
+end;
+
+procedure TTestTlsConnection.TestClientKeyWithoutCertificateRaises;
+var
+  LOpts: TTlsOptions;
+  LMsg: string;
+begin
+  LOpts := ClientOptsWithStore;
+  LOpts.PrivateKey := TTlsBlobSource.FromBytes(
+    TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_key'));
+  LOpts.CredentialSourceHint := 'CertificateFile';
+  CheckTrue(RaisesStreamError(LOpts, True, LMsg),
+    'a client key with no certificate is refused, not dropped');
+  CheckTrue(Pos('CertificateFile', LMsg) > 0, 'the message carries the hint: ' + LMsg);
+end;
+
+procedure TTestTlsConnection.TestServerNoCredentialNamesTheHint;
+var
+  LOpts: TTlsOptions;
+  LMsg: string;
+begin
+  LOpts := TTlsOptions.Default;
+  LOpts.CredentialSourceHint := 'CertificateFile';
+  CheckTrue(RaisesStreamError(LOpts, False, LMsg), 'a server without a certificate raises');
+  CheckTrue(Pos('CertificateFile', LMsg) > 0, 'the message carries the hint: ' + LMsg);
+end;
+
+procedure TTestTlsConnection.TestEncryptedKeyWithoutPasswordNamesPassword;
+var
+  LOpts: TTlsOptions;
+  LFields: TStringList;
+  LMsg: string;
+begin
+  LOpts := ServerOptsWithCredential;
+  LFields := LoadVectorFields('Certs/ImportKeys.txt');
+  try
+    LOpts.PrivateKey := TTlsBlobSource.FromBytes(DecodeHex(LFields.Values['rsa_enc_pem']));
+  finally
+    LFields.Free;
+  end;
+  LMsg := '';
+  try
+    TTlsConfigComposer.BuildServerConfig(LOpts);
+  except
+    on E: EArgumentTlsLibException do
+      LMsg := E.Message;
+  end;
+  CheckTrue(Pos('a password is required', LMsg) > 0,
+    'an encrypted key with no password names the missing password: ' + LMsg);
+end;
+
+procedure TTestTlsConnection.TestEncryptedKeyWithPasswordIsDecrypted;
+var
+  LOpts: TTlsOptions;
+  LFields: TStringList;
+  LMismatch: Boolean;
+begin
+  LOpts := ServerOptsWithCredential;
+  LFields := LoadVectorFields('Certs/ImportKeys.txt');
+  try
+    LOpts.PrivateKey := TTlsBlobSource.FromBytes(DecodeHex(LFields.Values['rsa_enc_pem']));
+  finally
+    LFields.Free;
+  end;
+  LOpts.KeyPassword := 'tlslib';
+  // the RSA key is not the EC leaf's, so a decrypted key reaches the pairing check
+  LMismatch := False;
+  try
+    TTlsConfigComposer.BuildServerConfig(LOpts);
+  except
+    on E: EInvalidOperationTlsLibException do
+      LMismatch := Pos('does not match the public key', E.Message) > 0;
+  end;
+  CheckTrue(LMismatch, 'an encrypted key is decrypted with its password');
+end;
+
+procedure TTestTlsConnection.TestInlineCredentialBytesAreNotWiped;
+var
+  LOpts: TTlsOptions;
+  LKeyBefore, LPfxBefore: TBytes;
+begin
+  LOpts := ServerOptsWithCredential;
+  LKeyBefore := System.Copy(LOpts.PrivateKey.Data);
+  TTlsConfigComposer.BuildServerConfig(LOpts);
+  CheckTrue(AreEqual(LKeyBefore, LOpts.PrivateKey.Data),
+    'inline key bytes belong to the caller and stay intact');
+  LOpts := Pkcs12Options('chain_pfx');
+  LPfxBefore := System.Copy(LOpts.Certificate.Data);
+  TTlsConfigComposer.BuildServerConfig(LOpts);
+  CheckTrue(AreEqual(LPfxBefore, LOpts.Certificate.Data),
+    'inline PKCS#12 bytes belong to the caller and stay intact');
+end;
+
+procedure TTestTlsConnection.TestSignatureCredentialFormChangesKey;
+var
+  LA, LB: TTlsOptions;
+begin
+  LA := Pkcs12Options('chain_pfx');
+  LB := LA;
+  LB.CredentialForm := TTlsCredentialForm.PemChainOrPkcs12;
+  CheckTrue(TTlsConfigComposer.ServerSignature(LA) <> TTlsConfigComposer.ServerSignature(LB),
+    'the form changes the server key');
+  CheckTrue(TTlsConfigComposer.ClientSignature(LA) <> TTlsConfigComposer.ClientSignature(LB),
+    'the form changes the client key');
+end;
+
+procedure TTestTlsConnection.TestSignaturePkcs12BytesChangeKey;
+var
+  LA, LB, LC: TTlsOptions;
+begin
+  LA := Pkcs12Options('chain_pfx');
+  LB := Pkcs12Options('rsa_pfx');
+  LC := Pkcs12Options('chain_pfx');
+  CheckTrue(TTlsConfigComposer.ServerSignature(LA) <> TTlsConfigComposer.ServerSignature(LB),
+    'different PKCS#12 stores give different keys');
+  CheckEquals(TTlsConfigComposer.ServerSignature(LA), TTlsConfigComposer.ServerSignature(LC),
+    'the same PKCS#12 bytes reuse the key');
+end;
+
+procedure TTestTlsConnection.TestGuardConflictOnCredentialFormAndPassword;
+
+  function Conflicts(const AOpts: TTlsOptions; AIsClient: Boolean): Boolean;
+  begin
+    Result := False;
+    try
+      TTlsConfigComposer.GuardNoConflict(AOpts, AIsClient, 'Config');
+    except
+      on E: ETlsStreamError do
+        Result := True;
+    end;
+  end;
+
+var
+  LOpts: TTlsOptions;
+begin
+  LOpts := TTlsOptions.Default;
+  LOpts.CredentialForm := TTlsCredentialForm.Pkcs12;
+  CheckTrue(Conflicts(LOpts, True) and Conflicts(LOpts, False),
+    'a non-default credential form conflicts with a supplied config');
+  LOpts := TTlsOptions.Default;
+  LOpts.KeyPassword := 'tlslib';
+  CheckTrue(Conflicts(LOpts, True) and Conflicts(LOpts, False),
+    'a key password conflicts with a supplied config');
+end;
+
+procedure TTestTlsConnection.TestClientDefaultsToSharedProviders;
+var
+  LOpts: TTlsOptions;
+  LConfig: ITlsClientConfig;
+begin
+  LOpts := TTlsOptions.Default;
+  LOpts.CustomTrustStore := TTlsLibTestCertificates.EcP256RootStore;
+  LConfig := TTlsConfigComposer.BuildClientConfig(LOpts);
+  CheckTrue(LConfig.Crypto = TDefaultCryptoProvider.Shared,
+    'nil crypto falls back to the shared default');
+  CheckTrue(LConfig.Pkix = TDefaultPkixProvider.Shared,
+    'nil pkix falls back to the shared default');
+end;
+
+procedure TTestTlsConnection.TestClientUsesInjectedProviders;
+var
+  LConfig: ITlsClientConfig;
+begin
+  LConfig := TTlsConfigComposer.BuildClientConfig(ClientOptsWithStore);
+  CheckTrue(LConfig.Crypto = Crypto, 'the injected crypto provider is used');
+  CheckTrue(LConfig.Pkix = Pkix, 'the injected pkix provider is used');
+end;
+
+procedure TTestTlsConnection.TestClientCustomStoreComposes;
+var
+  LConfig: ITlsClientConfig;
+begin
+  LConfig := TTlsConfigComposer.BuildClientConfig(ClientOptsWithStore);
+  CheckNotNull(LConfig.TrustStore, 'a custom store is composed into the trust source');
+end;
+
+procedure TTestTlsConnection.TestClientNoSourceFailsClosedWithHint;
+var
+  LOpts: TTlsOptions;
+  LMsg: string;
+begin
+  LOpts := TTlsOptions.Default;
+  LOpts.TrustSourceHint := 'a RootCertFile bundle';
+  CheckTrue(RaisesStreamError(LOpts, True, LMsg),
+    'verifying with no trust source fails closed');
+  CheckTrue(Pos('a RootCertFile bundle', LMsg) > 0,
+    'the message splices the host trust-source hint');
+end;
+
+procedure TTestTlsConnection.TestClientInsecureSkipVerifyBuildsWithSkipFlag;
+var
+  LOpts: TTlsOptions;
+  LConfig: ITlsClientConfig;
+begin
+  LOpts := TTlsOptions.Default;
+  LOpts.InsecureSkipVerify := True;
+  LConfig := TTlsConfigComposer.BuildClientConfig(LOpts);
+  CheckTrue(LConfig.DangerousTrust.InsecureSkipVerify, 'the loud skip flag is set');
+  CheckNull(LConfig.TrustStore, 'skipping composes no anchor store; nothing would consult it');
+end;
+
+procedure TTestTlsConnection.TestClientVerifyPeerOffSetsSkipFlag;
+var
+  LOpts: TTlsOptions;
+  LConfig: ITlsClientConfig;
+begin
+  LOpts := TTlsOptions.Default;
+  LOpts.VerifyPeer := False;
+  LConfig := TTlsConfigComposer.BuildClientConfig(LOpts);
+  CheckTrue(LConfig.DangerousTrust.InsecureSkipVerify,
+    'VerifyPeer off maps onto the loud skip flag');
+end;
+
+procedure TTestTlsConnection.TestClientCheckHostNameOffDisablesNameCheck;
+var
+  LOpts: TTlsOptions;
+begin
+  LOpts := ClientOptsWithStore;
+  LOpts.CheckHostName := False;
+  CheckFalse(TTlsConfigComposer.BuildClientConfig(LOpts).CheckServerName,
+    'CheckHostName off disables server-name checking');
+end;
+
+procedure TTestTlsConnection.TestClientServerNameIndicationForwarded;
+var
+  LOpts: TTlsOptions;
+  LConfig: ITlsClientConfig;
+begin
+  LOpts := ClientOptsWithStore;
+  LOpts.ServerNameIndication := TServerNameIndication.Omit;
+  LConfig := TTlsConfigComposer.BuildClientConfig(LOpts);
+  CheckEquals(Ord(TServerNameIndication.Omit), Ord(LConfig.ServerNameIndication),
+    'the SNI choice reaches the client config');
+  CheckTrue(LConfig.CheckServerName, 'omitting SNI leaves the name check on');
+end;
+
+procedure TTestTlsConnection.TestClientAlpnForwarded;
+var
+  LOpts: TTlsOptions;
+  LAlpn: TArray<TBytes>;
+begin
+  LOpts := ClientOptsWithStore;
+  LOpts.AlpnProtocols := TArray<string>.Create('h2', 'http/1.1');
+  LAlpn := TTlsConfigComposer.BuildClientConfig(LOpts).AlpnProtocols;
+  CheckEquals(2, System.Length(LAlpn), 'both ALPN protocols are forwarded');
+  CheckEqualBytes('first ALPN protocol', TAlpnProtocols.H2, LAlpn[0]);
+  CheckEqualBytes('second ALPN protocol', TAlpnProtocols.Http11, LAlpn[1]);
+end;
+
+procedure TTestTlsConnection.TestClientVerifyCallbackForwarded;
+var
+  LOpts: TTlsOptions;
+  LConfig: ITlsClientConfig;
+begin
+  LOpts := ClientOptsWithStore;
+  LOpts.VerifyCallback := StubVerifyCallback;
+  LConfig := TTlsConfigComposer.BuildClientConfig(LOpts);
+  CheckTrue(Assigned(LConfig.DangerousTrust.VerifyCallback),
+    'the augment-only verify callback is forwarded');
+end;
+
+procedure TTestTlsConnection.TestClientVerdictResolverArmsLiveRevocation;
+var
+  LOpts: TTlsOptions;
+  LConfig: ITlsClientConfig;
+begin
+  LOpts := ClientOptsWithStore;
+  LOpts.ClientVerdictResolver := StubResolver;
+  LOpts.ClientVerdictDeadlineMs := 1234;
+  LConfig := TTlsConfigComposer.BuildClientConfig(LOpts);
+  CheckEquals(Ord(TVerdictDeferral.LiveRevocation),
+    Ord(LConfig.AsyncCertificateVerdict.Deferral),
+    'a client resolver arms the live-revocation park');
+  CheckEquals(1234, LConfig.AsyncCertificateVerdict.DeadlineMs, 'the deadline is carried');
+end;
+
+procedure TTestTlsConnection.TestClientNoResolverLeavesInlineVerdict;
+begin
+  CheckEquals(Ord(TVerdictDeferral.None),
+    Ord(TTlsConfigComposer.BuildClientConfig(ClientOptsWithStore)
+      .AsyncCertificateVerdict.Deferral),
+    'no resolver keeps the verdict inline');
+end;
+
+procedure TTestTlsConnection.TestClientResumptionOnAddsCache;
+var
+  LConfig: ITlsClientConfig;
+begin
+  LConfig := TTlsConfigComposer.BuildClientConfig(ClientOptsWithStore);
+  CheckTrue(LConfig.Resumption, 'resumption is engaged by default');
+  CheckNotNull(LConfig.SessionCache, 'a session cache is provided');
+end;
+
+procedure TTestTlsConnection.TestClientResumptionOffDisablesCache;
+var
+  LOpts: TTlsOptions;
+begin
+  LOpts := ClientOptsWithStore;
+  LOpts.SessionResumption := False;
+  CheckFalse(TTlsConfigComposer.BuildClientConfig(LOpts).Resumption,
+    'resumption is off when disabled');
+end;
+
+procedure TTestTlsConnection.TestClientSystemTrustInstallerCalledForClientRole;
+var
+  LOpts: TTlsOptions;
+  LFake: TFakeSystemTrustInstaller;
+  LInst: ISystemTrustInstaller;
+begin
+  LFake := TFakeSystemTrustInstaller.Create(False, TTlsLibTestCertificates.EcP256RootStore);
+  LInst := LFake;
+  LOpts := TTlsOptions.Default;
+  LOpts.Pkix := Pkix;
+  LOpts.SystemTrust := LInst;
+  TTlsConfigComposer.BuildClientConfig(LOpts);
+  CheckTrue(LFake.ClientRoleCalled, 'the installer client-role hook ran');
+  CheckTrue(LFake.ClientPkix = Pkix, 'the effective pkix was passed to the installer');
+end;
+
+procedure TTestTlsConnection.TestClientVerifierComposesAndBuilds;
+var
+  LOpts: TTlsOptions;
+  LConfig: ITlsClientConfig;
+begin
+  LOpts := TTlsOptions.Default;
+  LOpts.ServerCertificateVerifier := TFixedVerdictVerifier.CreateRejecting(
+    TTlsAlertDescription.BadCertificate) as IServerCertificateVerifier;
+  LConfig := TTlsConfigComposer.BuildClientConfig(LOpts);
+  CheckNotNull(LConfig.ServerVerifierSource,
+    'a whole-verifier composes into the verifier source');
+end;
+
+procedure TTestTlsConnection.TestClientVerifierWithAnchorConflictPropagates;
+var
+  LOpts: TTlsOptions;
+  LRaised: Boolean;
+  LAlert: TTlsAlertDescription;
+  LMessage: string;
+begin
+  LOpts := TTlsOptions.Default;
+  LOpts.ServerCertificateVerifier := TFixedVerdictVerifier.CreateRejecting(
+    TTlsAlertDescription.BadCertificate) as IServerCertificateVerifier;
+  LOpts.CustomTrustStore := TTlsLibTestCertificates.EcP256RootStore;
+  LRaised := False;
+  LAlert := TTlsAlertDescription.CloseNotify;
+  LMessage := '';
+  try
+    TTlsConfigComposer.BuildClientConfig(LOpts);
+  except
+    on E: ETlsStreamError do
+    begin
+      LRaised := True;
+      LMessage := E.Message;
+      if E.HasAlert then
+        LAlert := E.Alert;
+    end;
+  end;
+  CheckTrue(LRaised, 'a verifier plus an anchor source is refused as a stream error');
+  CheckEquals(Ord(TTlsAlertDescription.InternalError), Ord(LAlert),
+    'the conflict carries internal_error');
+  CheckTrue(Pos('cannot be combined with anchors', LMessage) > 0,
+    'the refusal names the verifier-versus-trust-source conflict');
+end;
+
+procedure TTestTlsConnection.TestClientDelegateSystemTrustWithHostStoreNamesTheKnobs;
+var
+  LOpts: TTlsOptions;
+  LFake: TFakeSystemTrustInstaller;
+  LInst: ISystemTrustInstaller;
+  LHinted: Boolean;
+begin
+  LFake := TFakeSystemTrustInstaller.Create(False, TTlsLibTestCertificates.EcP256RootStore);
+  LFake.DelegateOnly := True;
+  LInst := LFake;
+  LOpts := TTlsOptions.Default;
+  LOpts.SystemTrust := LInst;
+  LOpts.CustomTrustStore := TTlsLibTestCertificates.EcP256RootStore;
+  LOpts.TrustSourceHint := 'MyTrustKnob';
+  LHinted := False;
+  try
+    TTlsConfigComposer.BuildClientConfig(LOpts);
+  except
+    on E: ETlsStreamError do
+      LHinted := Pos('MyTrustKnob', E.Message) > 0;
+  end;
+  CheckTrue(LHinted, 'system trust that refuses host anchors is reported naming the host knobs');
+end;
+
+procedure TTestTlsConnection.TestClientHostVerifierConflictIsNotBlamedOnSystemTrust;
+var
+  LOpts: TTlsOptions;
+  LFake: TFakeSystemTrustInstaller;
+  LInst: ISystemTrustInstaller;
+  LBlamed: Boolean;
+begin
+  LFake := TFakeSystemTrustInstaller.Create(False, TTlsLibTestCertificates.EcP256RootStore);
+  LFake.DelegateOnly := True;
+  LInst := LFake;
+  LOpts := TTlsOptions.Default;
+  LOpts.SystemTrust := LInst;
+  LOpts.ServerCertificateVerifier := TFixedVerdictVerifier.CreateRejecting(
+    TTlsAlertDescription.BadCertificate) as IServerCertificateVerifier;
+  LOpts.CustomTrustStore := TTlsLibTestCertificates.EcP256RootStore;
+  LOpts.TrustSourceHint := 'MyTrustKnob';
+  LBlamed := True;
+  try
+    TTlsConfigComposer.BuildClientConfig(LOpts);
+  except
+    on E: ETlsStreamError do
+      // the host set the verifier, so the message is the verifier conflict, not a delegate limit
+      LBlamed := Pos('could not be set up', E.Message) > 0;
+  end;
+  CheckFalse(LBlamed, 'a verifier beside host trust is reported as that conflict');
+  CheckFalse(LFake.ClientRoleCalled, 'and the system-trust installer is never asked');
+end;
+
+procedure TTestTlsConnection.TestHostServerConfigWithEarlyDataIsRefused;
+var
+  LOpts: TTlsOptions;
+  LRefused: Boolean;
+begin
+  LOpts := TTlsOptions.Default;
+  LOpts.ServerConfig := TTlsPresets.Compatible(Crypto, Pkix).Server
+    .WithCredential(TTlsCredential.Load(Crypto, Pkix,
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_cert'),
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_key')))
+    .Tls13.WithEarlyData(16384).Build;
+  LRefused := False;
+  try
+    TTlsConfigComposer.ResolveServerConfig(LOpts, TTlsConfigMemos.NewServer, 'ServerConfig');
+  except
+    on E: EArgumentTlsLibException do
+      LRefused := Pos('ServerConfig', E.Message) > 0;
+  end;
+  CheckTrue(LRefused, 'a host-driven server config cannot carry 0-RTT it would never deliver');
+end;
+
+procedure TTestTlsConnection.TestClientVerifierWithVerificationOffIsRefused;
+  function Refused(const AOpts: TTlsOptions): Boolean;
+  begin
+    Result := False;
+    try
+      TTlsConfigComposer.BuildClientConfig(AOpts);
+    except
+      on E: ETlsStreamError do
+        Result := Pos('custom server-certificate verifier', E.Message) > 0;
+    end;
+  end;
+
+var
+  LOpts: TTlsOptions;
+begin
+  LOpts := TTlsOptions.Default;
+  LOpts.ServerCertificateVerifier := TFixedVerdictVerifier.CreateRejecting(
+    TTlsAlertDescription.BadCertificate) as IServerCertificateVerifier;
+  LOpts.VerifyPeer := False;
+  CheckTrue(Refused(LOpts), 'a verifier beside VerifyPeer off is refused in adapter terms');
+  LOpts.VerifyPeer := True;
+  LOpts.InsecureSkipVerify := True;
+  CheckTrue(Refused(LOpts), 'a verifier beside skip-verify is refused in adapter terms');
+end;
+
+procedure TTestTlsConnection.TestClientEmptyCustomStoreFailsClosed;
+var
+  LOpts: TTlsOptions;
+  LRaised: Boolean;
+begin
+  // a host-supplied custom store that is empty passes the composer's own source check (non-nil) but
+  // must be refused by the builder's roots gate rather than silently verifying against nothing
+  LOpts := TTlsOptions.Default;
+  LOpts.CustomTrustStore := TTrustAnchorStore.Create(nil) as ITrustAnchorStore;
+  LRaised := False;
+  try
+    TTlsConfigComposer.BuildClientConfig(LOpts);
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'an empty custom trust store fails closed at Build');
+end;
+
+procedure TTestTlsConnection.TestClientRaisingInstallerPropagates;
+var
+  LOpts: TTlsOptions;
+  LInst: ISystemTrustInstaller;
+  LRaised: Boolean;
+begin
+  LInst := TFakeSystemTrustInstaller.Create(True, TTlsLibTestCertificates.EcP256RootStore);
+  LOpts := TTlsOptions.Default;
+  LOpts.Pkix := Pkix;
+  LOpts.SystemTrust := LInst;
+  LRaised := False;
+  try
+    TTlsConfigComposer.BuildClientConfig(LOpts);
+  except
+    on E: EInvalidOperationTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a raising installer propagates out of the build');
+end;
+
+procedure TTestTlsConnection.TestServerNoCredentialRaises;
+var
+  LOpts: TTlsOptions;
+  LMsg: string;
+begin
+  LOpts := TTlsOptions.Default;
+  CheckTrue(RaisesStreamError(LOpts, False, LMsg),
+    'a server without a certificate fails closed');
+end;
+
+procedure TTestTlsConnection.TestServerCredentialBuilds;
+var
+  LConfig: ITlsServerConfig;
+begin
+  LConfig := TTlsConfigComposer.BuildServerConfig(ServerOptsWithCredential);
+  CheckNotNull(LConfig, 'a server config builds from the credential');
+  CheckEquals(Ord(TClientAuthMode.None), Ord(LConfig.ClientAuth),
+    'the default mode requests no client authentication');
+end;
+
+procedure TTestTlsConnection.TestDefaultOptionsRequestNoClientAuth;
+begin
+  CheckEquals(Ord(TClientAuthMode.None), Ord(TTlsOptions.Default.ClientAuth),
+    'client authentication is opt-in: the default mode is None');
+  CheckEquals(Ord(TServerNameIndication.Send), Ord(TTlsOptions.Default.ServerNameIndication),
+    'a client sends SNI by default');
+end;
+
+procedure TTestTlsConnection.TestServerNoClientSourceLeavesNoClientAuth;
+var
+  LOpts: TTlsOptions;
+begin
+  // no mode and no client-trust input: no client auth is requested
+  LOpts := ServerOptsWithCredential;
+  CheckEquals(Ord(TClientAuthMode.None),
+    Ord(TTlsConfigComposer.BuildServerConfig(LOpts).ClientAuth),
+    'no mode means no client authentication');
+end;
+
+procedure TTestTlsConnection.TestServerRequestedModeComposes;
+var
+  LOpts: TTlsOptions;
+begin
+  LOpts := ServerOptsWithCredential;
+  LOpts.TrustAnchors := TArray<TTlsBlobSource>.Create(
+    TTlsBlobSource.FromBytes(
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'root_cert')));
+  LOpts.ClientAuth := TClientAuthMode.Requested;
+  CheckEquals(Ord(TClientAuthMode.Requested),
+    Ord(TTlsConfigComposer.BuildServerConfig(LOpts).ClientAuth),
+    'a Requested mode with a client-CA composes as Requested');
+end;
+
+procedure TTestTlsConnection.TestServerRequiredModeComposes;
+var
+  LOpts: TTlsOptions;
+begin
+  LOpts := ServerOptsWithCredential;
+  LOpts.TrustAnchors := TArray<TTlsBlobSource>.Create(
+    TTlsBlobSource.FromBytes(
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'root_cert')));
+  LOpts.ClientAuth := TClientAuthMode.Required;
+  CheckEquals(Ord(TClientAuthMode.Required),
+    Ord(TTlsConfigComposer.BuildServerConfig(LOpts).ClientAuth),
+    'a Required mode with a client-CA composes as Required');
+end;
+
+procedure TTestTlsConnection.TestServerAnchorsWithoutModeAreInert;
+var
+  LOpts: TTlsOptions;
+  LConfig: ITlsServerConfig;
+begin
+  // named client-CA sources with mode None are inert on the server: they must NOT fail the build (a
+  // shared / process-wide trust setting reaching a server keeps working) and request no client auth
+  LOpts := ServerOptsWithCredential;
+  LOpts.TrustAnchors := TArray<TTlsBlobSource>.Create(
+    TTlsBlobSource.FromBytes(
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'root_cert')));
+  LOpts.SystemTrust := TFakeSystemTrustInstaller.Create(False,
+    TTlsLibTestCertificates.EcP256RootStore);
+  LOpts.CustomTrustStore := TTlsLibTestCertificates.EcP256RootStore;
+  LConfig := TTlsConfigComposer.BuildServerConfig(LOpts);
+  CheckEquals(Ord(TClientAuthMode.None), Ord(LConfig.ClientAuth),
+    'anchors without a mode do not request client authentication');
+
+  // even with verification off (an anchor-bearing server that verifies no peer), mode None builds and
+  // requests no client auth - the verify-off guard fires only under a mode
+  LOpts.VerifyPeer := False;
+  LConfig := TTlsConfigComposer.BuildServerConfig(LOpts);
+  CheckEquals(Ord(TClientAuthMode.None), Ord(LConfig.ClientAuth),
+    'anchors with verification off and no mode still request no client authentication');
+end;
+
+procedure TTestTlsConnection.TestServerVerdictResolverArmsLiveRevocation;
+var
+  LOpts: TTlsOptions;
+  LConfig: ITlsServerConfig;
+begin
+  // a client-CA source, an explicit mode AND a server-role resolver arm the client-cert verdict park
+  LOpts := ServerOptsWithCredential;
+  LOpts.TrustAnchors := TArray<TTlsBlobSource>.Create(
+    TTlsBlobSource.FromBytes(
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'root_cert')));
+  LOpts.ClientAuth := TClientAuthMode.Required;
+  LOpts.ServerVerdictResolver := StubResolver;
+  LOpts.ServerVerdictDeadlineMs := 777;
+  LConfig := TTlsConfigComposer.BuildServerConfig(LOpts);
+  CheckEquals(Ord(TVerdictDeferral.LiveRevocation),
+    Ord(LConfig.AsyncCertificateVerdict.Deferral),
+    'the server-role resolver arms the live-revocation park');
+  CheckEquals(777, LConfig.AsyncCertificateVerdict.DeadlineMs, 'the server deadline is carried');
+end;
+
+procedure TTestTlsConnection.TestServerVerdictResolverNoModeIsRefused;
+var
+  LOpts: TTlsOptions;
+  LMsg: string;
+begin
+  // a client-CA and a resolver but NO mode: only the mode arms the park
+  LOpts := ServerOptsWithCredential;
+  LOpts.TrustAnchors := TArray<TTlsBlobSource>.Create(
+    TTlsBlobSource.FromBytes(
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'root_cert')));
+  LOpts.ServerVerdictResolver := StubResolver;
+  CheckTrue(RaisesStreamError(LOpts, False, LMsg),
+    'a resolver without a client-authentication mode is refused');
+end;
+
+procedure TTestTlsConnection.TestResolverBesideNonDeferringClientConfigIsRefused;
+var
+  LBuild, LOpts: TTlsOptions;
+  LMemo: ITlsClientConfigMemo;
+  LRaised: Boolean;
+begin
+  LMemo := TTlsConfigMemos.NewClient;
+  // a supplied config that never parks leaves the resolver unused, so it is refused
+  LOpts := TTlsOptions.Default;
+  LOpts.ClientConfig := TTlsConfigComposer.BuildClientConfig(ClientOptsWithStore);
+  LOpts.ClientVerdictResolver := StubResolver;
+  LRaised := False;
+  try
+    TTlsConfigComposer.ResolveClientConfig(LOpts, LMemo, 'ClientConfig');
+  except
+    on E: ETlsStreamError do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a resolver beside a config that never defers is refused');
+  // a config that does defer is accepted
+  LBuild := ClientOptsWithStore;
+  LBuild.ClientVerdictResolver := StubResolver;
+  LOpts.ClientConfig := TTlsConfigComposer.BuildClientConfig(LBuild);
+  CheckTrue(TTlsConfigComposer.ResolveClientConfig(LOpts, LMemo, 'ClientConfig') =
+    LOpts.ClientConfig, 'a deferring config keeps its resolver');
+end;
+
+procedure TTestTlsConnection.TestResolverBesideNonDeferringServerConfigIsRefused;
+var
+  LBuild, LOpts: TTlsOptions;
+  LMemo: ITlsServerConfigMemo;
+  LRaised: Boolean;
+begin
+  LMemo := TTlsConfigMemos.NewServer;
+  LBuild := ServerOptsWithCredential;
+  LBuild.TrustAnchors := TArray<TTlsBlobSource>.Create(
+    TTlsBlobSource.FromBytes(
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'root_cert')));
+  LBuild.ClientAuth := TClientAuthMode.Required;
+  LOpts := TTlsOptions.Default;
+  LOpts.ServerConfig := TTlsConfigComposer.BuildServerConfig(LBuild);
+  LOpts.ServerVerdictResolver := StubResolver;
+  LRaised := False;
+  try
+    TTlsConfigComposer.ResolveServerConfig(LOpts, LMemo, 'ServerConfig');
+  except
+    on E: ETlsStreamError do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a server resolver beside a client-auth config that never defers is refused');
+  // a client-auth config that does defer keeps its resolver
+  LBuild.ServerVerdictResolver := StubResolver;
+  LOpts.ServerConfig := TTlsConfigComposer.BuildServerConfig(LBuild);
+  CheckTrue(TTlsConfigComposer.ResolveServerConfig(LOpts, LMemo, 'ServerConfig') =
+    LOpts.ServerConfig, 'a deferring client-auth config accepts the resolver');
+end;
+
+procedure TTestTlsConnection.TestResolverBesideNoClientAuthServerConfigIsRefused;
+var
+  LOpts: TTlsOptions;
+  LMemo: ITlsServerConfigMemo;
+  LMessage: string;
+begin
+  LMemo := TTlsConfigMemos.NewServer;
+  LOpts := TTlsOptions.Default;
+  LOpts.ServerConfig := TTlsConfigComposer.BuildServerConfig(ServerOptsWithCredential);
+  LOpts.ServerVerdictResolver := StubResolver;
+  LMessage := '';
+  try
+    TTlsConfigComposer.ResolveServerConfig(LOpts, LMemo, 'ServerConfig');
+  except
+    on E: ETlsStreamError do
+      LMessage := E.Message;
+  end;
+  CheckTrue(Pos('client authentication is None', LMessage) > 0,
+    'a server resolver beside a config that requests no client certificate is refused for that');
+end;
+
+procedure TTestTlsConnection.TestServerVerifyCallbackWithoutClientAuthIsRefused;
+var
+  LOpts: TTlsOptions;
+  LMsg: string;
+begin
+  LOpts := ServerOptsWithCredential;
+  LOpts.VerifyCallback := StubVerifyCallback;
+  CheckTrue(RaisesStreamError(LOpts, False, LMsg),
+    'a verify callback on a server that requests no client certificate is refused');
+end;
+
+procedure TTestTlsConnection.TestServerModeWithVerifyPeerOffRaises;
+var
+  LOpts: TTlsOptions;
+  LMsg: string;
+begin
+  LOpts := ServerOptsWithCredential;
+  LOpts.TrustAnchors := TArray<TTlsBlobSource>.Create(
+    TTlsBlobSource.FromBytes(
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'root_cert')));
+  LOpts.ClientAuth := TClientAuthMode.Required;
+  LOpts.VerifyPeer := False;
+  CheckTrue(RaisesStreamError(LOpts, False, LMsg),
+    'a client-auth mode with peer verification off fails closed');
+  CheckTrue(Pos('verification is off', LMsg) > 0,
+    'the message is the mode-without-verification contradiction');
+end;
+
+procedure TTestTlsConnection.TestServerModeWithSkipVerifyRaises;
+var
+  LOpts: TTlsOptions;
+  LMsg: string;
+begin
+  LOpts := ServerOptsWithCredential;
+  LOpts.TrustAnchors := TArray<TTlsBlobSource>.Create(
+    TTlsBlobSource.FromBytes(
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'root_cert')));
+  LOpts.ClientAuth := TClientAuthMode.Required;
+  LOpts.InsecureSkipVerify := True;
+  CheckTrue(RaisesStreamError(LOpts, False, LMsg),
+    'a client-auth mode with the skip-verify bypass fails closed');
+  CheckTrue(Pos('verification is off', LMsg) > 0,
+    'the message is the mode-without-verification contradiction');
+end;
+
+procedure TTestTlsConnection.TestServerClientVerifierWithoutModeRaises;
+var
+  LOpts: TTlsOptions;
+  LMsg: string;
+begin
+  // a server-role client-cert verifier with mode None is inert: fail loud, do not silently drop it
+  LOpts := ServerOptsWithCredential;
+  LOpts.ClientCertificateVerifier := TFixedVerdictVerifier.CreateRejecting(
+    TTlsAlertDescription.BadCertificate) as IClientCertificateVerifier;
+  CheckTrue(RaisesStreamError(LOpts, False, LMsg),
+    'a client-cert verifier with mode None fails closed');
+  CheckTrue(Pos('client authentication is None', LMsg) > 0,
+    'the message names the missing mode');
+end;
+
+procedure TTestTlsConnection.TestServerSystemTrustInertBesidePrivateClientCa;
+var
+  LOpts: TTlsOptions;
+  LFake: TFakeSystemTrustInstaller;
+  LInst: ISystemTrustInstaller;
+  LConfig: ITlsServerConfig;
+begin
+  // system trust beside a private client-CA under a mode builds, and the client-auth trust is the
+  // private CA ONLY - the OS/public store (a DISTINCT cert here) is never unioned into it
+  LFake := TFakeSystemTrustInstaller.Create(False,
+    TTrustAnchorStore.Create(TArray<TBytes>.Create(
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_cert')))
+      as ITrustAnchorStore);
+  LInst := LFake;
+  LOpts := ServerOptsWithCredential;
+  LOpts.SystemTrust := LInst;
+  LOpts.TrustAnchors := TArray<TTlsBlobSource>.Create(
+    TTlsBlobSource.FromBytes(
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'root_cert')));
+  LOpts.ClientAuth := TClientAuthMode.Required;
+  LConfig := TTlsConfigComposer.BuildServerConfig(LOpts);
+  CheckFalse(LFake.ClientRoleCalled, 'a server build never touches the system-trust installer');
+  CheckEquals(1, System.Length(LConfig.TrustStore.RootCertificates),
+    'only the private client-CA is trusted; the OS store is not unioned in');
+  CheckEqualBytes('the sole client-CA is the private root',
+    TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'root_cert'),
+    LConfig.TrustStore.RootCertificates[0]);
+end;
+
+procedure TTestTlsConnection.TestServerSystemTrustOnlySourceFailsLoud;
+var
+  LOpts: TTlsOptions;
+  LMsg: string;
+begin
+  // a mode whose only named source is system trust fails at build with a dedicated message: the fix
+  // is a private client-CA, not "more" system trust
+  LOpts := ServerOptsWithCredential;
+  LOpts.SystemTrust := TFakeSystemTrustInstaller.Create(False,
+    TTlsLibTestCertificates.EcP256RootStore);
+  LOpts.ClientAuth := TClientAuthMode.Required;
+  CheckTrue(RaisesStreamError(LOpts, False, LMsg),
+    'system trust as the only client-CA under a mode fails closed');
+  CheckTrue(Pos('system trust', LMsg) > 0, 'the message names system trust as the culprit');
+  CheckTrue(Pos('a client-CA bundle', LMsg) > 0, 'the message splices the client-CA hint');
+end;
+
+procedure TTestTlsConnection.TestServerSystemTrustNotInstalledWithoutMode;
+var
+  LOpts: TTlsOptions;
+  LFake: TFakeSystemTrustInstaller;
+  LInst: ISystemTrustInstaller;
+  LConfig: ITlsServerConfig;
+begin
+  // with no mode, system trust on a server is inert and requests no client auth
+  LFake := TFakeSystemTrustInstaller.Create(False, TTlsLibTestCertificates.EcP256RootStore);
+  LInst := LFake;
+  LOpts := ServerOptsWithCredential;
+  LOpts.SystemTrust := LInst;
+  LConfig := TTlsConfigComposer.BuildServerConfig(LOpts);
+  CheckFalse(LFake.ClientRoleCalled, 'a server build never touches the system-trust installer');
+  CheckEquals(Ord(TClientAuthMode.None), Ord(LConfig.ClientAuth),
+    'no mode means no client authentication');
+end;
+
+procedure TTestTlsConnection.TestServerResumptionMintsDefaultStek;
+var
+  LOpts: TTlsOptions;
+begin
+  CheckTrue(TTlsConfigComposer.BuildServerConfig(ServerOptsWithCredential).Resumption,
+    'resumption is engaged by default');
+  LOpts := ServerOptsWithCredential;
+  LOpts.SessionResumption := False;
+  CheckFalse(TTlsConfigComposer.BuildServerConfig(LOpts).Resumption,
+    'resumption is off when disabled');
+end;
+
+procedure TTestTlsConnection.TestSignatureEqualOptionsEqualKeys;
+var
+  LA, LB: TTlsOptions;
+begin
+  LA := ClientOptsWithStore;
+  LB := ClientOptsWithStore;
+  LB.CustomTrustStore := LA.CustomTrustStore; // same store identity
+  CheckEquals(TTlsConfigComposer.ClientSignature(LA),
+    TTlsConfigComposer.ClientSignature(LB),
+    'equal options produce equal client signatures');
+end;
+
+procedure TTestTlsConnection.TestSignatureEachConcernChangesKey;
+var
+  LBase, LMut: TTlsOptions;
+  LBaseSig: string;
+begin
+  LBase := ClientOptsWithStore;
+  LBaseSig := TTlsConfigComposer.ClientSignature(LBase);
+
+  LMut := LBase;
+  LMut.SessionResumption := not LBase.SessionResumption;
+  CheckFalse(TTlsConfigComposer.ClientSignature(LMut) = LBaseSig,
+    'flipping resumption changes the key');
+
+  LMut := LBase;
+  LMut.VerifyPeer := not LBase.VerifyPeer;
+  CheckFalse(TTlsConfigComposer.ClientSignature(LMut) = LBaseSig,
+    'flipping VerifyPeer changes the key');
+
+  LMut := LBase;
+  LMut.CheckHostName := not LBase.CheckHostName;
+  CheckFalse(TTlsConfigComposer.ClientSignature(LMut) = LBaseSig,
+    'flipping CheckHostName changes the key');
+
+  LMut := LBase;
+  LMut.ServerNameIndication := TServerNameIndication.Omit;
+  CheckFalse(TTlsConfigComposer.ClientSignature(LMut) = LBaseSig,
+    'omitting SNI changes the key');
+
+  LMut := LBase;
+  LMut.KeyPassword := 'changed';
+  CheckFalse(TTlsConfigComposer.ClientSignature(LMut) = LBaseSig,
+    'changing the key password changes the key');
+
+  LMut := LBase;
+  LMut.AlpnProtocols := TArray<string>.Create('h2');
+  CheckFalse(TTlsConfigComposer.ClientSignature(LMut) = LBaseSig,
+    'adding ALPN changes the key');
+
+  LMut := LBase;
+  LMut.Certificate := TTlsBlobSource.FromBytes(
+    TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_cert'));
+  CheckFalse(TTlsConfigComposer.ClientSignature(LMut) = LBaseSig,
+    'a credential blob changes the key');
+
+  // the server signature discriminates the client-auth mode (a server-only concern)
+  LBase := ServerOptsWithCredential;
+  LBaseSig := TTlsConfigComposer.ServerSignature(LBase);
+  LMut := LBase;
+  LMut.ClientAuth := TClientAuthMode.Required;
+  CheckFalse(TTlsConfigComposer.ServerSignature(LMut) = LBaseSig,
+    'the client-auth mode changes the server key');
+
+  // system trust is a client-only read: it changes the CLIENT key but never the server key (the
+  // server build does not read it, so it must not be in the server memo signature)
+  LMut := LBase;
+  LMut.SystemTrust := TFakeSystemTrustInstaller.Create(False,
+    TTlsLibTestCertificates.EcP256RootStore) as ISystemTrustInstaller;
+  CheckTrue(TTlsConfigComposer.ServerSignature(LMut) = LBaseSig,
+    'system trust does not change the server key');
+  LBase := ClientOptsWithStore;
+  LBaseSig := TTlsConfigComposer.ClientSignature(LBase);
+  LMut := LBase;
+  LMut.SystemTrust := TFakeSystemTrustInstaller.Create(False,
+    TTlsLibTestCertificates.EcP256RootStore) as ISystemTrustInstaller;
+  CheckFalse(TTlsConfigComposer.ClientSignature(LMut) = LBaseSig,
+    'system trust changes the client key');
+end;
+
+procedure TTestTlsConnection.TestConnectionRefusesANilConfigOrTransport;
+var
+  LRaised: Boolean;
+  LConnection: TTlsConnection;
+begin
+  // a missing argument is a typed error, not an access violation
+  LRaised := False;
+  try
+    LConnection := TTlsConnection.CreateClient(nil, 'example.com', nil, nil, 0);
+    LConnection.Free;
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a client with no config and no transport is refused');
+  LRaised := False;
+  try
+    LConnection := TTlsConnection.CreateServer(nil, nil, nil, 0);
+    LConnection.Free;
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a server with no config and no transport is refused');
+  // a transport handed over with a missing config is released with the refused connection
+  LRaised := False;
+  try
+    LConnection := TTlsConnection.CreateClient(nil, 'example.com',
+      TTestMemoryTransport.Create(nil, True) as ITlsTimedTransport, nil, 0);
+    LConnection.Free;
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a client with a transport but no config is refused');
+end;
+
+procedure TTestTlsConnection.TestConnectionCreateRefusesANilEngineOrTransport;
+var
+  LRaised: Boolean;
+  LConnection: TTlsConnection;
+begin
+  // the public constructor takes the same typed refusal as CreateClient/CreateServer
+  LRaised := False;
+  try
+    LConnection := TTlsConnection.Create(nil,
+      TTestMemoryTransport.Create(nil, True) as ITlsTimedTransport, True, 'example.com', nil);
+    LConnection.Free;
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := Pos('a connection needs', E.Message) > 0;
+  end;
+  CheckTrue(LRaised, 'a connection with a transport but no engine is refused by the connection');
+  LRaised := False;
+  try
+    LConnection := TTlsConnection.Create(
+      TTlsEngineFactory.CreateClientEngine(
+        TTlsConfigComposer.BuildClientConfig(ClientOptsWithStore), 'example.com'),
+      nil, True, 'example.com', nil);
+    LConnection.Free;
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := Pos('a connection needs', E.Message) > 0;
+  end;
+  CheckTrue(LRaised, 'a connection with an engine but no transport is refused by the connection');
+end;
+
+procedure TTestTlsConnection.TestSignatureKeysSystemTrustByIdentity;
+var
+  LBase, LA, LB, LC: TTlsOptions;
+  LFirst, LSecond: TFakeSystemTrustInstaller;
+  LRaised: Boolean;
+begin
+  // the key follows what the installer installs, not where it lives: equal identities share a
+  // key across distinct instances, different identities never do
+  LBase := ClientOptsWithStore;
+  LFirst := TFakeSystemTrustInstaller.Create(False, TTlsLibTestCertificates.EcP256RootStore);
+  LSecond := TFakeSystemTrustInstaller.Create(False, TTlsLibTestCertificates.EcP256RootStore);
+  LA := LBase;
+  LA.SystemTrust := LFirst as ISystemTrustInstaller;
+  LB := LBase;
+  LB.SystemTrust := LSecond as ISystemTrustInstaller;
+  LFirst.InstallerIdentity := 'tenant-a';
+  LSecond.InstallerIdentity := 'tenant-a';
+  CheckEquals(TTlsConfigComposer.ClientSignature(LA), TTlsConfigComposer.ClientSignature(LB),
+    'distinct installers with one identity share a key');
+  LSecond.InstallerIdentity := 'tenant-b';
+  LC := LB;
+  CheckFalse(TTlsConfigComposer.ClientSignature(LA) = TTlsConfigComposer.ClientSignature(LC),
+    'installers with different identities never share a key');
+  // an unnamed installer is neither a key of its own nor the same as having none
+  LSecond.InstallerIdentity := '';
+  LRaised := False;
+  try
+    TTlsConfigComposer.ClientSignature(LC);
+  except
+    on E: ETlsStreamError do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'an installer with an empty identity is refused');
+  CheckFalse(TTlsConfigComposer.ClientSignature(LA) = TTlsConfigComposer.ClientSignature(LBase),
+    'an installer is not the same key as none');
+end;
+
+procedure TTestTlsConnection.TestSignatureExcludesResolverAndTimeout;
+var
+  LBase, LMut: TTlsOptions;
+  LBaseSig: string;
+begin
+  LBase := ClientOptsWithStore;
+  LBaseSig := TTlsConfigComposer.ClientSignature(LBase);
+
+  LMut := LBase;
+  LMut.HandshakeTimeoutMs := 5000;
+  CheckEquals(LBaseSig, TTlsConfigComposer.ClientSignature(LMut),
+    'the handshake timeout is not part of the config identity');
+
+  // a different resolver instance keeps the key: only assigned-or-not participates
+  LBase.ClientVerdictResolver := StubResolver;
+  LMut := LBase;
+  LMut.ClientVerdictResolver := StubResolverAlt;
+  CheckEquals(TTlsConfigComposer.ClientSignature(LBase),
+    TTlsConfigComposer.ClientSignature(LMut),
+    'a different resolver pointer does not change the key');
+end;
+
+procedure TTestTlsConnection.TestSignaturePasswordNotInClear;
+var
+  LOpts: TTlsOptions;
+begin
+  LOpts := ClientOptsWithStore;
+  LOpts.KeyPassword := 'sup3r-s3cret-passphrase';
+  CheckTrue(Pos('sup3r-s3cret-passphrase',
+    TTlsConfigComposer.ClientSignature(LOpts)) = 0,
+    'the key password never appears in clear in the signature');
+end;
+
+procedure TTestTlsConnection.TestResolveMemoisesBuildOnce;
+var
+  LOpts: TTlsOptions;
+  LMemo: ITlsClientConfigMemo;
+  LFirst, LSecond: ITlsClientConfig;
+begin
+  LOpts := ClientOptsWithStore;
+  LMemo := TTlsConfigMemos.NewClient;
+  LFirst := TTlsConfigComposer.ResolveClientConfig(LOpts, LMemo, 'ClientConfig');
+  LSecond := TTlsConfigComposer.ResolveClientConfig(LOpts, LMemo, 'ClientConfig');
+  CheckTrue(LFirst = LSecond, 'a memo hit reuses the same config identity');
+end;
+
+procedure TTestTlsConnection.TestResolveConfigInReturnedAsIs;
+var
+  LOpts: TTlsOptions;
+  LMemo: ITlsClientConfigMemo;
+  LSupplied, LResolved: ITlsClientConfig;
+  LProbe: ITlsClientConfig;
+begin
+  LSupplied := TTlsConfigComposer.BuildClientConfig(ClientOptsWithStore);
+  // a config-in with no conflicting options is returned verbatim, and the memo stays empty
+  LOpts := TTlsOptions.Default;
+  LOpts.ClientConfig := LSupplied;
+  LMemo := TTlsConfigMemos.NewClient;
+  LResolved := TTlsConfigComposer.ResolveClientConfig(LOpts, LMemo, 'ClientConfig');
+  CheckTrue(LResolved = LSupplied, 'the supplied config is returned as-is');
+  CheckFalse(LMemo.TryGet(TTlsConfigComposer.ClientSignature(LOpts), LProbe),
+    'the memo is untouched when a config is supplied');
+end;
+
+procedure TTestTlsConnection.TestGuardConflictOnEachField;
+
+  procedure ExpectConflict(const AOpts: TTlsOptions; const AWhat: string);
+  var
+    LOpts: TTlsOptions;
+    LMemo: ITlsClientConfigMemo;
+    LRaised: Boolean;
+  begin
+    LOpts := AOpts;
+    LOpts.ClientConfig := TTlsConfigComposer.BuildClientConfig(ClientOptsWithStore);
+    LMemo := TTlsConfigMemos.NewClient;
+    LRaised := False;
+    try
+      TTlsConfigComposer.ResolveClientConfig(LOpts, LMemo, 'ClientConfig');
+    except
+      on E: ETlsStreamError do
+        LRaised := True;
+    end;
+    CheckTrue(LRaised, 'a config supplied alongside ' + AWhat + ' fails loud');
+  end;
+
+var
+  LOpts: TTlsOptions;
+begin
+  LOpts := TTlsOptions.Default;
+  LOpts.Certificate := TTlsBlobSource.FromBytes(
+    TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_cert'));
+  ExpectConflict(LOpts, 'a certificate');
+
+  LOpts := TTlsOptions.Default;
+  LOpts.CustomTrustStore := TTrustAnchorStore.Create(nil) as ITrustAnchorStore;
+  ExpectConflict(LOpts, 'a custom store');
+
+  LOpts := TTlsOptions.Default;
+  LOpts.TrustAnchors := TArray<TTlsBlobSource>.Create(
+    TTlsBlobSource.FromBytes(
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'root_cert')));
+  ExpectConflict(LOpts, 'trust anchors');
+
+  LOpts := TTlsOptions.Default;
+  LOpts.Crypto := Crypto;
+  ExpectConflict(LOpts, 'an injected crypto provider');
+
+  LOpts := TTlsOptions.Default;
+  LOpts.SystemTrust := TFakeSystemTrustInstaller.Create(False,
+    TTlsLibTestCertificates.EcP256RootStore) as ISystemTrustInstaller;
+  ExpectConflict(LOpts, 'system trust');
+end;
+
+procedure TTestTlsConnection.TestGuardConflictOnSecurityToggles;
+
+  function Conflicts(const AOpts: TTlsOptions; AIsClient: Boolean): Boolean;
+  begin
+    Result := False;
+    try
+      TTlsConfigComposer.GuardNoConflict(AOpts, AIsClient, 'ClientConfig');
+    except
+      on E: ETlsStreamError do
+        Result := True;
+    end;
+  end;
+
+var
+  LOpts: TTlsOptions;
+begin
+  // a non-default toggle is silently dropped by a supplied config, so it must fail loud; the default
+  // never conflicts (that is the common config-in case)
+  LOpts := TTlsOptions.Default;
+  CheckFalse(Conflicts(LOpts, True), 'all-default toggles do not conflict (client)');
+  CheckFalse(Conflicts(LOpts, False), 'all-default toggles do not conflict (server)');
+
+  // peer verification, the skip-verify bypass and the host-name check are client-only reads; the
+  // server build consumes none of them on its own
+  LOpts := TTlsOptions.Default;
+  LOpts.VerifyPeer := False;
+  CheckTrue(Conflicts(LOpts, True), 'VerifyPeer off conflicts with a supplied config (client)');
+  CheckFalse(Conflicts(LOpts, False), 'VerifyPeer off does not conflict on the server');
+
+  LOpts := TTlsOptions.Default;
+  LOpts.InsecureSkipVerify := True;
+  CheckTrue(Conflicts(LOpts, True), 'skip-verify conflicts with a supplied config (client)');
+  CheckFalse(Conflicts(LOpts, False), 'skip-verify does not conflict on the server');
+
+  LOpts := TTlsOptions.Default;
+  LOpts.CheckHostName := False;
+  CheckTrue(Conflicts(LOpts, True), 'name-check off conflicts with a supplied config (client)');
+  CheckFalse(Conflicts(LOpts, False), 'name-check off does not conflict on the server');
+
+  // SNI is a client-only read too: a supplied client config would drop it, a server never sends it
+  LOpts := TTlsOptions.Default;
+  LOpts.ServerNameIndication := TServerNameIndication.Omit;
+  CheckTrue(Conflicts(LOpts, True), 'omitting SNI conflicts with a supplied config (client)');
+  CheckFalse(Conflicts(LOpts, False), 'omitting SNI does not conflict on the server');
+
+  // resumption is read by both role builds
+  LOpts := TTlsOptions.Default;
+  LOpts.SessionResumption := False;
+  CheckTrue(Conflicts(LOpts, True), 'resumption off conflicts with a supplied config (client)');
+  CheckTrue(Conflicts(LOpts, False), 'resumption off conflicts with a supplied config (server)');
+
+  // a non-default client-auth mode is a server-only security decision a config would replace
+  LOpts := TTlsOptions.Default;
+  LOpts.ClientAuth := TClientAuthMode.Required;
+  CheckTrue(Conflicts(LOpts, False), 'a client-auth mode conflicts with a supplied config (server)');
+  CheckFalse(Conflicts(LOpts, True), 'a client-auth mode does not conflict on the client');
+end;
+
+procedure TTestTlsConnection.TestGuardIncludesVerifyCallback;
+var
+  LOpts: TTlsOptions;
+  LMemo: ITlsClientConfigMemo;
+  LRaised: Boolean;
+begin
+  LOpts := TTlsOptions.Default;
+  LOpts.VerifyCallback := StubVerifyCallback;
+  LOpts.ClientConfig := TTlsConfigComposer.BuildClientConfig(ClientOptsWithStore);
+  LMemo := TTlsConfigMemos.NewClient;
+  LRaised := False;
+  try
+    TTlsConfigComposer.ResolveClientConfig(LOpts, LMemo, 'ClientConfig');
+  except
+    on E: ETlsStreamError do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a VerifyCallback conflicts with a supplied config');
+end;
+
+procedure TTestTlsConnection.TestGuardMessageNamesTheProperty;
+var
+  LOpts: TTlsOptions;
+  LMsg: string;
+begin
+  LOpts := TTlsOptions.Default;
+  LOpts.CustomTrustStore := TTrustAnchorStore.Create(nil) as ITrustAnchorStore;
+  LMsg := '';
+  try
+    TTlsConfigComposer.GuardNoConflict(LOpts, False, 'ServerConfig');
+  except
+    on E: ETlsStreamError do
+      LMsg := E.Message;
+  end;
+  CheckTrue(Pos('ServerConfig', LMsg) > 0, 'the conflict message names the config property');
+end;
+
+procedure TTestTlsConnection.TestGuardIgnoresResolverAndTimeout;
+var
+  LOpts: TTlsOptions;
+begin
+  // resolvers and the handshake timeout are runtime hooks - never a config-in conflict
+  LOpts := TTlsOptions.Default;
+  LOpts.HandshakeTimeoutMs := 5000;
+  LOpts.ClientVerdictResolver := StubResolver;
+  LOpts.ServerVerdictResolver := StubResolver;
+  // no raise expected
+  TTlsConfigComposer.GuardNoConflict(LOpts, True, 'ClientConfig');
+  CheckTrue(True, 'a resolver or timeout alone does not conflict');
+end;
+
+procedure TTestTlsConnection.TestServerModeWithoutSourceRaises;
+var
+  LOpts: TTlsOptions;
+  LMsg: string;
+begin
+  // an explicit client-auth mode with no client-trust source must fail loud, not fall through to a
+  // server that quietly asks for no certificate
+  LOpts := ServerOptsWithCredential;
+  LOpts.ClientAuth := TClientAuthMode.Required;
+  CheckTrue(RaisesStreamError(LOpts, False, LMsg),
+    'a client-auth mode without a client-trust source fails closed');
+  CheckTrue(Pos('a client-CA bundle', LMsg) > 0,
+    'the message splices the trust-source hint (guard 1, not the verify-off guard)');
+end;
+
+procedure TTestTlsConnection.TestServerGuardAllowsClientOnlyOptions;
+var
+  LOpts: TTlsOptions;
+  LRaised: Boolean;
+begin
+  // the server-cert verifier and system trust are client-only reads, so they do not conflict with a
+  // supplied server config; a shared option (a certificate) still does
+  LOpts := TTlsOptions.Default;
+  LOpts.ServerCertificateVerifier := TFixedVerdictVerifier.CreateRejecting(
+    TTlsAlertDescription.BadCertificate) as IServerCertificateVerifier;
+  LOpts.SystemTrust := TFakeSystemTrustInstaller.Create(False,
+    TTlsLibTestCertificates.EcP256RootStore) as ISystemTrustInstaller;
+  LOpts.ServerConfig := TTlsConfigComposer.BuildServerConfig(ServerOptsWithCredential);
+  CheckNotNull(TTlsConfigComposer.ResolveServerConfig(LOpts, TTlsConfigMemos.NewServer,
+    'ServerConfig'), 'client-only options do not conflict with a server config-in');
+  LOpts.Certificate := TTlsBlobSource.FromBytes(
+    TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'leaf_cert'));
+  LRaised := False;
+  try
+    TTlsConfigComposer.ResolveServerConfig(LOpts, TTlsConfigMemos.NewServer, 'ServerConfig');
+  except
+    on E: ETlsStreamError do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a shared cert/trust option still conflicts with a server config-in');
+end;
+
+procedure TTestTlsConnection.TestServerVerifyCallbackForwardedUnderClientAuth;
+var
+  LOpts, LWithout: TTlsOptions;
+  LConfig: ITlsServerConfig;
+begin
+  // the augment-only hook vets a presented client chain, so an operator's allow-list must run
+  LOpts := ServerOptsWithCredential;
+  LOpts.TrustAnchors := TArray<TTlsBlobSource>.Create(
+    TTlsBlobSource.FromBytes(
+      TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'root_cert')));
+  LOpts.ClientAuth := TClientAuthMode.Required;
+  LOpts.VerifyCallback := StubVerifyCallback;
+  LConfig := TTlsConfigComposer.BuildServerConfig(LOpts);
+  CheckTrue(Assigned(LConfig.DangerousTrust.VerifyCallback),
+    'the verify callback is wired into the server under client auth');
+  LWithout := LOpts;
+  LWithout.VerifyCallback := nil;
+  CheckFalse(TTlsConfigComposer.ServerSignature(LOpts) =
+    TTlsConfigComposer.ServerSignature(LWithout),
+    'the callback is part of the server memo key');
+end;
+
+procedure TTestTlsConnection.TestServerGuardFlagsVerifyCallback;
+var
+  LOpts: TTlsOptions;
+  LRaised: Boolean;
+begin
+  // a supplied server config would silently drop the callback, so it conflicts
+  LOpts := TTlsOptions.Default;
+  LOpts.VerifyCallback := StubVerifyCallback;
+  LOpts.ServerConfig := TTlsConfigComposer.BuildServerConfig(ServerOptsWithCredential);
+  LRaised := False;
+  try
+    TTlsConfigComposer.ResolveServerConfig(LOpts, TTlsConfigMemos.NewServer, 'ServerConfig');
+  except
+    on E: ETlsStreamError do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a verify callback conflicts with a server config-in');
+end;
+
+procedure TTestTlsConnection.TestTransportCapIsAnAbsoluteDeadline;
+var
+  LTransport: TTestMemoryTransport;
+  LTimed: ITlsTransport;
+  LClockObj: TMockMonotonicClock;
+  LClock: ITlsMonotonicClock;
+  LBuf, LInbound: TBytes;
+  LRaised: Boolean;
+begin
+  // every read finds data inside the cap, but the cap is spent over the whole handshake: each read
+  // is given only the time left, and a read past the deadline raises
+  LInbound := nil;
+  SetLength(LInbound, 200);
+  LClockObj := TMockMonotonicClock.Create(1000);
+  LClock := LClockObj;
+  LTransport := TTestMemoryTransport.Create(LInbound, True, LClock);
+  LTimed := LTransport as ITlsTransport;
+  LTransport.SetReadTimeout(150);
+  SetLength(LBuf, 1);
+  LTimed.Read(LBuf, 0, 1);
+  CheckEquals(150, LTransport.LastWaitMs, 'the first read gets the whole cap');
+  LClockObj.Advance(100);
+  LTimed.Read(LBuf, 0, 1);
+  CheckEquals(50, LTransport.LastWaitMs, 'a later read gets only the time left');
+  LClockObj.Advance(3900); // a clock step far past the deadline
+  LRaised := False;
+  try
+    LTimed.Read(LBuf, 0, 1);
+  except
+    on E: ETlsHandshakeTimeout do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a read past the deadline raises a handshake timeout');
+end;
+
+procedure TTestTlsConnection.TestConnectionMeasuresTheCapOnTheConfigsMonotonicClock;
+var
+  LClockObj: TMockMonotonicClock;
+  LConfig: ITlsClientConfig;
+  LTransport: TTestMemoryTransport;
+  LTimed: ITlsTransport;
+  LConnection: TTlsConnection;
+  LRaised: Boolean;
+begin
+  LClockObj := TMockMonotonicClock.Create(1000);
+  LConfig := TTlsPresets.Compatible(Crypto, Pkix).Client
+    .WithServerVerification(
+      TServerVerification.WebPki(TTlsLibTestCertificates.EcP256RootStore).Build)
+    .WithMonotonicClock(LClockObj as ITlsMonotonicClock).Build;
+  LTransport := TTestMemoryTransport.Create(nil, True);
+  LTimed := LTransport as ITlsTransport;
+  LConnection := TTlsConnection.CreateClient(LConfig, 'example.com', LTransport, nil, 0);
+  try
+    LTransport.SetReadTimeout(150);
+    LClockObj.Advance(100);
+    LTransport.PollCap; // inside the cap
+    LClockObj.Advance(100);
+    LRaised := False;
+    try
+      LTransport.PollCap;
+    except
+      on E: ETlsHandshakeTimeout do
+        LRaised := True;
+    end;
+    CheckTrue(LRaised, 'the transport measures its cap on the config''s monotonic clock');
+  finally
+    LConnection.Free;
+  end;
+end;
+
+procedure TTestTlsConnection.TestRefusedEngineBuildReleasesTheTransport;
+var
+  LConfig: ITlsClientConfig;
+  LTransport: TTestMemoryTransport;
+  LConnection: TTlsConnection;
+  LDestroyed, LRaised: Boolean;
+  LMessage: string;
+begin
+  LConfig := TTlsPresets.Compatible(Crypto, Pkix).Client
+    .WithServerVerification(
+      TServerVerification.WebPki(TTlsLibTestCertificates.EcP256RootStore).Build).Build;
+  LTransport := TTestMemoryTransport.Create(nil, True);
+  LDestroyed := False;
+  LTransport.ReportDestructionTo(@LDestroyed);
+  LRaised := False;
+  LMessage := '';
+  LConnection := nil;
+  try
+    // an empty host with the name check on is refused when the engine is built; the connection
+    // is the transport's only owner here, so it must release it
+    LConnection := TTlsConnection.CreateClient(LConfig, '', LTransport, nil, 0);
+  except
+    on E: EArgumentTlsLibException do
+    begin
+      LRaised := True;
+      LMessage := E.Message;
+    end;
+  end;
+  LConnection.Free;
+  CheckTrue(LRaised, 'the engine build is refused as an argument error');
+  CheckTrue(Pos('server-name checking is on', LMessage) > 0,
+    'the refusal is the missing server name');
+  CheckTrue(LDestroyed, 'a refused engine build still releases the transport');
+end;
+
+procedure TTestTlsConnection.TestTransportRefusesANilClock;
+var
+  LTransport: TTestMemoryTransport;
+  LTimed: ITlsTransport;
+  LRaised: Boolean;
+begin
+  LTransport := TTestMemoryTransport.Create(nil, True);
+  LTimed := LTransport as ITlsTransport;
+  LRaised := False;
+  try
+    LTransport.UseClock(nil);
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a transport needs a clock');
+end;
+
+procedure TTestTlsConnection.TestClientGuardFlagsServerCertVerifier;
+var
+  LOpts: TTlsOptions;
+  LRaised: Boolean;
+begin
+  // the server-cert verifier is a client-role read, so it conflicts with a supplied client config
+  LOpts := TTlsOptions.Default;
+  LOpts.ServerCertificateVerifier := TFixedVerdictVerifier.CreateRejecting(
+    TTlsAlertDescription.BadCertificate) as IServerCertificateVerifier;
+  LOpts.ClientConfig := TTlsConfigComposer.BuildClientConfig(ClientOptsWithStore);
+  LRaised := False;
+  try
+    TTlsConfigComposer.ResolveClientConfig(LOpts, TTlsConfigMemos.NewClient, 'ClientConfig');
+  except
+    on E: ETlsStreamError do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a server-cert verifier conflicts with a client config-in');
+end;
+
+procedure TTestTlsConnection.TestTransportTimesOutWhenSilent;
+var
+  LTransport: TTestMemoryTransport;
+  LTimed: ITlsTransport;
+  LBuf: TBytes;
+  LRaised: Boolean;
+  LMsg: string;
+begin
+  LTransport := TTestMemoryTransport.Create(nil, False); // never readable
+  LTimed := LTransport as ITlsTransport;
+  LTransport.SetReadTimeout(150);
+  SetLength(LBuf, 16);
+  LRaised := False;
+  LMsg := '';
+  try
+    LTimed.Read(LBuf, 0, 16);
+  except
+    on E: ETlsHandshakeTimeout do
+    begin
+      LRaised := True;
+      LMsg := E.Message;
+    end;
+  end;
+  CheckTrue(LRaised, 'a silent peer under an armed cap raises a handshake timeout');
+  CheckTrue(Pos('150', LMsg) > 0, 'the timeout message carries the elapsed cap');
+end;
+
+procedure TTestTlsConnection.TestApplicationReadTimeoutRaisesTheRetryableReadTimeout;
+var
+  LSilent, LReadable: TTestMemoryTransport;
+  LTimed: ITlsTransport;
+  LBuf, LInbound: TBytes;
+  LRaised: Boolean;
+begin
+  LSilent := TTestMemoryTransport.Create(nil, False); // never readable
+  LTimed := LSilent as ITlsTransport;
+  LSilent.SetApplicationReadTimeout(150);
+  SetLength(LBuf, 16);
+  LRaised := False;
+  try
+    LTimed.Read(LBuf, 0, 16);
+  except
+    on E: ETlsReadTimeout do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a silent peer under an application-read cap raises the retryable read timeout');
+  // clearing the cap returns to blocking reads, which a readable source then satisfies
+  LInbound := nil;
+  SetLength(LInbound, 8);
+  LReadable := TTestMemoryTransport.Create(LInbound, True);
+  LTimed := LReadable as ITlsTransport;
+  LReadable.SetApplicationReadTimeout(150);
+  LReadable.SetReadTimeout(0);
+  CheckEquals(8, LTimed.Read(LBuf, 0, 16), 'a cleared cap does not bound the read');
+  CheckEquals(0, LReadable.LastWaitMs, 'and waits nowhere');
+end;
+
+procedure TTestTlsConnection.TestCapCheckBetweenRetriesHonoursTheDeadline;
+var
+  LTransport: TTestMemoryTransport;
+  LTimed: ITlsTransport;
+  LClockObj: TMockMonotonicClock;
+  LClock: ITlsMonotonicClock;
+  LRaised: Boolean;
+begin
+  // both are reference counted: hold them through interfaces so they are released with the test
+  LClockObj := TMockMonotonicClock.Create(1000);
+  LClock := LClockObj;
+  LTransport := TTestMemoryTransport.Create(nil, True, LClock);
+  LTimed := LTransport as ITlsTransport;
+  LTransport.PollCap; // no cap armed: nothing to enforce
+  LTransport.SetReadTimeout(150);
+  LClockObj.Advance(100);
+  LTransport.PollCap; // inside the cap
+  LClockObj.Advance(100);
+  LRaised := False;
+  try
+    LTransport.PollCap;
+  except
+    on E: ETlsHandshakeTimeout do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a retry past the deadline raises the handshake timeout');
+  LTransport.SetReadTimeout(0);
+  LTransport.PollCap; // cleared: nothing to enforce
+end;
+
+procedure TTestTlsConnection.TestSupportedVersionsOptionNarrowsTheOffer;
+var
+  LOpts: TTlsOptions;
+  LVersions: TArray<UInt16>;
+  LServerSignature, LDefaultSignature: string;
+begin
+  LOpts := ClientOptsWithStore;
+  LDefaultSignature := TTlsConfigComposer.ClientSignature(LOpts);
+  LVersions := TTlsConfigComposer.BuildClientConfig(LOpts).SupportedVersions;
+  CheckEquals(2, System.Length(LVersions), 'the default client offers TLS 1.3 and 1.2');
+  LOpts.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls12);
+  LVersions := TTlsConfigComposer.BuildClientConfig(LOpts).SupportedVersions;
+  CheckEquals(1, System.Length(LVersions), 'a one-entry list narrows the client offer');
+  CheckEquals(Integer(TlsWireVersionTls12), Integer(LVersions[0]), 'to TLS 1.2');
+  CheckTrue(LDefaultSignature <> TTlsConfigComposer.ClientSignature(LOpts),
+    'the client memo key tells the two builds apart');
+  LOpts.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls13);
+  LVersions := TTlsConfigComposer.BuildClientConfig(LOpts).SupportedVersions;
+  CheckEquals(1, System.Length(LVersions), 'TLS 1.3 alone is expressible too');
+  CheckEquals(Integer(TlsWireVersionTls13), Integer(LVersions[0]), 'TLS 1.3');
+  LOpts := ServerOptsWithCredential;
+  LServerSignature := TTlsConfigComposer.ServerSignature(LOpts);
+  LOpts.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls12);
+  LVersions := TTlsConfigComposer.BuildServerConfig(LOpts).SupportedVersions;
+  CheckEquals(1, System.Length(LVersions), 'and the server accepts only one');
+  CheckEquals(Integer(TlsWireVersionTls12), Integer(LVersions[0]), 'TLS 1.2');
+  CheckTrue(LServerSignature <> TTlsConfigComposer.ServerSignature(LOpts),
+    'the server memo key tells the two builds apart');
+end;
+
+procedure TTestTlsConnection.TestSupportedVersionsOrderIsPartOfTheMemoKey;
+var
+  LBase, LForward, LReverse: TTlsOptions;
+begin
+  // order is the preference, so two orderings are two configs and must not share a memoised one;
+  // both sets copy one base, since each ClientOptsWithStore call builds a store with its own identity
+  LBase := ClientOptsWithStore;
+  LForward := LBase;
+  LForward.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls13, TlsWireVersionTls12);
+  LReverse := LBase;
+  LReverse.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls12, TlsWireVersionTls13);
+  CheckTrue(TTlsConfigComposer.ClientSignature(LForward) <>
+    TTlsConfigComposer.ClientSignature(LReverse), 'client key');
+  CheckEquals(Integer(TlsWireVersionTls12),
+    Integer(TTlsConfigComposer.BuildClientConfig(LReverse).SupportedVersions[0]),
+    'the built config keeps the preference order');
+  LBase := ServerOptsWithCredential;
+  LForward := LBase;
+  LForward.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls13, TlsWireVersionTls12);
+  LReverse := LBase;
+  LReverse.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls12, TlsWireVersionTls13);
+  CheckTrue(TTlsConfigComposer.ServerSignature(LForward) <>
+    TTlsConfigComposer.ServerSignature(LReverse), 'server key');
+end;
+
+procedure TTestTlsConnection.TestSupportedVersionsRefusesUnknownAndDuplicateCodes;
+var
+  LOpts: TTlsOptions;
+  LRaised: Boolean;
+begin
+  LOpts := ClientOptsWithStore;
+  LOpts.SupportedVersions := TArray<UInt16>.Create(UInt16($0305));
+  LRaised := False;
+  try
+    TTlsConfigComposer.BuildClientConfig(LOpts);
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'an unknown version code is refused');
+  LOpts.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls11);
+  LRaised := False;
+  try
+    TTlsConfigComposer.BuildClientConfig(LOpts);
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a legacy version code is refused');
+  LOpts := ServerOptsWithCredential;
+  LOpts.SupportedVersions := TArray<UInt16>.Create(UInt16($0305));
+  LRaised := False;
+  try
+    TTlsConfigComposer.BuildServerConfig(LOpts);
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'the server refuses an unknown version code too');
+  LOpts := ClientOptsWithStore;
+  LOpts.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls12, TlsWireVersionTls12);
+  LRaised := False;
+  try
+    TTlsConfigComposer.BuildClientConfig(LOpts);
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a duplicate version code is refused');
+end;
+
+procedure TTestTlsConnection.TestSupportedVersionsConflictsWithASuppliedConfig;
+var
+  LOpts: TTlsOptions;
+  LRaised: Boolean;
+begin
+  // SupportedVersions is read by the options-driven build a supplied config replaces, so it must fail loud
+  LOpts := TTlsOptions.Default;
+  LOpts.ClientConfig := TTlsConfigComposer.BuildClientConfig(ClientOptsWithStore);
+  LOpts.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls12);
+  LRaised := False;
+  try
+    TTlsConfigComposer.ResolveClientConfig(LOpts, TTlsConfigMemos.NewClient, 'ClientConfig');
+  except
+    on E: ETlsStreamError do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'SupportedVersions alongside a supplied client config is refused');
+end;
+
+procedure TTestTlsConnection.TestHostCipherListNarrowsAndOrdersTheBuiltConfig;
+var
+  LOpts: TTlsOptions;
+  LConfig: ITlsClientConfig;
+  LServerConfig: ITlsServerConfig;
+  L12: TArray<UInt16>;
+begin
+  LOpts := ClientOptsWithStore;
+  LOpts.CipherSuites := TArray<UInt16>.Create(TCipherSuites12.EcdheRsaAes256GcmSha384,
+    TCipherSuites12.EcdheRsaAes128GcmSha256);
+  LConfig := TTlsConfigComposer.BuildClientConfig(LOpts);
+  L12 := TNegotiationPolicy.SuiteOrder(LConfig.CipherSuites, TSuiteProtocol.Tls12);
+  CheckEquals(2, System.Length(L12), 'the 1.2 suites are narrowed to the list');
+  CheckEquals(TCipherSuites12.EcdheRsaAes256GcmSha384, L12[0], 'in the host order');
+  CheckEquals(TCipherSuites12.EcdheRsaAes128GcmSha256, L12[1], 'in the host order');
+  CheckTrue(System.Length(TNegotiationPolicy.SuiteOrder(LConfig.CipherSuites,
+    TSuiteProtocol.Tls13)) > 0, 'the TLS 1.3 suites are untouched by a list that names none');
+  CheckEquals(2, System.Length(LConfig.SupportedVersions), 'both versions stay on');
+  LOpts := ServerOptsWithCredential;
+  LOpts.CipherSuites := TArray<UInt16>.Create(TCipherSuites12.EcdheRsaAes128GcmSha256);
+  LServerConfig := TTlsConfigComposer.BuildServerConfig(LOpts);
+  L12 := TNegotiationPolicy.SuiteOrder(LServerConfig.CipherSuites, TSuiteProtocol.Tls12);
+  CheckEquals(1, System.Length(L12), 'the server is narrowed too');
+  CheckEquals(TCipherSuites12.EcdheRsaAes128GcmSha256, L12[0], 'to the listed suite');
+end;
+
+procedure TTestTlsConnection.TestHostCipherListNamingNoTls12SuiteDropsTls12;
+var
+  LOpts: TTlsOptions;
+  LConfig: ITlsClientConfig;
+begin
+  LOpts := ClientOptsWithStore;
+  LOpts.CipherSuites := TArray<UInt16>.Create(TCipherSuites13.Aes256GcmSha384);
+  LConfig := TTlsConfigComposer.BuildClientConfig(LOpts);
+  CheckEquals(1, System.Length(LConfig.SupportedVersions), 'a TLS 1.3-only list turns 1.2 off');
+  CheckEquals(Integer(TlsWireVersionTls13), Integer(LConfig.SupportedVersions[0]), 'TLS 1.3');
+  CheckEquals(1, System.Length(TNegotiationPolicy.SuiteOrder(LConfig.CipherSuites,
+    TSuiteProtocol.Tls13)), 'and narrows 1.3 to the listed suite');
+end;
+
+procedure TTestTlsConnection.TestHostCipherListLeavesNoUsableSuiteIsRefused;
+var
+  LOpts: TTlsOptions;
+  LMessage: string;
+begin
+  // the host pinned TLS 1.2 and the list names only TLS 1.3 suites: nothing is left to offer
+  LOpts := ClientOptsWithStore;
+  LOpts.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls12);
+  LOpts.CipherSuites := TArray<UInt16>.Create(TCipherSuites13.Aes128GcmSha256);
+  LOpts.CipherSuitesHint := 'CipherList';
+  CheckTrue(RaisesStreamError(LOpts, True, LMessage), 'the contradiction is refused');
+  CheckTrue(Pos('CipherList', LMessage) > 0, 'naming the host property: ' + LMessage);
+end;
+
+procedure TTestTlsConnection.TestHostCipherListNamingOnlyTls12SuitesRefusesAPinnedTls13Only;
+var
+  LOpts: TTlsOptions;
+  LMessage: string;
+begin
+  // a host list never governed TLS 1.3, so a 1.2-only list beside a 1.3-only pin would change
+  // nothing: refused in the host's terms, as a stream error naming its property
+  LOpts := ClientOptsWithStore;
+  LOpts.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls13);
+  LOpts.CipherSuites := TArray<UInt16>.Create(TCipherSuites12.EcdheRsaAes128GcmSha256);
+  LOpts.CipherSuitesHint := 'CipherList';
+  CheckTrue(RaisesStreamError(LOpts, True, LMessage), 'the dead pairing is refused');
+  CheckTrue(Pos('CipherList', LMessage) > 0, 'naming the host property: ' + LMessage);
+end;
+
+procedure TTestTlsConnection.TestServerHostCipherListNamingOnlyTls12SuitesRefusesAPinnedTls13Only;
+var
+  LOpts: TTlsOptions;
+  LMessage: string;
+begin
+  LOpts := ServerOptsWithCredential;
+  LOpts.SupportedVersions := TArray<UInt16>.Create(TlsWireVersionTls13);
+  LOpts.CipherSuites := TArray<UInt16>.Create(TCipherSuites12.EcdheRsaAes128GcmSha256);
+  LOpts.CipherSuitesHint := 'CipherList';
+  CheckTrue(RaisesStreamError(LOpts, False, LMessage), 'the dead pairing is refused');
+  CheckTrue(Pos('CipherList', LMessage) > 0, 'naming the host property: ' + LMessage);
+end;
+
+procedure TTestTlsConnection.TestHostCipherListIsPartOfTheMemoKey;
+var
+  LBase, LNone, LOne, LOther, LReversed: TTlsOptions;
+begin
+  // two hosts that differ only in their list must never share a memoised config; every set is
+  // copied from one base, because each ClientOptsWithStore call builds a fresh store whose
+  // identity is itself part of the signature
+  LBase := ClientOptsWithStore;
+  LNone := LBase;
+  LOne := LBase;
+  LOne.CipherSuites := TArray<UInt16>.Create(TCipherSuites12.EcdheRsaAes256GcmSha384,
+    TCipherSuites12.EcdheRsaAes128GcmSha256);
+  LOther := LBase;
+  LOther.CipherSuites := TArray<UInt16>.Create(TCipherSuites12.EcdheRsaAes256GcmSha384);
+  LReversed := LBase;
+  LReversed.CipherSuites := TArray<UInt16>.Create(TCipherSuites12.EcdheRsaAes128GcmSha256,
+    TCipherSuites12.EcdheRsaAes256GcmSha384);
+  CheckTrue(TTlsConfigComposer.ClientSignature(LNone) <> TTlsConfigComposer.ClientSignature(LOne),
+    'a list differs from none');
+  CheckTrue(TTlsConfigComposer.ClientSignature(LOne) <> TTlsConfigComposer.ClientSignature(LOther),
+    'a shorter list differs');
+  CheckTrue(TTlsConfigComposer.ClientSignature(LOne) <>
+    TTlsConfigComposer.ClientSignature(LReversed), 'order is the preference');
+  LBase := ServerOptsWithCredential;
+  LNone := LBase;
+  LOne := LBase;
+  LOne.CipherSuites := TArray<UInt16>.Create(TCipherSuites12.EcdheRsaAes256GcmSha384);
+  CheckTrue(TTlsConfigComposer.ServerSignature(LNone) <> TTlsConfigComposer.ServerSignature(LOne),
+    'the server key tells them apart');
+end;
+
+procedure TTestTlsConnection.TestHostCipherListConflictsWithASuppliedConfig;
+var
+  LOpts: TTlsOptions;
+  LRaised: Boolean;
+begin
+  LOpts := TTlsOptions.Default;
+  LOpts.ClientConfig := TTlsConfigComposer.BuildClientConfig(ClientOptsWithStore);
+  LOpts.CipherSuites := TArray<UInt16>.Create(TCipherSuites12.EcdheRsaAes128GcmSha256);
+  LRaised := False;
+  try
+    TTlsConfigComposer.ResolveClientConfig(LOpts, TTlsConfigMemos.NewClient, 'ClientConfig');
+  except
+    on E: ETlsStreamError do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a cipher list beside a supplied client config is refused');
+  LOpts := TTlsOptions.Default;
+  LOpts.ServerConfig := TTlsConfigComposer.BuildServerConfig(ServerOptsWithCredential);
+  LOpts.CipherSuites := TArray<UInt16>.Create(TCipherSuites12.EcdheRsaAes128GcmSha256);
+  LRaised := False;
+  try
+    TTlsConfigComposer.ResolveServerConfig(LOpts, TTlsConfigMemos.NewServer, 'ServerConfig');
+  except
+    on E: ETlsStreamError do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'and beside a supplied server config');
+end;
+
+procedure TTestTlsConnection.TestTransportReturnsDataWhenReadable;
+var
+  LTransport: TTestMemoryTransport;
+  LTimed: ITlsTransport;
+  LBuf: TBytes;
+  LN: Int32;
+begin
+  LTransport := TTestMemoryTransport.Create(TBytes.Create(1, 2, 3, 4), True);
+  LTimed := LTransport as ITlsTransport;
+  LTransport.SetReadTimeout(1000);
+  SetLength(LBuf, 16);
+  LN := LTimed.Read(LBuf, 0, 16);
+  CheckEquals(4, LN, 'the available bytes are read within the cap');
+end;
+
+procedure TTestTlsConnection.TestTransportCapZeroDoesNotWait;
+var
+  LTransport: TTestMemoryTransport;
+  LTimed: ITlsTransport;
+  LBuf: TBytes;
+begin
+  // WaitReadable would answer False, but cap 0 must not consult it - reads block/return data
+  LTransport := TTestMemoryTransport.Create(TBytes.Create(9), False);
+  LTimed := LTransport as ITlsTransport;
+  LTransport.SetReadTimeout(0);
+  SetLength(LBuf, 8);
+  CheckEquals(1, LTimed.Read(LBuf, 0, 8), 'cap 0 does not consult the readiness wait');
+end;
+
+procedure TTestTlsConnection.TestTransportNegativeReceiveRaisesStreamError;
+var
+  LTransport: TTestMemoryTransport;
+  LTimed: ITlsTransport;
+  LBuf: TBytes;
+  LRaised: Boolean;
+begin
+  // a negative host receive is a genuine error (reset/broken pipe), not a peer close; it must
+  // surface as a stream error, never be masked as an orderly end-of-stream
+  LTransport := TTestMemoryTransport.Create(nil, True);
+  LTransport.ReceiveNegative := True;
+  LTimed := LTransport as ITlsTransport;
+  SetLength(LBuf, 8);
+  LRaised := False;
+  try
+    LTimed.Read(LBuf, 0, 8);
+  except
+    on E: ETlsStreamError do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a negative host receive raises a stream error');
+end;
+
+procedure TTestTlsConnection.TestTransportZeroReceiveIsEof;
+var
+  LTransport: TTestMemoryTransport;
+  LTimed: ITlsTransport;
+  LBuf: TBytes;
+begin
+  // a zero-length receive is the orderly close: still reported as end-of-stream, not an error
+  LTransport := TTestMemoryTransport.Create(nil, True);
+  LTimed := LTransport as ITlsTransport;
+  SetLength(LBuf, 8);
+  CheckEquals(0, LTimed.Read(LBuf, 0, 8), 'a zero host receive is end-of-stream');
+end;
+
+procedure TTestTlsConnection.TestTransportWriteCompletesOverPartialSends;
+var
+  LTransport: TTestMemoryTransport;
+  LTimed: ITlsTransport;
+  LData: TBytes;
+  LI: Int32;
+begin
+  LTransport := TTestMemoryTransport.Create(nil, True);
+  LTransport.MaxSend := 3; // force the write loop to iterate
+  LTimed := LTransport as ITlsTransport;
+  SetLength(LData, 10);
+  for LI := 0 to 9 do
+    LData[LI] := Byte(LI + 1);
+  LTimed.Write(LData, 0, 10);
+  CheckEquals(10, System.Length(LTransport.Outbound), 'the write loop sends every byte');
+  for LI := 0 to 9 do
+    CheckEquals(LI + 1, LTransport.Outbound[LI], 'byte order is preserved across partial sends');
+end;
+
+procedure TTestTlsConnection.TestTransportSetReadTimeoutIsObservable;
+var
+  LTransport: TTestMemoryTransport;
+begin
+  LTransport := TTestMemoryTransport.Create(nil, True);
+  try
+    CheckEquals(0, LTransport.ArmedTimeout, 'the cap starts cleared');
+    LTransport.SetReadTimeout(30000);
+    CheckEquals(30000, LTransport.ArmedTimeout, 'the armed cap is observable');
+    LTransport.SetReadTimeout(0);
+    CheckEquals(0, LTransport.ArmedTimeout, 'the cap clears back to blocking');
+  finally
+    LTransport.Free;
+  end;
+end;
+
+{ TTestHostCipherList }
+
+function TTestHostCipherList.Refused(const AText: string; out AMessage: string): Boolean;
+begin
+  Result := False;
+  AMessage := '';
+  try
+    THostCipherList.Parse(AText, 'CipherList');
+  except
+    on E: ETlsStreamError do
+    begin
+      Result := True;
+      AMessage := E.Message;
+    end;
+  end;
+end;
+
+function TTestHostCipherList.Codes(const AText: string): TArray<UInt16>;
+begin
+  Result := THostCipherList.Parse(AText, 'CipherList');
+end;
+
+procedure TTestHostCipherList.TestIanaAndOpenSslNamesMapToTheSameCodes;
+var
+  LCodes: TArray<UInt16>;
+begin
+  LCodes := Codes('TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:' +
+    'TLS_AES_128_GCM_SHA256:ECDHE-RSA-CHACHA20-POLY1305');
+  CheckEquals(4, System.Length(LCodes), 'four suites');
+  CheckEquals(TCipherSuites12.EcdheRsaAes128GcmSha256, LCodes[0], 'IANA name');
+  CheckEquals(TCipherSuites12.EcdheEcdsaAes256GcmSha384, LCodes[1], 'OpenSSL name');
+  CheckEquals(TCipherSuites13.Aes128GcmSha256, LCodes[2], 'a 1.3 suite');
+  CheckEquals(TCipherSuites12.EcdheRsaChaCha20Poly1305Sha256, LCodes[3], 'ChaCha');
+end;
+
+procedure TTestHostCipherList.TestSeparatorsAndRunsOfThem;
+var
+  LCodes: TArray<UInt16>;
+begin
+  LCodes := Codes(' :ECDHE-RSA-AES128-GCM-SHA256,, ECDHE-RSA-AES256-GCM-SHA384'#9'TLS_AES_256_GCM_SHA384:; ');
+  CheckEquals(3, System.Length(LCodes),
+    'colon, comma, semicolon, space and tab all separate; runs collapse');
+  CheckEquals(TCipherSuites12.EcdheRsaAes128GcmSha256, LCodes[0], 'first');
+  CheckEquals(TCipherSuites12.EcdheRsaAes256GcmSha384, LCodes[1], 'second');
+  CheckEquals(TCipherSuites13.Aes256GcmSha384, LCodes[2], 'third');
+end;
+
+procedure TTestHostCipherList.TestCaseIsIgnoredAndDuplicatesKeepTheFirstPosition;
+var
+  LCodes: TArray<UInt16>;
+begin
+  LCodes := Codes('ecdhe-rsa-aes256-gcm-sha384:ECDHE-RSA-AES128-GCM-SHA256:' +
+    'TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384');
+  CheckEquals(2, System.Length(LCodes), 'the repeat under the other vocabulary is dropped');
+  CheckEquals(TCipherSuites12.EcdheRsaAes256GcmSha384, LCodes[0], 'the first position wins');
+  CheckEquals(TCipherSuites12.EcdheRsaAes128GcmSha256, LCodes[1], 'and the rest keeps its order');
+end;
+
+procedure TTestHostCipherList.TestEmptyAndDefaultMeanTheHostDefault;
+begin
+  CheckEquals(0, System.Length(Codes('')), 'empty');
+  CheckEquals(0, System.Length(Codes('   ')), 'blank');
+  CheckEquals(0, System.Length(Codes('DEFAULT')), 'DEFAULT');
+  CheckEquals(0, System.Length(Codes(' default ')), 'DEFAULT in any case, trimmed');
+end;
+
+procedure TTestHostCipherList.TestExpressionsAndUnimplementedSuitesAreRefused;
+const
+  Offenders: array [0 .. 9] of string = ('HIGH', '!aNULL', '+RSA', '@STRENGTH', 'ALL',
+    '-ECDHE-RSA-AES128-GCM-SHA256', 'ECDHE-RSA-AES128-SHA', 'RC4-SHA', 'DES-CBC3-SHA',
+    'AES128-GCM-SHA256');
+var
+  LI: Int32;
+  LMessage: string;
+begin
+  for LI := Low(Offenders) to High(Offenders) do
+  begin
+    CheckTrue(Refused(Offenders[LI], LMessage), Offenders[LI] + ' is refused, never skipped');
+    CheckTrue(Pos('CipherList', LMessage) > 0, 'the message names the property');
+    CheckTrue(Pos(Offenders[LI], LMessage) > 0, 'and the offending token');
+  end;
+  CheckTrue(Refused('ECDHE-RSA-AES128-GCM-SHA256:HIGH:RC4-SHA', LMessage), 'a good name beside bad ones');
+  CheckTrue((Pos('HIGH', LMessage) > 0) and (Pos('RC4-SHA', LMessage) > 0),
+    'every offender is named: ' + LMessage);
+end;
+
+procedure TTestHostCipherList.TestDefaultBesideNamesIsRefused;
+var
+  LMessage: string;
+begin
+  CheckTrue(Refused('DEFAULT:ECDHE-RSA-AES128-GCM-SHA256', LMessage), 'DEFAULT then a name');
+  CheckTrue(Refused('ECDHE-RSA-AES128-GCM-SHA256:DEFAULT', LMessage), 'a name then DEFAULT');
+end;
+
+initialization
+
+{$IFDEF FPC}
+  RegisterTest(TTestTlsConnection);
+  RegisterTest(TTestHostCipherList);
+{$ELSE}
+  RegisterTest(TTestTlsConnection.Suite);
+  RegisterTest(TTestHostCipherList.Suite);
+{$ENDIF FPC}
+
+end.
