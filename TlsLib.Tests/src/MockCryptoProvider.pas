@@ -25,12 +25,13 @@ uses
   TlpImportedCredential,
   TlpIKeyExchangePrivateKey,
   TlpICryptoProvider,
+  TlpArrayUtilities,
   TlpTlsLibExceptions,
   TlpDefaultCryptoProvider;
 
 type
   /// <summary>A signature verifier that rejects every signature.</summary>
-  TRejectingSignatureVerifier = class sealed(TInterfacedObject, ISignatureVerifier)
+  TRejectingSignatureVerifier = class(TInterfacedObject, ISignatureVerifier)
   public
     procedure Update(const AData: TBytes; AOffset, ALength: Int32);
     function Verify(const ASignature: TBytes): Boolean;
@@ -43,6 +44,64 @@ type
     function CapableSchemes: TArray<TSignatureScheme>;
     function PublicKeyInfo: TBytes;
     function WithPreferredSchemes(const ASchemes: TArray<TSignatureScheme>): ISigningKey;
+  end;
+
+  /// <summary>A signing key that reports fixed schemes and a fixed public key and has no
+  /// private key material; WithPreferredSchemes keeps the requested schemes the key can
+  /// sign.</summary>
+  TFakeSigningKey = class(TInterfacedObject, ISigningKey)
+  strict private
+  var
+    FSchemes: TArray<TSignatureScheme>;
+    FPublicKeyInfo: TBytes;
+  strict protected
+    function Narrowed(const ASchemes: TArray<TSignatureScheme>): ISigningKey; virtual;
+  public
+    constructor Create(const ASchemes: TArray<TSignatureScheme>); overload;
+    constructor Create(const ASchemes: TArray<TSignatureScheme>;
+      const APublicKeyInfo: TBytes); overload;
+    function CapableSchemes: TArray<TSignatureScheme>;
+    function PublicKeyInfo: TBytes;
+    function WithPreferredSchemes(const ASchemes: TArray<TSignatureScheme>): ISigningKey;
+  end;
+
+  /// <summary>An HPKE suite that seals nothing; a test only asks whether one was granted.</summary>
+  TFakeHpkeSuite = class sealed(TInterfacedObject, IHpkeSuite)
+  strict private
+  var
+    FKem, FKdf, FAead: UInt16;
+  public
+    constructor Create(AKem, AKdf, AAead: UInt16);
+    function Kem: UInt16;
+    function Kdf: UInt16;
+    function Aead: UInt16;
+    function AeadTagLength: Int32;
+    procedure SetupSealer(const ARecipientPublicKey, AInfo: TBytes; out AEnc: TBytes;
+      out ASealer: IHpkeSealer);
+  end;
+
+  /// <summary>A foreign HPKE facet, not composed over any primitives, that offers every KEM and
+  /// the three AEADs and counts the key operations that reach it. Never for production
+  /// use.</summary>
+  TFakeHpke = class sealed(TInterfacedObject, IHpkeCrypto)
+  strict private
+  var
+    FRecipientImports: Int32;
+    FKeyPairs: Int32;
+    FPrivateImports: Int32;
+  public
+    function Suite(AKem, AKdf, AAead: UInt16): IHpkeSuite;
+    function ImportRecipientKey(AKem: UInt16;
+      const APrivateKey: ISecretBuffer): IHpkeRecipientKey;
+    procedure GenerateKeyPair(AKem: UInt16; out APublicKey: TBytes;
+      out APrivateKey: ISecretBuffer);
+    function ImportPrivateKey(AKem: UInt16; const APkcs8Der: TBytes): ISecretBuffer;
+    function SupportedSuites(AKem: UInt16): TArray<THpkeSuiteId>;
+    function ValidatePublicKey(AKem: UInt16; const APublicKey: TBytes): Boolean;
+    function RandomEncapsulation(AKem: UInt16): TBytes;
+    property RecipientImports: Int32 read FRecipientImports;
+    property KeyPairs: Int32 read FKeyPairs;
+    property PrivateImports: Int32 read FPrivateImports;
   end;
 
   /// <summary>An <see cref="ISigningCrypto" /> that signs and imports through an inner facet but
@@ -137,8 +196,12 @@ type
     FMissingAgreement: TKeyAgreementAlgorithm;
     FHasMissingAgreement: Boolean;
     FLenientKem: Boolean;
+    FFault: ExceptClass;
   public
     constructor Create(const AInner: ICryptoPrimitives; AMissing: TAeadAlgorithm); overload;
+    /// <summary>From now on the missing AEAD fails with AFault, a plain Exception as a third
+    /// party's might or a fatal one, instead of the library's not-supported error.</summary>
+    procedure ArmFault(AFault: ExceptClass);
     /// <summary>Models a facet that cannot build one key agreement instead.</summary>
     constructor Create(const AInner: ICryptoPrimitives;
       AMissingAgreement: TKeyAgreementAlgorithm); overload;
@@ -183,6 +246,10 @@ type
     constructor Create(const AInner: ICryptoProvider;
       AMissingAgreement: TKeyAgreementAlgorithm); overload;
     constructor CreateLenientKem(const AInner: ICryptoProvider);
+    /// <summary>Once built, the missing AEAD fails with AFault, as a third party's might (the
+    /// builder itself tolerates only the library's not-supported error).</summary>
+    constructor CreateFault(const AInner: ICryptoProvider; AMissing: TAeadAlgorithm;
+      AFault: ExceptClass);
     function Primitives: ICryptoPrimitives;
     function Signing: ISigningCrypto;
     function Hpke: IHpkeCrypto;
@@ -272,6 +339,7 @@ resourcestring
   SMissingAead = 'this primitives facet does not provide the requested AEAD';
   SInjectedSealFault = 'the AEAD seal was made to fail by the test';
   SMissingAgreement = 'this primitives facet does not provide the requested key agreement';
+  SFakeHpkeSealer = 'the fake HPKE suite seals nothing';
 
 { TRejectingSignatureVerifier }
 
@@ -283,6 +351,88 @@ end;
 function TRejectingSignatureVerifier.Verify(const ASignature: TBytes): Boolean;
 begin
   Result := False;
+end;
+
+{ TFakeHpkeSuite }
+
+constructor TFakeHpkeSuite.Create(AKem, AKdf, AAead: UInt16);
+begin
+  inherited Create;
+  FKem := AKem;
+  FKdf := AKdf;
+  FAead := AAead;
+end;
+
+function TFakeHpkeSuite.Kem: UInt16;
+begin
+  Result := FKem;
+end;
+
+function TFakeHpkeSuite.Kdf: UInt16;
+begin
+  Result := FKdf;
+end;
+
+function TFakeHpkeSuite.Aead: UInt16;
+begin
+  Result := FAead;
+end;
+
+function TFakeHpkeSuite.AeadTagLength: Int32;
+begin
+  Result := 16;
+end;
+
+procedure TFakeHpkeSuite.SetupSealer(const ARecipientPublicKey, AInfo: TBytes;
+  out AEnc: TBytes; out ASealer: IHpkeSealer);
+begin
+  raise EInvalidOperationTlsLibException.CreateRes(@SFakeHpkeSealer);
+end;
+
+{ TFakeHpke }
+
+function TFakeHpke.Suite(AKem, AKdf, AAead: UInt16): IHpkeSuite;
+begin
+  Result := TFakeHpkeSuite.Create(AKem, AKdf, AAead) as IHpkeSuite;
+end;
+
+function TFakeHpke.ImportRecipientKey(AKem: UInt16;
+  const APrivateKey: ISecretBuffer): IHpkeRecipientKey;
+begin
+  Inc(FRecipientImports);
+  Result := nil;
+end;
+
+procedure TFakeHpke.GenerateKeyPair(AKem: UInt16; out APublicKey: TBytes;
+  out APrivateKey: ISecretBuffer);
+begin
+  Inc(FKeyPairs);
+  APublicKey := nil;
+  APrivateKey := nil;
+end;
+
+function TFakeHpke.ImportPrivateKey(AKem: UInt16; const APkcs8Der: TBytes): ISecretBuffer;
+begin
+  Inc(FPrivateImports);
+  Result := nil;
+end;
+
+function TFakeHpke.SupportedSuites(AKem: UInt16): TArray<THpkeSuiteId>;
+begin
+  Result := TArray<THpkeSuiteId>.Create(
+    THpkeSuiteId.Create(AKem, THpkeKdf.HKDF_SHA256, THpkeAead.AES_128_GCM),
+    THpkeSuiteId.Create(AKem, THpkeKdf.HKDF_SHA256, THpkeAead.AES_256_GCM),
+    THpkeSuiteId.Create(AKem, THpkeKdf.HKDF_SHA256, THpkeAead.CHACHA20_POLY1305));
+end;
+
+function TFakeHpke.ValidatePublicKey(AKem: UInt16; const APublicKey: TBytes): Boolean;
+begin
+  Result := True;
+end;
+
+function TFakeHpke.RandomEncapsulation(AKem: UInt16): TBytes;
+begin
+  Result := TBytes.Create(1);
 end;
 
 { TMockSigningKey }
@@ -301,6 +451,51 @@ function TMockSigningKey.WithPreferredSchemes(
   const ASchemes: TArray<TSignatureScheme>): ISigningKey;
 begin
   Result := Self;
+end;
+
+{ TFakeSigningKey }
+
+constructor TFakeSigningKey.Create(const ASchemes: TArray<TSignatureScheme>);
+begin
+  Create(ASchemes, nil);
+end;
+
+constructor TFakeSigningKey.Create(const ASchemes: TArray<TSignatureScheme>;
+  const APublicKeyInfo: TBytes);
+begin
+  inherited Create;
+  FSchemes := ASchemes;
+  FPublicKeyInfo := APublicKeyInfo;
+end;
+
+function TFakeSigningKey.Narrowed(const ASchemes: TArray<TSignatureScheme>): ISigningKey;
+begin
+  Result := TFakeSigningKey.Create(ASchemes, FPublicKeyInfo) as ISigningKey;
+end;
+
+function TFakeSigningKey.CapableSchemes: TArray<TSignatureScheme>;
+begin
+  Result := FSchemes;
+end;
+
+function TFakeSigningKey.PublicKeyInfo: TBytes;
+begin
+  Result := FPublicKeyInfo;
+end;
+
+function TFakeSigningKey.WithPreferredSchemes(
+  const ASchemes: TArray<TSignatureScheme>): ISigningKey;
+var
+  LKept: TArray<TSignatureScheme>;
+  LI: Int32;
+begin
+  if System.Length(ASchemes) = 0 then
+    Exit(Self as ISigningKey);
+  LKept := nil;
+  for LI := 0 to System.Length(ASchemes) - 1 do
+    if TArrayUtilities.Contains<TSignatureScheme>(FSchemes, ASchemes[LI]) then
+      TArrayUtilities.Append<TSignatureScheme>(LKept, ASchemes[LI]);
+  Result := Narrowed(LKept);
 end;
 
 { TRejectingVerifierSigning }
@@ -468,6 +663,11 @@ begin
   FHasMissingAgreement := True;
 end;
 
+procedure TMissingAeadPrimitives.ArmFault(AFault: ExceptClass);
+begin
+  FFault := AFault;
+end;
+
 function TMissingAeadPrimitives.GetRandom: IRandom;
 begin
   Result := FInner.GetRandom;
@@ -496,7 +696,11 @@ end;
 function TMissingAeadPrimitives.CreateAead(AAlgorithm: TAeadAlgorithm): IAead;
 begin
   if FHasMissingAead and (AAlgorithm = FMissing) then
+  begin
+    if FFault <> nil then
+      raise FFault.CreateRes(@SMissingAead);
     raise ENotSupportedTlsLibException.CreateRes(@SMissingAead);
+  end;
   Result := FInner.CreateAead(AAlgorithm);
 end;
 
@@ -599,6 +803,24 @@ begin
       as ICryptoPrimitives)
     .WithSigning(AInner.Signing)
     .Build;
+end;
+
+constructor TMissingAeadProvider.CreateFault(const AInner: ICryptoProvider;
+  AMissing: TAeadAlgorithm; AFault: ExceptClass);
+var
+  LBuilder: ICryptoProviderBuilder;
+  LPrimitives: TMissingAeadPrimitives;
+  LHeld: ICryptoPrimitives;
+begin
+  inherited Create;
+  LPrimitives := TMissingAeadPrimitives.Create(AInner.Primitives, AMissing);
+  LHeld := LPrimitives as ICryptoPrimitives;
+  LBuilder := TCryptoProviderBuilder.Create;
+  FComposed := LBuilder
+    .WithPrimitives(LHeld)
+    .WithSigning(AInner.Signing)
+    .Build;
+  LPrimitives.ArmFault(AFault);
 end;
 
 function TMissingAeadProvider.Primitives: ICryptoPrimitives;

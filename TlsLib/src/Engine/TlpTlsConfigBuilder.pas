@@ -26,6 +26,8 @@ uses
   TlpCryptoDomainTypes,
   TlpPkixDomainTypes,
   TlpINamedGroup,
+  TlpNamedGroups,
+  TlpClientPskPath,
   TlpINegotiation,
   TlpNegotiationTypes,
   TlpCipherSuiteCatalog,
@@ -46,6 +48,8 @@ uses
   TlpCertificateLimits,
   TlpTrustPolicy,
   TlpCertificateStrengthPolicy,
+  TlpChainAlgorithmPolicy,
+  TlpTlsAlert,
   TlpTlsCredential,
   TlpITlsCredentialResolver,
   TlpCredentialResolvers,
@@ -98,6 +102,12 @@ type
   /// and a version facet touched for a version that is not offered is refused at build.
   /// </summary>
   TTlsConfigBuilder = class(TInterfacedObject, ITlsConfigBuilder)
+  public const
+    /// <summary>The session-ticket lifetime in seconds a server config carries until
+    /// WithTicketLifetime sets another.</summary>
+    DefaultTicketLifetimeSeconds = UInt32(7200);
+    /// <summary>The longest session or resumption scope, in bytes, the builder accepts.</summary>
+    MaxResumptionScopeLength = Int32(32);
   strict private
   var
     FFrozen: Boolean;
@@ -251,10 +261,6 @@ type
     constructor Create(const ACryptoProvider: ICryptoProvider;
       const APkixProvider: IPkixProvider; const AProfile: TTlsConfigProfile);
   private
-    /// <summary>A credential sharing no mutable byte array (chain, staple) with ACredential, so a
-    /// caller reusing its buffers after Build cannot change what a built config sends or validated.
-    /// The signing key handle is shared by reference.</summary>
-    class function CloneCredential(const ACredential: TTlsCredential): TTlsCredential; static;
     /// <summary>The PSKs with their identity and context copied (the secret is an immutable
     /// buffer, shared by reference).</summary>
     class function CloneExternalPsks(
@@ -416,6 +422,7 @@ resourcestring
     'verdict slot: call only one';
   SDefaultKeysBesideExplicitKeys = 'WithDefaultSessionTicketKeys can never take effect beside ' +
     'WithSessionTicketKeys: call only one';
+  SSuiteDiffersFromCatalog = 'cipher suite 0x%.4x differs from the catalog definition of its code';
   SCipherSuiteListNotOffered = 'the cipher-suite list names only suites of a protocol version ' +
     'that is not offered, so it would change nothing: list a suite of an offered version or drop ' +
     'WithCipherSuiteList';
@@ -472,6 +479,9 @@ resourcestring
     'configured client-CA anchors as its exclusive trust root and can trust nothing without them; ' +
     'give the TClientVerification.VerifierSource store at least one root certificate (a verifier ' +
     'that brings its own roots is installed with TClientVerification.Custom instead)';
+  SClientAnchorBelowKeyFloors = 'a client-CA trust anchor''s key is below the certificate ' +
+    'strength floors or cannot be read, and the strength policy holds anchors to the floors ' +
+    '(AnchorKeyFloors)';
   SMtlsSharedResumptionNeedsScope = 'client authentication with a supplied session store or ' +
     'ticket-key manager requires WithResumptionScope: a key or store may be shared across ' +
     'configurations, and a resumed handshake reuses the stored client identity unverified';
@@ -569,6 +579,8 @@ resourcestring
   SCredentialKeyLeafMismatch = 'the credential''s private key does not match the public key in ' +
     'its end-entity certificate (CertificateChain[0]); load a leaf-first chain (from PEM) whose ' +
     'first certificate pairs with the key';
+  SCredentialLeafMalformed = 'the credential''s end-entity certificate (CertificateChain[0]) ' +
+    'cannot be parsed';
   SCredentialLeafCannotSign = 'the credential''s end-entity certificate has a keyUsage extension ' +
     'that forbids digitalSignature, so it cannot sign a handshake (RFC 5280 4.2.1.3)';
   SCredentialLeafRsaPssUnsupported = 'the credential''s end-entity certificate carries an ' +
@@ -581,11 +593,9 @@ resourcestring
   SSniCredentialInvalid = 'the SNI credential for host "%s" is invalid: %s';
 
 const
-  DefaultTicketLifetimeSeconds = UInt32(7200);
   DefaultTicketCount = Int32(2);
   MaxTicketCount = Int32(8);
   SessionScopeLength = Int32(16);
-  MaxResumptionScopeLength = Int32(32);
   MaxServerEarlyData = UInt32(1 shl 20);
   MaxAlpnListBytes = Int32(16384);
   // the names ride one list with a 2-byte length in both versions (RFC 5246 7.4.4, RFC 9846 4.3.4)
@@ -953,7 +963,7 @@ end;
 
 function TFrozenCommonConfigBase.Credential: TTlsCredential;
 begin
-  Result := TTlsConfigBuilder.CloneCredential(FCredential);
+  Result := FCredential.Clone;
 end;
 
 function TFrozenCommonConfigBase.TrustStore: ITrustAnchorStore;
@@ -2233,14 +2243,6 @@ begin
   Result := Self;
 end;
 
-class function TTlsConfigBuilder.CloneCredential(
-  const ACredential: TTlsCredential): TTlsCredential;
-begin
-  Result := ACredential;
-  Result.CertificateChain := TArrayUtilities.DeepCopy<Byte>(ACredential.CertificateChain);
-  Result.OcspStaple := System.Copy(ACredential.OcspStaple);
-end;
-
 class function TTlsConfigBuilder.CloneExternalPsks(
   const APsks: TArray<TExternalPsk>): TArray<TExternalPsk>;
 var
@@ -2258,7 +2260,7 @@ function TTlsConfigBuilder.WithCredential(
   const ACredential: TTlsCredential): TTlsConfigBuilder;
 begin
   GuardMutable;
-  FCredential := TTlsConfigBuilder.CloneCredential(ACredential);
+  FCredential := ACredential.Clone;
   FHasCredential := True;
   Result := Self;
 end;
@@ -2270,7 +2272,7 @@ var
 begin
   GuardMutable;
   LEntry.Host := AHost;
-  LEntry.Credential := TTlsConfigBuilder.CloneCredential(ACredential);
+  LEntry.Credential := ACredential.Clone;
   TArrayUtilities.Append<TSniCredentialEntry>(FSniCredentialEntries, LEntry);
   Result := Self;
 end;
@@ -2318,37 +2320,25 @@ end;
 
 procedure TTlsConfigBuilder.ValidateCredentialConsistency(
   const ACredential: TTlsCredential);
-var
-  LLeaf, LKeyPublicKeyInfo: TBytes;
-  LSchemes: TArray<TSignatureScheme>;
 begin
   // an empty chain would emit an empty certificate_list (RFC 9846 4.5.1) and a missing key
   // cannot sign, so either is refused here rather than failing mid-handshake
-  if System.Length(ACredential.CertificateChain) = 0 then
-    raise EInvalidOperationTlsLibException.CreateRes(@SCredentialChainEmpty);
-  if ACredential.PrivateKey = nil then
-    raise EInvalidOperationTlsLibException.CreateRes(@SCredentialKeyMissing);
-  LLeaf := ACredential.CertificateChain[0];
-  // a definite No means the leaf may not sign a CertificateVerify; an absent or unreadable
-  // keyUsage passes (the peer-side signing-policy check is the backstop)
-  if FPkix.Certificates.KeyUsagePermits(LLeaf, TCertKeyUsage.DigitalSignature) = TCertAnswer.No
-  then
-    raise EInvalidOperationTlsLibException.CreateRes(@SCredentialLeafCannotSign);
-  // an id-RSASSA-PSS leaf key pairs only with rsa_pss_pss_*, which this library does not offer,
-  // so it is unusable even when the private key matches it (the key-value match below would pass)
-  LSchemes := ACredential.PrivateKey.CapableSchemes;
-  if (System.Length(LSchemes) > 0) and (LSchemes[0].KeyKind = TSignatureKeyKind.Rsa) and
-    (FPkix.Certificates.KeyIsRsaPss(LLeaf) = TCertAnswer.Yes) then
-    raise EInvalidOperationTlsLibException.CreateRes(@SCredentialLeafRsaPssUnsupported);
-  // the private key must own the leaf: match the key's public half against the leaf's, with no
-  // signing operation. A key that cannot export its public half fails closed. The value compare
-  // also catches a mis-ordered chain whose first certificate is not the one that pairs with the key
-  LKeyPublicKeyInfo := ACredential.PrivateKey.PublicKeyInfo;
-  if System.Length(LKeyPublicKeyInfo) = 0 then
-    raise EInvalidOperationTlsLibException.CreateRes(@SCredentialKeyNotExportable);
-  if FPkix.Certificates.SamePublicKey(FPkix.Certificates.PublicKeyInfo(LLeaf),
-    LKeyPublicKeyInfo) <> TCertAnswer.Yes then
-    raise EInvalidOperationTlsLibException.CreateRes(@SCredentialKeyLeafMismatch);
+  case ACredential.Consistency(FPkix.Certificates) of
+    TCredentialConsistency.ChainEmpty:
+      raise EInvalidOperationTlsLibException.CreateRes(@SCredentialChainEmpty);
+    TCredentialConsistency.KeyMissing:
+      raise EInvalidOperationTlsLibException.CreateRes(@SCredentialKeyMissing);
+    TCredentialConsistency.LeafCannotSign:
+      raise EInvalidOperationTlsLibException.CreateRes(@SCredentialLeafCannotSign);
+    TCredentialConsistency.LeafKeyRsaPss:
+      raise EInvalidOperationTlsLibException.CreateRes(@SCredentialLeafRsaPssUnsupported);
+    TCredentialConsistency.KeyNotExportable:
+      raise EInvalidOperationTlsLibException.CreateRes(@SCredentialKeyNotExportable);
+    TCredentialConsistency.LeafMalformed:
+      raise EInvalidOperationTlsLibException.CreateRes(@SCredentialLeafMalformed);
+    TCredentialConsistency.KeyLeafMismatch:
+      raise EInvalidOperationTlsLibException.CreateRes(@SCredentialKeyLeafMismatch);
+  end;
 end;
 
 function TTlsConfigBuilder.ComposeCredentialResolver: ITlsServerCredentialResolver;
@@ -3054,28 +3044,31 @@ end;
 
 procedure TTlsConfigBuilder.ValidateRequiredCollaborators;
 var
-  LI: Int32;
   LGroup: INamedGroup;
-  LAnyRegistered, LEcdheRegistered: Boolean;
+  LResolved: TArray<INamedGroup>;
+  LEcdheRegistered: Boolean;
+  LSuites: ICipherSuiteRegistry;
+  LSuite: TTlsCipherSuite;
 begin
   if (FCipherSuites = nil) or (FSignatureSchemes = nil) or (FNamedGroups = nil) then
     raise EArgumentTlsLibException.CreateRes(@SNilNegotiationRegistry);
-  ValidateOfferedVersionsHaveSuites(EffectiveCipherSuites);
+  LSuites := EffectiveCipherSuites;
+  // a custom registry skips the default registry's own check, and the engine runs the record
+  for LSuite in LSuites.Items do
+    if not TCipherSuiteCatalog.MatchesCatalog(LSuite) then
+      raise EArgumentTlsLibException.CreateResFmt(@SSuiteDiffersFromCatalog, [LSuite.Common.Code]);
+  ValidateOfferedVersionsHaveSuites(LSuites);
   if System.Length(FPreferredGroups) = 0 then
     raise EArgumentTlsLibException.CreateRes(@SNoPreferredGroups);
   // a preferred group the registry lacks is skipped (the registry is authoritative, so a pruned
   // registry may keep a wider preference list), but with none registered no group could ever be
   // selected and every handshake would fail
-  LAnyRegistered := False;
+  LResolved := TNamedGroups.ResolvedGroups(FNamedGroups, FPreferredGroups);
   LEcdheRegistered := False;
-  for LI := 0 to System.High(FPreferredGroups) do
-    if FNamedGroups.TryGet(FPreferredGroups[LI], LGroup) then
-    begin
-      LAnyRegistered := True;
-      if LGroup.Kind = TNamedGroupKind.Ecdhe then
-        LEcdheRegistered := True;
-    end;
-  if not LAnyRegistered then
+  for LGroup in LResolved do
+    if LGroup.Kind = TNamedGroupKind.Ecdhe then
+      LEcdheRegistered := True;
+  if System.Length(LResolved) = 0 then
     raise EArgumentTlsLibException.CreateRes(@SNoRegisteredPreferredGroup);
   // TLS 1.2 key exchange is classical ECDHE only (KEM and hybrid groups are 1.3-only)
   if (not LEcdheRegistered) and
@@ -3126,19 +3119,19 @@ begin
   begin
     // each version the client offers needs a PSK of that version, required, or it would reach a
     // certificate path with nothing to verify against
-    if TArrayUtilities.Contains<UInt16>(FSupportedVersions, TlsWireVersionTls13) then
+    if (TArrayUtilities.Contains<UInt16>(FSupportedVersions, TlsWireVersionTls13)) and
+      not TClientPskPath.RequiresPsk(System.Length(FExternalPsks), FExternalPskRequired) then
     begin
       if System.Length(FExternalPsks) = 0 then
         raise EInvalidOperationTlsLibException.CreateRes(@SPskOnlyClientNeedsTls12Only);
-      if not FExternalPskRequired then
-        raise EInvalidOperationTlsLibException.CreateRes(@SPskOnlyClientNeedsPskRequired);
+      raise EInvalidOperationTlsLibException.CreateRes(@SPskOnlyClientNeedsPskRequired);
     end;
-    if TArrayUtilities.Contains<UInt16>(FSupportedVersions, TlsWireVersionTls12) then
+    if (TArrayUtilities.Contains<UInt16>(FSupportedVersions, TlsWireVersionTls12)) and
+      not TClientPskPath.RequiresPsk(System.Length(FTls12Psks), FTls12PskRequired) then
     begin
       if System.Length(FTls12Psks) = 0 then
         raise EInvalidOperationTlsLibException.CreateRes(@SPskOnlyClientNeedsTls13Only);
-      if not FTls12PskRequired then
-        raise EInvalidOperationTlsLibException.CreateRes(@SPskOnlyClientNeedsTls12PskRequired);
+      raise EInvalidOperationTlsLibException.CreateRes(@SPskOnlyClientNeedsTls12PskRequired);
     end;
     ValidatePskOnlyClientSettings;
   end;
@@ -3272,6 +3265,7 @@ end;
 function TTlsConfigBuilder.BuildServer: ITlsServerConfig;
 var
   LConfig: TFrozenServerConfig;
+  LAlert: TTlsAlertDescription;
 begin
   // a builder is single-use
   GuardMutable;
@@ -3360,6 +3354,11 @@ begin
       raise EInvalidOperationTlsLibException.CreateRes(@SEmptyTrustStore);
     raise EInvalidOperationTlsLibException.CreateRes(@SNoClientAuthTrustStore);
   end;
+  // with AnchorKeyFloors set, every client-CA anchor is held to the floors, used or not
+  if (FClientAuth <> TClientAuthMode.None) and HasAnchorRoots and
+    not TChainAlgorithmPolicy.AnchorsMeetKeyFloors(FPkix.Certificates,
+    ComposeTrustStore.RootCertificates, FStrengthPolicy, LAlert) then
+    raise EInvalidOperationTlsLibException.CreateRes(@SClientAnchorBelowKeyFloors);
   // a Hard revocation posture on the client certificate rejects a client whose cert carries no
   // definite non-revoked status. A client cannot staple, so the only status source is a live
   // OCSP/CRL verdict resolver; without one, Hard would reject every client. Fail fast at Build

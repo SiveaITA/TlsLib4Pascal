@@ -29,8 +29,10 @@ uses
   TlpCryptoDomainTypes,
   TlpICryptoProvider,
   TlpICryptoBackendReport,
-  TlpISystemSigningKey,
   TlpSystemCryptoTypes,
+  TlpSystemCryptoStrictness,
+  TlpINegotiation,
+  TlpSignatureSchemeRegistry,
   TlpISecretBuffer,
   TlpISigningKey,
   TlpImportedCredential,
@@ -43,6 +45,7 @@ uses
   TlpEcPrivateScalar,
   TlpSystemCryptoBase,
   MockCryptoProvider,
+  MockSystemCrypto,
   TlsLibTestProviders,
   TlsLibTestBase;
 
@@ -322,6 +325,9 @@ type
   strict private
     procedure CheckNotNative(const AName: string; const AEntry: TCryptoBackendEntry);
     procedure CheckComposed(const AName: string; const AEntry: TCryptoBackendEntry);
+    // the signing answer of a platform whose module decision is these three facts
+    function ModuleFacet(ASchemeServed, AModulePresent,
+      AFacetNative: Boolean): TCryptoBackendEntry;
   published
     procedure TestRandomDefaultsToNotNative;
     procedure TestHashDefaultsToNotNative;
@@ -330,6 +336,7 @@ type
     procedure TestKeyAgreementDefaultsToNotNative;
     procedure TestKemDefaultsToNotNative;
     procedure TestSigningDefaultsToNotNative;
+    procedure TestVerificationDefaultsToNotNative;
     procedure TestHkdfIsNotNativeWhenHmacDefaults;
     procedure TestTls12PrfIsNotNativeWhenHmacDefaults;
     procedure TestHkdfIsComposedExactlyWhereHmacIsSystem;
@@ -337,8 +344,31 @@ type
     procedure TestHpkeFacetIsComposedWhenFlagged;
     procedure TestHpkeFacetIsNotNativeWhenNotFlagged;
     procedure TestPrimitivesAndSigningFacetsAreNeverWhole;
-    procedure TestSigningKeyIsSystemWhenMarked;
+    procedure TestSigningKeyIsNotNativeEvenWhenMarked;
     procedure TestSigningKeyIsNotNativeWhenUnmarked;
+    procedure TestVerifierIsNotNativeEvenWhenMarked;
+    procedure TestVerifierIsNotNativeWhenUnmarked;
+    // the per-scheme decision of a facet served by a separate OS module, one case each
+    procedure TestModuleFacetSchemeNotServedIsNotNative;
+    procedure TestModuleFacetAbsentModuleIsNoModule;
+    procedure TestModuleFacetNativeIsSystem;
+    procedure TestModuleFacetNotNativeIsPortable;
+    // a scheme the module does not serve is NotNative before the module is judged absent
+    procedure TestModuleFacetSchemeNotServedAndModuleAbsentIsNotNative;
+  end;
+
+  /// <summary>The strict-registry derivation over backend reports whose signing and
+  /// verification coverage differ.</summary>
+  TTestSystemCryptoStrictness = class(TSystemCryptoHelperTestCase)
+  strict private
+    // the signature schemes left and the names dropped for a report with this coverage
+    function Remaining(const AReport: ICryptoBackendReport;
+      out ADropped: TArray<string>): ISignatureSchemeRegistry;
+  published
+    procedure TestSigningWithoutVerificationDropsEveryScheme;
+    procedure TestVerificationWithoutSigningDropsEveryScheme;
+    procedure TestFullCoverageKeepsEveryScheme;
+    procedure TestMixedCoverageKeepsOnlyTheSchemesServedInBothRoles;
   end;
 
 implementation
@@ -410,23 +440,49 @@ const
     '9d201395faa4b61a96c8';
 
 type
-  // a platform that overrides nothing: every per-algorithm answer is the base default
-  TBareBackendReport = class(TSystemBackendReportBase)
-  public
-    function Describe: string; override;
-  end;
-
   // a platform whose OS HMAC serves only some hashes
-  TFakeBackendReport = class(TBareBackendReport)
+  TPartialHmacReport = class(TBareBackendReport)
   public
     function HmacBackend(AAlgorithm: THashAlgorithm): TCryptoBackendEntry; override;
   end;
 
-  TFakeSystemSigningKey = class(TMockSigningKey, ISystemSigningKey);
+  // a platform whose OS module serves signing and verification independently
+  TSplitBackendReport = class(TBareBackendReport)
+  strict private
+  var
+    FSigningNative: Boolean;
+    FVerifyNative: Boolean;
+  public
+    constructor Create(ASigningNative, AVerifyNative: Boolean); reintroduce;
+    function SigningBackend(AScheme: TSignatureScheme): TCryptoBackendEntry; override;
+    function VerificationBackend(AScheme: TSignatureScheme): TCryptoBackendEntry; override;
+  end;
+
+  // a platform whose signing is served by a separate OS module, as the base helper decides it
+  TModuleFacetReport = class(TBareBackendReport)
+  strict private
+  var
+    FSchemeServed: Boolean;
+    FModulePresent: Boolean;
+    FFacetNative: Boolean;
+  public
+    constructor Create(ASchemeServed, AModulePresent, AFacetNative: Boolean); reintroduce;
+    function SigningBackend(AScheme: TSignatureScheme): TCryptoBackendEntry; override;
+  end;
+
+  // a platform that signs every scheme natively but verifies only ECDSA natively
+  TEcdsaVerifyOnlyReport = class(TBareBackendReport)
+  public
+    constructor Create; reintroduce;
+    function SigningBackend(AScheme: TSignatureScheme): TCryptoBackendEntry; override;
+    function VerificationBackend(AScheme: TSignatureScheme): TCryptoBackendEntry; override;
+  end;
 
 const
   // the hashes the fake OS HMAC serves
   HmacSystemHashes = [THashAlgorithm.SHA_256, THashAlgorithm.SHA_512];
+  EcdsaSchemes = [TSignatureScheme.ECDSA_SECP256R1_SHA256, TSignatureScheme.ECDSA_SECP384R1_SHA384,
+    TSignatureScheme.ECDSA_SECP521R1_SHA512];
 
 { TRecordingHkdf }
 
@@ -1916,21 +1972,76 @@ begin
       end;
 end;
 
-{ TBareBackendReport }
+{ TPartialHmacReport }
 
-function TBareBackendReport.Describe: string;
-begin
-  Result := '';
-end;
-
-{ TFakeBackendReport }
-
-function TFakeBackendReport.HmacBackend(AAlgorithm: THashAlgorithm): TCryptoBackendEntry;
+function TPartialHmacReport.HmacBackend(AAlgorithm: THashAlgorithm): TCryptoBackendEntry;
 begin
   if AAlgorithm in HmacSystemHashes then
     Result := Ent(TCryptoBackend.System, TCryptoBackendReason.NotFallback)
   else
     Result := Ent(TCryptoBackend.Portable, TCryptoBackendReason.NotPresent);
+end;
+
+{ TSplitBackendReport }
+
+constructor TSplitBackendReport.Create(ASigningNative, AVerifyNative: Boolean);
+begin
+  inherited Create(False);
+  FSigningNative := ASigningNative;
+  FVerifyNative := AVerifyNative;
+end;
+
+function TSplitBackendReport.SigningBackend(AScheme: TSignatureScheme): TCryptoBackendEntry;
+begin
+  if FSigningNative then
+    Result := Ent(TCryptoBackend.System, TCryptoBackendReason.NotFallback)
+  else
+    Result := NotNative;
+end;
+
+function TSplitBackendReport.VerificationBackend(
+  AScheme: TSignatureScheme): TCryptoBackendEntry;
+begin
+  if FVerifyNative then
+    Result := Ent(TCryptoBackend.System, TCryptoBackendReason.NotFallback)
+  else
+    Result := NotNative;
+end;
+
+{ TModuleFacetReport }
+
+constructor TModuleFacetReport.Create(ASchemeServed, AModulePresent, AFacetNative: Boolean);
+begin
+  inherited Create(False);
+  FSchemeServed := ASchemeServed;
+  FModulePresent := AModulePresent;
+  FFacetNative := AFacetNative;
+end;
+
+function TModuleFacetReport.SigningBackend(AScheme: TSignatureScheme): TCryptoBackendEntry;
+begin
+  Result := ModuleFacetBackend(FSchemeServed, FModulePresent, FFacetNative);
+end;
+
+{ TEcdsaVerifyOnlyReport }
+
+constructor TEcdsaVerifyOnlyReport.Create;
+begin
+  inherited Create(False);
+end;
+
+function TEcdsaVerifyOnlyReport.SigningBackend(AScheme: TSignatureScheme): TCryptoBackendEntry;
+begin
+  Result := Ent(TCryptoBackend.System, TCryptoBackendReason.NotFallback);
+end;
+
+function TEcdsaVerifyOnlyReport.VerificationBackend(
+  AScheme: TSignatureScheme): TCryptoBackendEntry;
+begin
+  if AScheme in EcdsaSchemes then
+    Result := Ent(TCryptoBackend.System, TCryptoBackendReason.NotFallback)
+  else
+    Result := NotNative;
 end;
 
 { TTestSystemBackendReport }
@@ -1947,6 +2058,16 @@ procedure TTestSystemBackendReport.CheckComposed(const AName: string;
 begin
   CheckTrue(AEntry.Backend = TCryptoBackend.Composed, AName + ': composed');
   CheckTrue(AEntry.Reason = TCryptoBackendReason.NotFallback, AName + ': not a fallback');
+end;
+
+function TTestSystemBackendReport.ModuleFacet(ASchemeServed, AModulePresent,
+  AFacetNative: Boolean): TCryptoBackendEntry;
+var
+  LReport: ICryptoBackendReport;
+begin
+  LReport := TModuleFacetReport.Create(ASchemeServed, AModulePresent, AFacetNative)
+    as ICryptoBackendReport;
+  Result := LReport.SigningBackend(TSignatureScheme.ECDSA_SECP256R1_SHA256);
 end;
 
 procedure TTestSystemBackendReport.TestRandomDefaultsToNotNative;
@@ -2018,6 +2139,16 @@ begin
     CheckNotNative(Format('signing %d', [Ord(LScheme)]), LReport.SigningBackend(LScheme));
 end;
 
+procedure TTestSystemBackendReport.TestVerificationDefaultsToNotNative;
+var
+  LReport: ICryptoBackendReport;
+  LScheme: TSignatureScheme;
+begin
+  LReport := TBareBackendReport.Create(False);
+  for LScheme := Low(TSignatureScheme) to High(TSignatureScheme) do
+    CheckNotNative(Format('verification %d', [Ord(LScheme)]), LReport.VerificationBackend(LScheme));
+end;
+
 procedure TTestSystemBackendReport.TestHkdfIsNotNativeWhenHmacDefaults;
 var
   LReport: ICryptoBackendReport;
@@ -2043,7 +2174,7 @@ var
   LReport: ICryptoBackendReport;
   LHash: THashAlgorithm;
 begin
-  LReport := TFakeBackendReport.Create(False);
+  LReport := TPartialHmacReport.Create(False);
   for LHash := Low(THashAlgorithm) to High(THashAlgorithm) do
     if LHash in HmacSystemHashes then
       CheckComposed(Format('hkdf %d', [Ord(LHash)]), LReport.HkdfBackend(LHash))
@@ -2056,7 +2187,7 @@ var
   LReport: ICryptoBackendReport;
   LHash: THashAlgorithm;
 begin
-  LReport := TFakeBackendReport.Create(False);
+  LReport := TPartialHmacReport.Create(False);
   for LHash := Low(THashAlgorithm) to High(THashAlgorithm) do
     if LHash in HmacSystemHashes then
       CheckComposed(Format('prf %d', [Ord(LHash)]), LReport.Tls12PrfBackend(LHash))
@@ -2084,22 +2215,19 @@ procedure TTestSystemBackendReport.TestPrimitivesAndSigningFacetsAreNeverWhole;
 var
   LReport: ICryptoBackendReport;
 begin
-  LReport := TFakeBackendReport.Create(True);
+  LReport := TPartialHmacReport.Create(True);
   CheckNotNative('primitives facet', LReport.FacetBackend(TCryptoFacet.Primitives));
   CheckNotNative('signing facet', LReport.FacetBackend(TCryptoFacet.Signing));
 end;
 
-procedure TTestSystemBackendReport.TestSigningKeyIsSystemWhenMarked;
+procedure TTestSystemBackendReport.TestSigningKeyIsNotNativeEvenWhenMarked;
 var
   LReport: ICryptoBackendReport;
   LKey: ISigningKey;
-  LEntry: TCryptoBackendEntry;
 begin
   LReport := TBareBackendReport.Create(False);
-  LKey := TFakeSystemSigningKey.Create;
-  LEntry := LReport.SigningKeyBackend(LKey);
-  CheckTrue(LEntry.Backend = TCryptoBackend.System, 'a marked key is system-backed');
-  CheckTrue(LEntry.Reason = TCryptoBackendReason.NotFallback, 'a marked key is not a fallback');
+  LKey := TFakeSystemSigningKey.Create(nil);
+  CheckNotNative('a marker any class can list', LReport.SigningKeyBackend(LKey));
 end;
 
 procedure TTestSystemBackendReport.TestSigningKeyIsNotNativeWhenUnmarked;
@@ -2112,6 +2240,118 @@ begin
   CheckNotNative('an unmarked key', LReport.SigningKeyBackend(LKey));
 end;
 
+procedure TTestSystemBackendReport.TestVerifierIsNotNativeEvenWhenMarked;
+var
+  LReport: ICryptoBackendReport;
+  LVerifier: ISignatureVerifier;
+begin
+  LReport := TBareBackendReport.Create(False);
+  LVerifier := TFakeSystemVerifier.Create as ISignatureVerifier;
+  CheckNotNative('a marker any class can list', LReport.VerifierBackend(LVerifier));
+end;
+
+procedure TTestSystemBackendReport.TestVerifierIsNotNativeWhenUnmarked;
+var
+  LReport: ICryptoBackendReport;
+  LVerifier: ISignatureVerifier;
+begin
+  LReport := TBareBackendReport.Create(False);
+  LVerifier := TRejectingSignatureVerifier.Create as ISignatureVerifier;
+  CheckNotNative('an unmarked verifier', LReport.VerifierBackend(LVerifier));
+end;
+
+procedure TTestSystemBackendReport.TestModuleFacetSchemeNotServedIsNotNative;
+begin
+  CheckNotNative('a scheme the module does not serve', ModuleFacet(False, True, True));
+end;
+
+procedure TTestSystemBackendReport.TestModuleFacetAbsentModuleIsNoModule;
+var
+  LEntry: TCryptoBackendEntry;
+begin
+  LEntry := ModuleFacet(True, False, True);
+  CheckTrue(LEntry.Backend = TCryptoBackend.Portable, 'an absent module is portable');
+  CheckTrue(LEntry.Reason = TCryptoBackendReason.NoModule, 'and the reason is the module');
+end;
+
+procedure TTestSystemBackendReport.TestModuleFacetNativeIsSystem;
+var
+  LEntry: TCryptoBackendEntry;
+begin
+  LEntry := ModuleFacet(True, True, True);
+  CheckTrue(LEntry.Backend = TCryptoBackend.System, 'a working facet is system-backed');
+  CheckTrue(LEntry.Reason = TCryptoBackendReason.NotFallback, 'and is not a fallback');
+end;
+
+procedure TTestSystemBackendReport.TestModuleFacetNotNativeIsPortable;
+begin
+  CheckNotNative('a present module whose facet is not native', ModuleFacet(True, True, False));
+end;
+
+procedure TTestSystemBackendReport.TestModuleFacetSchemeNotServedAndModuleAbsentIsNotNative;
+begin
+  CheckNotNative('an unserved scheme on a host with no module', ModuleFacet(False, False, False));
+end;
+
+{ TTestSystemCryptoStrictness }
+
+function TTestSystemCryptoStrictness.Remaining(const AReport: ICryptoBackendReport;
+  out ADropped: TArray<string>): ISignatureSchemeRegistry;
+var
+  LProvider: ICryptoProvider;
+begin
+  CheckTrue(System.Length(TSignatureSchemeRegistry.CreateDefault.Items) > 0,
+    'the default registry offers schemes, so none of the checks below is vacuous');
+  LProvider := TOverlayCryptoProvider.Create(Crypto, nil, nil, AReport, nil) as ICryptoProvider;
+  Result := TSystemCryptoStrictness.NativeSignatureSchemes(LProvider, ADropped);
+end;
+
+procedure TTestSystemCryptoStrictness.TestSigningWithoutVerificationDropsEveryScheme;
+var
+  LDropped: TArray<string>;
+begin
+  CheckEquals(0, System.Length(Remaining(TSplitBackendReport.Create(True, False)
+    as ICryptoBackendReport, LDropped).Items),
+    'a scheme with no native verification is not offered');
+  CheckEquals(System.Length(TSignatureSchemeRegistry.CreateDefault.Items),
+    System.Length(LDropped), 'each one is reported dropped');
+end;
+
+procedure TTestSystemCryptoStrictness.TestVerificationWithoutSigningDropsEveryScheme;
+var
+  LDropped: TArray<string>;
+begin
+  CheckEquals(0, System.Length(Remaining(TSplitBackendReport.Create(False, True)
+    as ICryptoBackendReport, LDropped).Items),
+    'a scheme with no native signing is not offered');
+  CheckEquals(System.Length(TSignatureSchemeRegistry.CreateDefault.Items),
+    System.Length(LDropped), 'each one is reported dropped');
+end;
+
+procedure TTestSystemCryptoStrictness.TestFullCoverageKeepsEveryScheme;
+var
+  LDropped: TArray<string>;
+begin
+  CheckEquals(System.Length(TSignatureSchemeRegistry.CreateDefault.Items),
+    System.Length(Remaining(TSplitBackendReport.Create(True, True) as ICryptoBackendReport,
+    LDropped).Items), 'native in both roles is kept');
+  CheckEquals(0, System.Length(LDropped), 'nothing is dropped');
+end;
+
+procedure TTestSystemCryptoStrictness.TestMixedCoverageKeepsOnlyTheSchemesServedInBothRoles;
+var
+  LDropped: TArray<string>;
+  LKept: TArray<TSignatureScheme>;
+  LI: Int32;
+begin
+  LKept := Remaining(TEcdsaVerifyOnlyReport.Create as ICryptoBackendReport, LDropped).Items;
+  CheckEquals(3, System.Length(LKept), 'the three ECDSA schemes are served in both roles');
+  for LI := 0 to System.Length(LKept) - 1 do
+    CheckTrue(LKept[LI] in EcdsaSchemes, 'only an ECDSA scheme is kept');
+  CheckEquals(System.Length(TSignatureSchemeRegistry.CreateDefault.Items),
+    System.Length(LKept) + System.Length(LDropped), 'every other scheme is reported dropped');
+end;
+
 initialization
 
 {$IFDEF FPC}
@@ -2122,6 +2362,7 @@ initialization
   RegisterTest(TTestForwardingSigningCrypto);
   RegisterTest(TTestEcPrivateScalar);
   RegisterTest(TTestSystemBackendReport);
+  RegisterTest(TTestSystemCryptoStrictness);
 {$ELSE}
   RegisterTest(TTestSystemCryptoHelpers.Suite);
   RegisterTest(TTestEcdsaSignatureEncoding.Suite);
@@ -2130,6 +2371,7 @@ initialization
   RegisterTest(TTestForwardingSigningCrypto.Suite);
   RegisterTest(TTestEcPrivateScalar.Suite);
   RegisterTest(TTestSystemBackendReport.Suite);
+  RegisterTest(TTestSystemCryptoStrictness.Suite);
 {$ENDIF FPC}
 
 end.

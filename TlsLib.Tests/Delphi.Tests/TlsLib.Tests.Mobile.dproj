@@ -411,6 +411,7 @@
         <DCCReference Include="..\..\TlsLib\src\Engine\TlpTlsEngineEvents.pas"/>
         <DCCReference Include="..\..\TlsLib\src\Engine\TlpTlsEngine.pas"/>
         <DCCReference Include="..\..\TlsLib\src\KeySchedule\TlpHkdfLabel.pas"/>
+        <DCCReference Include="..\..\TlsLib\src\KeySchedule\TlpTls12PrfLabels.pas"/>
         <DCCReference Include="..\..\TlsLib\src\KeySchedule\TlpExporterArgs.pas"/>
         <DCCReference Include="..\..\TlsLib\src\Interfaces\KeySchedule\TlpIKeySchedule.pas"/>
         <DCCReference Include="..\..\TlsLib\src\KeySchedule\TlpTrafficKeys.pas"/>
@@ -467,6 +468,7 @@
         <DCCReference Include="..\..\TlsLib\src\Trust\TlpChainAlgorithmPolicy.pas"/>
         <DCCReference Include="..\..\TlsLib\src\Handshake\TlpTlsCredential.pas"/>
         <DCCReference Include="..\..\TlsLib\src\Interfaces\Handshake\TlpITlsCredentialResolver.pas"/>
+        <DCCReference Include="..\..\TlsLib\src\Interfaces\Handshake\TlpITlsServerCredentialSet.pas"/>
         <DCCReference Include="..\..\TlsLib\src\Handshake\TlpCredentialResolvers.pas"/>
         <DCCReference Include="..\..\TlsLib\src\Ech\TlpEchConfig.pas"/>
         <DCCReference Include="..\..\TlsLib\src\Ech\TlpEchExtension.pas"/>
@@ -488,6 +490,7 @@
         <DCCReference Include="..\..\TlsLib\src\Engine\TlpTlsConfigMemo.pas"/>
         <DCCReference Include="..\..\TlsLib\src\Engine\TlpTlsSignatureBuilder.pas"/>
         <DCCReference Include="..\..\TlsLib\src\Engine\TlpTlsEngineFactory.pas"/>
+        <DCCReference Include="..\..\TlsLib\src\Negotiation\TlpClientPskPath.pas"/>
         <DCCReference Include="..\..\TlsLib\src\Extensions\TlpExtensionContext.pas"/>
         <DCCReference Include="..\..\TlsLib\src\Extensions\TlpExtensionVector.pas"/>
         <DCCReference Include="..\..\TlsLib\src\Ech\TlpEchRegistryExtension.pas"/>
@@ -527,6 +530,8 @@
         <DCCReference Include="..\src\MockKeyLog.pas"/>
         <DCCReference Include="..\src\MockPlatformChainEngine.pas"/>
         <DCCReference Include="..\src\MockCryptoProvider.pas"/>
+        <DCCReference Include="..\src\MockSystemCrypto.pas"/>
+        <DCCReference Include="..\src\MockCredentialResolvers.pas"/>
         <DCCReference Include="..\src\MockHttpFetcher.pas"/>
         <DCCReference Include="..\src\MockPkixProvider.pas"/>
         <DCCReference Include="..\src\MockSink.pas"/>
@@ -603,6 +608,11 @@
         <DCCReference Include="..\src\TrustCompositionTests.pas"/>
         <DCCReference Include="..\src\SystemTrustTests.pas"/>
         <DCCReference Include="..\src\NativeCryptoProviderTests.pas"/>
+        <DCCReference Include="..\src\MockCompliance.pas"/>
+        <DCCReference Include="..\src\ComplianceRulesTests.pas"/>
+        <DCCReference Include="..\src\ComplianceProviderTests.pas"/>
+        <DCCReference Include="..\src\CompliancePolicyTests.pas"/>
+        <DCCReference Include="..\src\ComplianceLoopbackTests.pas"/>
         <DCCReference Include="..\src\AppleAlertMapTests.pas"/>
         <DCCReference Include="..\src\RootGenKeyingTests.pas"/>
         <DCCReference Include="..\src\EchToolingTests.pas"/>

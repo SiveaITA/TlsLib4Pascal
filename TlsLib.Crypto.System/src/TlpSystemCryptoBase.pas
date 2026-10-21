@@ -20,7 +20,6 @@ uses
   TlpCryptoDomainTypes,
   TlpICryptoProvider,
   TlpICryptoBackendReport,
-  TlpISystemSigningKey,
   TlpSystemCryptoTypes,
   TlpISecretBuffer,
   TlpISigningKey,
@@ -63,17 +62,16 @@ type
   end;
 
   /// <summary>
-  /// An <see cref="ICryptoProvider" /> that overlays a substituted Primitives and/or
-  /// Signing facet on a base provider - so a native overlay preserves the
-  /// base's identity and its same-reference-every-call contract. A nil override takes that
-  /// facet from the base. The base's HPKE is kept unless it is the default composition over the
-  /// base's own primitives, which is rebuilt over the overlay's. A platform composer builds this;
-  /// the OS factory only dispatches.
+  /// An <see cref="ICryptoProvider" /> that overlays a substituted Primitives and/or Signing
+  /// facet on a base provider, so a native overlay preserves the base's identity and its
+  /// same-reference-every-call contract. A nil override takes that facet from the base. The
+  /// base's HPKE is kept unless it is the default composition over the base's own primitives,
+  /// which is rebuilt over the overlay's, unless the caller supplies one. A platform composer
+  /// builds this; the OS factory only dispatches.
   /// </summary>
   TOverlayCryptoProvider = class(TInterfacedObject, ICryptoProvider, ICryptoBackendReport)
   strict private
   var
-    FInner: ICryptoProvider;
     FPrimitives: ICryptoPrimitives;
     FSigning: ISigningCrypto;
     FReport: ICryptoBackendReport;
@@ -82,12 +80,21 @@ type
     // (Supports returns False), so a provider with no backend map reads as wholly portable
     property BackendReport: ICryptoBackendReport read FReport
       implements ICryptoBackendReport;
+    function DefaultHpke(const ABase: ICryptoProvider): IHpkeCrypto;
+    procedure CheckHpkeMatchesReport;
   public
     /// <summary>True only for the default HPKE composition over ABase's own primitives.</summary>
     class function RebuildsHpke(const ABase: ICryptoProvider): Boolean; static;
+    /// <summary>Whether AHpke is an HPKE composition over exactly APrimitives.</summary>
+    class function ComposesHpkeOver(const AHpke: IHpkeCrypto;
+      const APrimitives: ICryptoPrimitives): Boolean; static;
+    /// <summary>AHpke is a caller-supplied HPKE facet; nil keeps the rule above. The overlay
+    /// exposes AReport unchanged, so its HPKE answer must describe AHpke: a report that names
+    /// any backend but portable for HPKE is accepted with a caller-supplied AHpke only when AHpke
+    /// is a composition over the overlay's primitives, otherwise the constructor raises.</summary>
     constructor Create(const ABase: ICryptoProvider;
       const APrimitives: ICryptoPrimitives; const ASigning: ISigningCrypto;
-      const AReport: ICryptoBackendReport);
+      const AReport: ICryptoBackendReport; const AHpke: IHpkeCrypto);
     function Primitives: ICryptoPrimitives;
     function Signing: ISigningCrypto;
     function Hpke: IHpkeCrypto;
@@ -138,10 +145,12 @@ type
 
   /// <summary>
   /// The platform-neutral part of an <see cref="ICryptoBackendReport" />. Every per-algorithm
-  /// query defaults to portable, so a platform overrides only what it serves natively; HKDF
-  /// and the TLS 1.2 PRF follow the OS HMAC, a signing key follows the <see
-  /// cref="ISystemSigningKey" /> marker, and the HPKE facet follows the constructor flag. The
-  /// platform supplies <see cref="Describe" />.
+  /// query defaults to portable, so a platform overrides only what it serves natively; signing
+  /// and verification default to portable per scheme, HKDF and the TLS 1.2 PRF follow the OS
+  /// HMAC, a signing key and a verifier are portable, and the HPKE facet follows the constructor
+  /// flag. A marker interface is claimable by any class, so the base trusts none: a platform that
+  /// serves keys and verifiers natively overrides both queries with a check of its own classes.
+  /// The platform supplies <see cref="Describe" />.
   /// </summary>
   TSystemBackendReportBase = class abstract(TInterfacedObject, ICryptoBackendReport)
   strict private
@@ -153,6 +162,11 @@ type
     class function Ent(ABackend: TCryptoBackend;
       AReason: TCryptoBackendReason): TCryptoBackendEntry; static;
     class function NotNative: TCryptoBackendEntry; static;
+    /// <summary>The per-scheme answer for a facet served by a separate OS module: a scheme the
+    /// module does not serve is NotNative, an absent module is NoModule, and a present one is
+    /// System only when the facet works on it.</summary>
+    class function ModuleFacetBackend(ASchemeServed, AModulePresent,
+      AFacetNative: Boolean): TCryptoBackendEntry; static;
   public
     /// <param name="AHpkeComposed">True when the provider's HPKE composes over its own
     /// primitives.</param>
@@ -160,13 +174,19 @@ type
     function RandomBackend: TCryptoBackendEntry; virtual;
     function HashBackend(AAlgorithm: THashAlgorithm): TCryptoBackendEntry; virtual;
     function HmacBackend(AAlgorithm: THashAlgorithm): TCryptoBackendEntry; virtual;
+    /// <summary>Composed when the HMAC is native: Extract runs over the OS HMAC, and a
+    /// platform that serves Expand natively still reports the derivation as composed.</summary>
     function HkdfBackend(AAlgorithm: THashAlgorithm): TCryptoBackendEntry;
-    function Tls12PrfBackend(AAlgorithm: THashAlgorithm): TCryptoBackendEntry;
+    /// <summary>Composed when the HMAC is native; a platform whose OS module serves the PRF
+    /// itself overrides it.</summary>
+    function Tls12PrfBackend(AAlgorithm: THashAlgorithm): TCryptoBackendEntry; virtual;
     function AeadBackend(AAlgorithm: TAeadAlgorithm): TCryptoBackendEntry; virtual;
     function KeyAgreementBackend(AAlgorithm: TKeyAgreementAlgorithm): TCryptoBackendEntry; virtual;
     function KemBackend(AAlgorithm: TKemAlgorithm): TCryptoBackendEntry; virtual;
     function SigningBackend(AScheme: TSignatureScheme): TCryptoBackendEntry; virtual;
-    function SigningKeyBackend(const AKey: ISigningKey): TCryptoBackendEntry;
+    function SigningKeyBackend(const AKey: ISigningKey): TCryptoBackendEntry; virtual;
+    function VerificationBackend(AScheme: TSignatureScheme): TCryptoBackendEntry; virtual;
+    function VerifierBackend(const AVerifier: ISignatureVerifier): TCryptoBackendEntry; virtual;
     function FacetBackend(AFacet: TCryptoFacet): TCryptoBackendEntry;
     function Describe: string; virtual; abstract;
   end;
@@ -176,6 +196,8 @@ implementation
 resourcestring
   SNilInnerPrimitives = 'the inner primitives facet must not be nil';
   SNilInnerSigning = 'the inner signing facet must not be nil';
+  SHpkeReportMismatch = 'the backend report names a backend for HPKE but the HPKE facet is ' +
+    'not a composition over the overlay''s primitives';
   SUpdateSpanOutOfRange = 'the Update source span is out of range';
 
 { TForwardingCryptoPrimitives }
@@ -239,41 +261,65 @@ end;
 
 constructor TOverlayCryptoProvider.Create(const ABase: ICryptoProvider;
   const APrimitives: ICryptoPrimitives; const ASigning: ISigningCrypto;
-  const AReport: ICryptoBackendReport);
+  const AReport: ICryptoBackendReport; const AHpke: IHpkeCrypto);
 begin
   inherited Create;
-  FInner := ABase;
-  FPrimitives := APrimitives;
-  FSigning := ASigning;
   FReport := AReport;
-  if RebuildsHpke(ABase) then
-    FHpke := THpkeComposition.Create(Primitives) as IHpkeCrypto
+  if APrimitives <> nil then
+    FPrimitives := APrimitives
   else
-    FHpke := ABase.Hpke;
+    FPrimitives := ABase.Primitives;
+  if ASigning <> nil then
+    FSigning := ASigning
+  else
+    FSigning := ABase.Signing;
+  if AHpke <> nil then
+    FHpke := AHpke
+  else
+    FHpke := DefaultHpke(ABase);
+  CheckHpkeMatchesReport;
+end;
+
+function TOverlayCryptoProvider.DefaultHpke(const ABase: ICryptoProvider): IHpkeCrypto;
+begin
+  if RebuildsHpke(ABase) then
+    Result := THpkeComposition.Create(FPrimitives) as IHpkeCrypto
+  else
+    Result := ABase.Hpke;
+end;
+
+procedure TOverlayCryptoProvider.CheckHpkeMatchesReport;
+begin
+  // a nil report claims nothing, so there is nothing to match
+  if FReport = nil then
+    Exit;
+  if (FReport.FacetBackend(TCryptoFacet.Hpke).Backend <> TCryptoBackend.Portable) and
+    (not ComposesHpkeOver(FHpke, FPrimitives)) then
+    raise EArgumentTlsLibException.CreateRes(@SHpkeReportMismatch);
 end;
 
 class function TOverlayCryptoProvider.RebuildsHpke(const ABase: ICryptoProvider): Boolean;
+begin
+  Result := ComposesHpkeOver(ABase.Hpke, ABase.Primitives);
+end;
+
+class function TOverlayCryptoProvider.ComposesHpkeOver(const AHpke: IHpkeCrypto;
+  const APrimitives: ICryptoPrimitives): Boolean;
 var
   LComposition: IHpkeComposition;
 begin
-  Result := Supports(ABase.Hpke, IHpkeComposition, LComposition) and
-    (LComposition.ComposedOver = ABase.Primitives);
+  Result := Supports(AHpke, IHpkeComposition, LComposition) and
+    (LComposition.ComposedOver = APrimitives);
 end;
 
 function TOverlayCryptoProvider.Primitives: ICryptoPrimitives;
 begin
-  if FPrimitives <> nil then
-    Result := FPrimitives
-  else
-    Result := FInner.Primitives;
+  Result := FPrimitives;
 end;
 
 function TOverlayCryptoProvider.Signing: ISigningCrypto;
 begin
-  if FSigning <> nil then
-    Result := FSigning
-  else
-    Result := FInner.Signing;
+  Result := FSigning;
 end;
 
 function TOverlayCryptoProvider.Hpke: IHpkeCrypto;
@@ -415,6 +461,19 @@ begin
   Result := Ent(TCryptoBackend.Portable, TCryptoBackendReason.NoNativeImpl);
 end;
 
+class function TSystemBackendReportBase.ModuleFacetBackend(ASchemeServed, AModulePresent,
+  AFacetNative: Boolean): TCryptoBackendEntry;
+begin
+  if not ASchemeServed then
+    Result := NotNative
+  else if not AModulePresent then
+    Result := Ent(TCryptoBackend.Portable, TCryptoBackendReason.NoModule)
+  else if AFacetNative then
+    Result := Ent(TCryptoBackend.System, TCryptoBackendReason.NotFallback)
+  else
+    Result := NotNative;
+end;
+
 function TSystemBackendReportBase.RandomBackend: TCryptoBackendEntry;
 begin
   Result := NotNative;
@@ -480,12 +539,19 @@ end;
 function TSystemBackendReportBase.SigningKeyBackend(
   const AKey: ISigningKey): TCryptoBackendEntry;
 begin
-  // per key, not per scheme: only a key the OS module imported carries the marker; one that
-  // fell back to the portable facet signs portable regardless of its scheme
-  if Supports(AKey, ISystemSigningKey) then
-    Result := Ent(TCryptoBackend.System, TCryptoBackendReason.NotFallback)
-  else
-    Result := NotNative;
+  Result := NotNative;
+end;
+
+function TSystemBackendReportBase.VerificationBackend(
+  AScheme: TSignatureScheme): TCryptoBackendEntry;
+begin
+  Result := NotNative;
+end;
+
+function TSystemBackendReportBase.VerifierBackend(
+  const AVerifier: ISignatureVerifier): TCryptoBackendEntry;
+begin
+  Result := NotNative;
 end;
 
 function TSystemBackendReportBase.FacetBackend(

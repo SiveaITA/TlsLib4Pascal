@@ -18,7 +18,8 @@
 #                 path through it (os-anchors with bad_certificate), a non-distrusted intermediate
 #                 and a twin of the distrusted one still verify. Before the root install, the same
 #                 distrust is applied to a path that relied on a --host-root (the run root passed
-#                 beside the OS roots), where it must win too.
+#                 with the OS roots, or alone with --host-roots-alone), where it must win too in
+#                 both the delegate and os-anchors.
 #
 # The server-cert delegate reject cells whose alert is a per-OS status-map code (hostname, EKU,
 # expired) assert only that the handshake aborts with a fatal alert, not the exact code: the two OS
@@ -329,8 +330,21 @@ if [ "$HAS_DELEGATE" = 1 ]; then
   cell "anchors host root baseline -> accept" --trust-mode os-anchors \
     --host-root "$CA/root.pem" --server-cert "$CA/distrust_leaf_fullchain.pem" \
     --server-key "$CA/distrust_leaf.key" --posture soft --expect accept
+  cell "delegate host root alone baseline -> accept" --trust-mode os-delegate \
+    --host-root "$CA/root.pem" --host-roots-alone --server-cert "$CA/distrust_leaf_fullchain.pem" \
+    --server-key "$CA/distrust_leaf.key" --posture soft --expect accept
+  cell "anchors host root alone baseline -> accept" --trust-mode os-anchors \
+    --host-root "$CA/root.pem" --host-roots-alone --server-cert "$CA/distrust_leaf_fullchain.pem" \
+    --server-key "$CA/distrust_leaf.key" --posture soft --expect accept
   if ci_store_mutation_allowed && { DISTRUSTED=1; install_distrust; }; then
-    echo "  (distrusted intermediate $DTHUMB, host root only)"
+    echo "  (distrusted intermediate $DTHUMB, host root alone and with the OS roots)"
+    cell "delegate host root alone + distrusted intermediate -> reject" --trust-mode os-delegate \
+      --host-root "$CA/root.pem" --host-roots-alone --server-cert "$CA/distrust_leaf_fullchain.pem" \
+      --server-key "$CA/distrust_leaf.key" --posture soft --expect reject
+    cell "anchors host root alone + distrusted intermediate -> bad_certificate" \
+      --trust-mode os-anchors --host-root "$CA/root.pem" --host-roots-alone \
+      --server-cert "$CA/distrust_leaf_fullchain.pem" --server-key "$CA/distrust_leaf.key" \
+      --posture soft --expect reject:42
     cell "delegate host root + distrusted intermediate -> reject" --trust-mode os-delegate \
       --host-root "$CA/root.pem" --server-cert "$CA/distrust_leaf_fullchain.pem" \
       --server-key "$CA/distrust_leaf.key" --posture soft --expect reject
@@ -399,6 +413,17 @@ if [ "$HAS_DELEGATE" = 1 ]; then
     cell "delegate expired via injected clock -> reject" --trust-mode os-delegate \
       --server-cert "$CA/leaf_fullchain.pem" --server-key "$CA/leaf.key" \
       --staple "$CA/ocsp_good.der" --posture hard --now-ms "$FUTURE_MS" --expect reject
+    # host roots alone while the OS trusts the chain's root: an unrelated host root must not let the
+    # installed root vouch (the OS roots never vouch), in the delegate and in Anchors mode. The
+    # installed-root accepts above show the same chain is otherwise trusted.
+    cell "delegate host root alone (unrelated) + OS-installed root -> reject" \
+      --trust-mode os-delegate --host-root "$CA/foreign_root.pem" --host-roots-alone \
+      --server-cert "$CA/leaf_fullchain.pem" --server-key "$CA/leaf.key" \
+      --staple "$CA/ocsp_good.der" --posture soft --expect reject:48
+    cell "anchors host root alone (unrelated) + OS-installed root -> reject" \
+      --trust-mode os-anchors --host-root "$CA/foreign_root.pem" --host-roots-alone \
+      --server-cert "$CA/leaf_fullchain.pem" --server-key "$CA/leaf.key" \
+      --staple "$CA/ocsp_good.der" --posture soft --expect reject:48
     # OS-native LIVE revocation: the OS engine fetches the loopback responder off the engine
     # thread in the async park. Good -> accept under Hard; a definitive Revoked -> reject. No
     # --now-ms: a live response is produced at wall-clock time, so a fixed verify date would push
@@ -409,6 +434,16 @@ if [ "$HAS_DELEGATE" = 1 ]; then
     cell "delegate live revoked -> certificate_revoked" --trust-mode os-delegate \
       --revocation-fetch live --server-cert "$CA/live_revoked_leaf_fullchain.pem" \
       --server-key "$CA/live_revoked_leaf.key" --posture hard --expect reject:44
+    # with live fetch, host roots alone still decide: the run root alone accepts, and an unrelated
+    # host root rejects although the OS trusts the installed run root (the OS roots never vouch)
+    cell "delegate live host root alone -> accept" --trust-mode os-delegate \
+      --revocation-fetch live --host-root "$CA/root.pem" --host-roots-alone \
+      --server-cert "$CA/live_leaf_fullchain.pem" --server-key "$CA/live_leaf.key" \
+      --posture hard --expect accept
+    cell "delegate live host root alone (unrelated) + OS-installed root -> reject" \
+      --trust-mode os-delegate --revocation-fetch live --host-root "$CA/foreign_root.pem" \
+      --host-roots-alone --server-cert "$CA/live_leaf_fullchain.pem" \
+      --server-key "$CA/live_leaf.key" --posture hard --expect reject:48
     # the same live accept/revoked pair over TLS 1.2: the 1.2 client cert-verdict park is a separate
     # code path from the 1.3 one and is otherwise unexercised on the client side
     cell "[12] delegate live accept (2-tier, good/Hard)" --trust-mode os-delegate \

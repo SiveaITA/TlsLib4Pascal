@@ -16,7 +16,7 @@ on:
         description: >-
           Comma-separated list of targets to run (leave empty for the default set).
           Valid IDs: linux-x64, linux-arm64, linux-x64-scalar, linux-arm64-scalar,
-          windows-x64, macos-arm64, macos-x64, linux-arm32, linux-powerpc64-be,
+          windows-x64, windows-2022, macos-arm64, macos-x64, linux-arm32, linux-powerpc64-be,
           freebsd, solaris, netbsd, dragonflybsd
         default: ""
         type: string
@@ -77,7 +77,7 @@ env:
   # against a per-run generated CA on every native leg, plus - on Windows/macOS - the OS trust
   # delegate against a throwaway root installed into the machine store. Set false to skip them.
   MAKE_RUN_TRUST: true
-  # When true, the Windows github-hosted leg also runs the informational root auto-update probe
+  # When true, the Windows github-hosted legs also run the informational root auto-update probe
   # (it removes one public root from the machine stores and restores it). Default false: it answered
   # its question; the probe stays available for re-checking after a Windows image change.
   MAKE_RUN_AUTOROOT: false
@@ -88,7 +88,7 @@ env:
   # does not install and stay out of scope. Read by that job's fclnet-build.sh step. Set false to skip.
   MAKE_RUN_FCLNET: true
   # The crypto and PKIX providers the interop harness (self-test, fuzzer, openssl matrix and BoGo)
-  # and the Windows unit-suite rerun use (TLSLIB_CRYPTO_PROVIDER / TLSLIB_PKIX_PROVIDER): portable,
+  # and the Windows unit-suite reruns use (TLSLIB_CRYPTO_PROVIDER / TLSLIB_PKIX_PROVIDER): portable,
   # or os for this platform's native facets overlaid on the portable base. Only Windows has native
   # crypto facets today, so os equals portable elsewhere, and PKIX has no os provider yet. With
   # both portable the rerun is skipped.
@@ -309,6 +309,13 @@ jobs:
           submodules: true
           persist-credentials: false
 
+      # The exact Windows build, to compare with the validated builds in the module certificate;
+      # informational, so a failure here never fails the leg.
+      - name: OS build info
+        continue-on-error: true
+        shell: bash
+        run: bash .github/workflows/ci/os-build-info.sh
+
       - name: Build
         shell: bash
         env:
@@ -342,6 +349,72 @@ jobs:
         with:
           fpc-target: ${{ fromJSON(needs.setup.outputs.target_map)['windows-x64'].fpc_target }}
           artifact-suffix: windows-x64
+          run-interop: ${{ env.MAKE_RUN_INTEROP }}
+          run-bogo: ${{ env.MAKE_RUN_BOGO }}
+          run-openssl: ${{ env.MAKE_RUN_OPENSSL }}
+          crypto-provider: ${{ env.MAKE_CRYPTO_PROVIDER }}
+          pkix-provider: ${{ env.MAKE_PKIX_PROVIDER }}
+          run-trust: ${{ env.MAKE_RUN_TRUST }}
+          run-autoroot: ${{ env.MAKE_RUN_AUTOROOT }}
+          bogo-ref: ${{ env.BOGO_REF }}
+
+  # Sets TLSLIB_EXPECT_VALIDATED_MODULE, which makes the tests require the validated module, on
+  # the windows-2022 runner image only; the other Windows images leave it unset.
+  windows-2022:
+    name: "Native: Windows Server 2022"
+    runs-on: ${{ fromJSON(needs.setup.outputs.target_map)['windows-2022'].runner }}
+    timeout-minutes: 120
+    needs: [setup, lint]
+    if: contains(format(',{0},', needs.setup.outputs.enabled_targets), ',windows-2022,')
+    env:
+      TLSLIB_EXPECT_VALIDATED_MODULE: 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+          persist-credentials: false
+
+      # The exact Windows build, to compare with the validated builds in the module certificate;
+      # informational, so a failure here never fails the leg.
+      - name: OS build info
+        continue-on-error: true
+        shell: bash
+        run: bash .github/workflows/ci/os-build-info.sh
+
+      - name: Build
+        shell: bash
+        env:
+          FPC_TARGET: ${{ fromJSON(needs.setup.outputs.target_map)['windows-2022'].fpc_target }}
+          FPC_TARBALL_TARGET: ${{ fromJSON(needs.setup.outputs.target_map)['windows-2022'].fpc_tarball_target }}
+          TLSLIB_TEST_NETWORK: ${{ env.MAKE_TEST_NETWORK }}
+        run: bash .github/workflows/ci/native-build.sh
+
+      # The Build step runs the unit suites on the portable providers. When a non-portable
+      # provider is selected, run them again on it with the binary Build just produced.
+      - name: Unit suites (selected providers)
+        if: env.MAKE_CRYPTO_PROVIDER != 'portable' || env.MAKE_PKIX_PROVIDER != 'portable'
+        shell: bash
+        env:
+          TLSLIB_CRYPTO_PROVIDER: ${{ env.MAKE_CRYPTO_PROVIDER }}
+          TLSLIB_PKIX_PROVIDER: ${{ env.MAKE_PKIX_PROVIDER }}
+        run: bash .github/workflows/ci/provider-suites.sh
+
+      # FclNet adapter: compile the fcl-net adapter + examples and run its loopbacks (no deps
+      # beyond the FPC tarball). Runs after Build so the packages are already compiled.
+      - name: FclNet adapter (build + loopback)
+        shell: bash
+        env:
+          FPC_TARGET: ${{ fromJSON(needs.setup.outputs.target_map)['windows-2022'].fpc_target }}
+          MAKE_RUN_FCLNET: ${{ env.MAKE_RUN_FCLNET }}
+        run: bash .github/workflows/ci/adapters/fclnet-build.sh
+
+      # Same gating as the other native legs: the harness follows MAKE_RUN_INTEROP, BoGo follows MAKE_RUN_BOGO.
+      - name: Interop harness (BoGo)
+        uses: ./.github/workflows/ci/interop/interop-harness
+        with:
+          fpc-target: ${{ fromJSON(needs.setup.outputs.target_map)['windows-2022'].fpc_target }}
+          artifact-suffix: windows-2022
           run-interop: ${{ env.MAKE_RUN_INTEROP }}
           run-bogo: ${{ env.MAKE_RUN_BOGO }}
           run-openssl: ${{ env.MAKE_RUN_OPENSSL }}

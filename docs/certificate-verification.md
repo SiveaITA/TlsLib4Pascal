@@ -1,6 +1,6 @@
 # Certificate verification & trust
 
-**TlsLib4Pascal docs** · [Home](README.md) · [Getting started](getting-started.md) · [Cookbook](cookbook.md) · Verification · [System trust](system-trust.md) · [Compression](certificate-compression.md) · [ECH](ech.md) · [Security model](security-model.md)
+**TlsLib4Pascal docs** · [Home](README.md) · [Getting started](getting-started.md) · [Cookbook](cookbook.md) · Verification · [System trust](system-trust.md) · [Compression](certificate-compression.md) · [ECH](ech.md) · [Compliance](compliance.md) · [Security model](security-model.md)
 
 TlsLib4Pascal is **fail-closed** by default: a client will not complete a handshake unless it
 can verify the server's certificate chain, and the config builder refuses to build a client
@@ -17,7 +17,9 @@ This guide covers, from safest to most dangerous:
 7. [Other knobs](#7-other-knobs) — chain limits, key-strength floors, stapling
 
 > To verify against the **OS system trust store** (the way a browser does) instead of your own
-> anchors, see [system-trust.md](system-trust.md).
+> anchors, see [system-trust.md](system-trust.md). To run your private CA through the OS chain
+> engine with no public root ever vouching, see
+> [Host roots alone](system-trust.md#host-roots-alone-a-private-pki).
 
 Throughout, `Crypto` is an `ICryptoProvider` and `Pkix` an `IPkixProvider` (e.g.
 `TDefaultCryptoProvider.Create as ICryptoProvider` and `TDefaultPkixProvider.Create as IPkixProvider`).
@@ -430,9 +432,12 @@ thread and the verdict resolves the park.
 //    async park. The deadline must be non-zero (0 raises) so the Windows resolver can bound its
 //    fetch (Apple has no per-evaluation timeout). It replaces any earlier WithServerVerification.
 //    Windows + Apple only; other platforms raise.
-client := TSystemTrust.WithLiveSystemTrust(client, TRevocationPosture.Hard, deadlineMs);
+//    The roots say which roots vouch: TSystemTrustRoots.OsRoots, OsAndHostRoots(Store) or
+//    HostRoots(Store).
+client := TSystemTrust.WithLiveSystemTrust(client, Pkix, TSystemTrustRoots.OsRoots,
+  TRevocationPosture.Hard, deadlineMs);
 // 2. wire the OS-native resolver, built from the frozen config, to the stream/adapter:
-resolver := TOSSystemTrust.LiveRevocationResolver(clientConfig);   // caller owns + frees it
+resolver := TOSSystemTrust.LiveRevocationResolver(clientConfig, nil);   // caller owns + frees it
 stream.SetCertificateVerdictResolver(resolver.ResolveVerdict);   // @resolver.ResolveVerdict under FPC {$mode objfpc}
 ```
 
@@ -440,7 +445,7 @@ The OS engine returns a tri-state: a definitive **Revoked** aborts with `certifi
 **Good** accepts; an **indeterminate** (the OS could not fetch or decide) follows the posture —
 `Soft`/`Off` accept, `Hard` rejects with `bad_certificate_status_response`. A handshake staple is
 attached to the live evaluation, so a server that already stapled a current Good is not re-fetched.
-Pass an optional fallback resolver to `LiveRevocationResolver(config, fallback)` (typically a
+Pass a fallback resolver (nil for none) as `LiveRevocationResolver(config, fallback)` (typically a
 `TLiveRevocationChecker.ResolveVerdict`) to run the **portable** OCSP/CRL over your `IHttpFetcher`
 on an indeterminate OS outcome before the posture decides.
 
@@ -460,9 +465,9 @@ then aborts the handshake with `certificate_revoked`. This works with both the *
 `TLiveRevocationChecker` (give it the configured client-CA anchors as `TLiveRevocationOptions.IssuerCandidates`, so it can
 recover the issuer of a leaf-only client credential) and the **OS-native** delegate on Windows/Apple
 (`TOSSystemTrust.ClientVerifierSource(TSystemTrustFetch.Live)` +
-`TOSSystemTrust.LiveRevocationResolver(serverConfig)` + `WithLiveRevocationVerdict(deadlineMs)` on the
-server builder, since no server facade arms it — see the OS-native subsection above and
-[system-trust.md](system-trust.md)).
+`TOSSystemTrust.LiveRevocationResolver(serverConfig, nil)` +
+`WithLiveRevocationVerdict(deadlineMs)` on the server builder, since no server facade arms it —
+see the OS-native subsection above and [system-trust.md](system-trust.md)).
 
 ### Time source: one injected clock
 
@@ -537,7 +542,9 @@ LConfig := TTlsPresets.Compatible(Crypto, Pkix).Client
 ### Key-strength floors
 
 `WithMinimumStrength` on a `WebPki` or `VerifierSource` policy (server or client verification) sets
-the floors the leaf and intermediates must meet; a configured trust anchor is exempt. The fields of
+the floors the leaf and intermediates must meet; a configured trust anchor is exempt unless
+`AnchorKeyFloors` is set, which holds its key to the floors too; with it set, all of a server's
+client-CA anchors are checked at `Build` (`EInvalidOperationTlsLibException`). The fields of
 `TCertificateStrengthPolicy` (unit `TlpCertificateStrengthPolicy`) and their `Defaults`, used by
 every preset:
 
@@ -560,7 +567,8 @@ LConfig := TTlsPresets.Compatible(Crypto, Pkix).Client
 
 ### The chain-algorithm policy (always on)
 
-Over the validated path (the anchor exempt), the built-in pipeline and the OS delegates always check:
+Over the validated path (the anchor exempt unless `AnchorKeyFloors` is set), the built-in pipeline
+and the OS delegates always check:
 
 - every leaf and intermediate is signed with a signature scheme this endpoint advertised, else
   `unsupported_certificate`;
@@ -602,7 +610,9 @@ resolver configured.
   RealPeerRevocationProbe); a timeout of 0 means 60 s, the response head is capped at 64 KiB,
   and it follows no redirect, treats a 101 or 204 as a failure and cannot reach an IPv6 responder.
 - **Server-side mTLS.** A server requests client certificates with `WithPeerAuth` and verifies them with
-  `WithClientVerification(TClientVerification.WebPki(...).Build)`. Without `WithPeerAuth`, the
+  `WithClientVerification(TClientVerification.WebPki(...).Build)`. With `AnchorKeyFloors` set, every
+  client-CA anchor is checked against the floors at `Build` (`EInvalidOperationTlsLibException`).
+  Without `WithPeerAuth`, the
   client-verification, pinning, callback, verdict, chain-limit and changed signature-scheme registry settings are refused at `Build`, and a
   server that shares a session store or ticket keys must also set `WithResumptionScope`.
 

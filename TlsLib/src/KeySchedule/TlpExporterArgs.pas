@@ -17,7 +17,8 @@ interface
 
 uses
   SysUtils,
-  TlpTlsLibExceptions;
+  TlpTlsLibExceptions,
+  TlpTls12PrfLabels;
 
 type
   /// <summary>Shared argument guard for the RFC 5705 / RFC 9846 keying-material exporters, used by
@@ -34,12 +35,6 @@ resourcestring
   SExportLabelNotAscii = 'the exporter label must be ASCII';
   SExportLabelReserved = 'the exporter label collides with a reserved TLS PRF label';
 
-const
-  // exporter labels can collide with the TLS PRF's own labels (RFC 5705 4); refuse the reserved
-  // ones so an export can never equal a handshake secret
-  ReservedPrfLabels: array [0 .. 4] of string = ('client finished', 'server finished',
-    'master secret', 'key expansion', 'extended master secret');
-
 { TExporterArgs }
 
 class procedure TExporterArgs.Guard(const ALabel: string; ALength: Int32);
@@ -53,9 +48,9 @@ begin
   for LI := 1 to System.Length(ALabel) do
     if Ord(ALabel[LI]) > 127 then
       raise EArgumentTlsLibException.CreateRes(@SExportLabelNotAscii);
-  for LI := System.Low(ReservedPrfLabels) to System.High(ReservedPrfLabels) do
-    if ALabel = ReservedPrfLabels[LI] then
-      raise EArgumentTlsLibException.CreateRes(@SExportLabelReserved);
+  // an export must never equal a handshake secret (RFC 5705 4)
+  if TTls12PrfLabels.IsKeyScheduleLabel(ALabel) then
+    raise EArgumentTlsLibException.CreateRes(@SExportLabelReserved);
 end;
 
 end.

@@ -87,7 +87,7 @@ CPU-adaptive AEAD selection (ChaCha20-Poly1305 preferred where hardware AES is a
 - **PKIX path validation** (PKITS-verified) with a bounded path build; other RFC 5280 behaviour plugs in as a custom `ICertificatePathValidator`.
 - **Endpoint identity** -- RFC 9525 host-name / SAN matching (subject alternative names only).
 - **Revocation** -- stapled OCSP, live OCSP/CRL over an injected fetcher, soft/hard/off posture, and RFC 7633 must-staple.
-- **OS system trust** (opt-in) -- the OS verifier on Windows / macOS / iOS / Android, an OS root harvest on Linux / BSD / Solaris; your own CA can sit beside the OS roots.
+- **OS system trust** (opt-in) -- the OS verifier on Windows / macOS / iOS / Android, an OS root harvest on Linux / BSD / Solaris; your own CA can be trusted with the OS roots.
 - **CA bundles** -- a PEM/DER bundle loader (`TlsLib.Trust.Bundle`).
 - **Pinning**, **mutual TLS**, and **OCSP stapling** (sent by servers, enforced by clients).
 - One composable, fail-closed pipeline; custom verification **augments** (can only reject further), and every bypass is behind the `dangerous` surface.
@@ -167,6 +167,7 @@ Add one only when you use its feature; the core references none of them:
 | `TlsLib.Trust.System` | OS system-trust harvest + verifier delegate |
 | `TlsLib.Trust.Bundle` | A PEM/DER CA-bundle loader (`FromPem` / `FromPemFile`) |
 | `TlsLib.Crypto.System` | Opt-in OS-native crypto primitives for the handshake |
+| `TlsLib.Compliance` | An optional FIPS / CNSA policy over the OS crypto module (see [docs/compliance.md](docs/compliance.md)) |
 | `TlsLib.Net` | TCP connector/listener, the HTTP/OCSP/CRL fetcher (`TSocketHttpFetcher`), and the DNS/SVCB ECH config helper; the fcl-net adapter requires it |
 | `TlsLib.Adapter.mORMot` / `.Indy` / `.Synapse` / `.FclNet` | Drop-in adapters for those networking stacks |
 

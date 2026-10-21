@@ -1,6 +1,6 @@
 # Security model
 
-**TlsLib4Pascal docs** · [Home](README.md) · [Getting started](getting-started.md) · [Cookbook](cookbook.md) · [Verification](certificate-verification.md) · [System trust](system-trust.md) · [Compression](certificate-compression.md) · [ECH](ech.md) · Security model
+**TlsLib4Pascal docs** · [Home](README.md) · [Getting started](getting-started.md) · [Cookbook](cookbook.md) · [Verification](certificate-verification.md) · [System trust](system-trust.md) · [Compression](certificate-compression.md) · [ECH](ech.md) · [Compliance](compliance.md) · Security model
 
 This document is the map of what TlsLib4Pascal defends against, **where each defense is enforced, and
 how it is tested.** It serves two audiences: users deciding how much to trust the library, and
@@ -54,7 +54,7 @@ principal test units (the fuzz + BoGo + KAT suites cross-cover several).
 | 6 | **DoS / resource limits.** Hard caps on handshake-reassembly size, floods of empty records / warning alerts / KeyUpdate requests, the stateful session store, and the 0-RTT strike register. The reassembly and chain sizes, the session store and the strike register are configurable; the flood caps (consecutive empty records, change_cipher_spec, warning alerts, post-handshake messages) are fixed constants. Secure defaults throughout. A handshake parked on an async verdict buffers inbound under these same caps. | memory exhaustion / infinite-work loops | the record layer + engine bounds; the stateless HRR cookie | record/handshake tests; `TStrikeRegisterAntiReplay` bounds (`Tls13ResumptionTests`) |
 | 7 | **Secret hygiene.** All key material — schedule secrets, traffic keys, PSKs, resumption secrets, STEK/ticket keys, the HRR-cookie secret — lives in a heap-stable `ISecretBuffer`, wiped once at end-of-life with a plain `FillChar` over the buffer (`TSecureMemory.Wipe`; there is no extra barrier against the compiler eliding the store). Provider intermediates (round keys, HKDF PRKs, scratch) are wiped too. | key material recovered from freed memory | `TSecretBuffer` (refcounted, single buffer, wiped in its destructor when the last reference is released) | `SecretTests` (`TestWipeOnLastRelease` asserts the buffer is zeroed when its last reference is released) |
 | 8 | **Single-threaded per connection.** An engine/connection is single-threaded (caller serializes; no internal locks). Config objects are immutable once built and freely shareable across threads. | accidental data races on connection state | stated contract; frozen config objects | design invariant; config-freeze tests |
-| 9 | **Fail-closed authentication.** A client with verification on but no trust source is refused at `Build` (`SNoTrustStore`), and a client with name checking on but no usable host is refused when the engine is created — never a silent RFC 9525 skip (disable it only via `WithDangerousDisableServerNameCheck`). A certificate whose `extendedKeyUsage` excludes the TLS role — `serverAuth` for a server, `clientAuth` for a client, over the leaf and every intermediate — is rejected as `unsupported_certificate` (required-if-present; `anyExtendedKeyUsage` is not a substitute). Anchors *union* inside one `WebPki` policy; a whole verifier (`Custom`) takes no anchors, intermediates or skip-verify, so nothing it would ignore can be set beside it. A parked verdict with no resolver, or whose resolver raises, fails the handshake — the only pass is an explicit positive verdict. The deadline is a budget handed to the resolver, which must honour it; the library runs no timer. A definitive, authenticated `Revoked` aborts under every revocation posture, including `Off`. Our own certificate chain is never sent when a certificate in it other than a self-issued one is signed with MD5, or with SHA-1 the peer did not advertise (RFC 9846 4.5.1.2; MD5 inferred from 4.5.1.3): a server aborts `handshake_failure`, a client answers without a certificate. | silent-insecure / fail-open trust / wrong-purpose certificate | the config builder guards + the engine factory + the trust pipeline (augment-only) | `CertificateVerifierTests`, `TrustCompositionTests`, `CertificateCheckTests`, `LiveRevocationTests`, `ServerSideLiveRevocationTests`, `ChainAlgorithmPolicyTests` |
+| 9 | **Fail-closed authentication.** A client with verification on but no trust source is refused at `Build` (`SNoTrustStore`), and a client with name checking on but no usable host is refused when the engine is created — never a silent RFC 9525 skip (disable it only via `WithDangerousDisableServerNameCheck`). A certificate whose `extendedKeyUsage` excludes the TLS role — `serverAuth` for a server, `clientAuth` for a client, over the leaf and every intermediate — is rejected as `unsupported_certificate` (required-if-present; `anyExtendedKeyUsage` is not a substitute). Anchors *union* inside one `WebPki` policy; a whole verifier (`Custom`) takes no anchors, intermediates or skip-verify, so nothing it would ignore can be set beside it. A parked verdict with no resolver, or whose resolver raises, fails the handshake — the only pass is an explicit positive verdict. The deadline is a budget handed to the resolver, which must honour it; the library runs no timer. A definitive, authenticated `Revoked` aborts under every revocation posture, including `Off`. Our own certificate chain is never sent when a certificate in it other than a self-signed one is signed with MD5, or with SHA-1 the peer did not advertise (RFC 9846 4.5.1.2; MD5 inferred from 4.5.1.3): a server aborts `handshake_failure`, a client answers without a certificate. | silent-insecure / fail-open trust / wrong-purpose certificate | the config builder guards + the engine factory + the trust pipeline (augment-only) | `CertificateVerifierTests`, `TrustCompositionTests`, `CertificateCheckTests`, `LiveRevocationTests`, `ServerSideLiveRevocationTests`, `ChainAlgorithmPolicyTests` |
 | 10 | **Downgrade protection.** The ServerHello.random downgrade sentinel is set/checked and is *cryptographically bound* (via the 1.2 SKE signature and, both versions, the Finished MAC over the transcript); a 1.3-capable client aborts `illegal_parameter` on a spurious downgrade. Server-side `TLS_FALLBACK_SCSV` aborts `inappropriate_fallback`. A server aborts with `protocol_version` when a ClientHello has `supported_versions` and a `legacy_version` other than 0x0303; this includes the ClientHello after a HelloRetryRequest and the ECH outer ClientHello (RFC 9846 4.2.2). | version-downgrade MITM | negotiation prologue + Finished MAC + SCSV | `NegotiationTests`, `Tls12DualVersionTests`, `HelloRetryRequestTests`, `EchClientEngineTests` |
 | 11 | **CSPRNG hard-fail.** A randomness failure aborts the operation with a fatal error — never a silent fallback to a weak or zero source. There is no fork detection: after `fork()` the child must not use the parent's provider or any connection it inherited; build a fresh provider in the child. | weak / replayed randomness | the provider's RNG contract | provider RNG tests |
 
@@ -97,6 +97,24 @@ one when ECH was accepted). For debugging only — never production.
   presets) offered by the presets and preferred under Hardened and Strict. X25519MLKEM768 is
   interop-verified against OpenSSL 3.5+ and BoringSSL; SecP256r1MLKEM768 against OpenSSL where the
   installed build supports it.
+- **Compliance mode (optional).** The `TlsLib.Compliance` package routes the cryptography a
+  policy-built config negotiates through refusing providers: an algorithm outside the rules is
+  refused in both enforcement modes, and in strict mode so is one the OS module does not serve.
+  Hashes and HMACs are checked against the module only, and a few internal SHA-256 uses are
+  disclosed. A refusal ends the handshake with a fatal `internal_error`, except where the engine
+  absorbs it (a session ticket that is not issued) and where a credential resolver answers `False`.
+  Rules must lie within a named preset in both modes. Relaxed mode refuses what the
+  allowlists and the configuration requirements forbid, and reports the in-module requirements
+  (`InModuleChainVerification`, `Kdf` of `RequireModule`) and where the cryptography runs without
+  refusing portable code.
+  `Admit` checks the non-crypto settings (early data, ECH, PSKs, key log, verification bypass,
+  strength floors including trust anchors, credential chains and keys) and, for key agreement
+  through group objects and chain verification through a verifier source, is the only enforcement:
+  they do not run through the policy providers, so a config from `Build` without `BuildClient`,
+  `BuildServer` or `Admit` is not policy-enforced for them. TLS 1.2 exporter derivations
+  (RFC 5705) are composed over the module HMAC and disclosed; a strict policy whose `Kdf` is
+  `RequireModule` refuses them and discloses the refusal instead. It makes no module validation
+  claim of its own; see [compliance.md](compliance.md).
 - **Resumption.** TLS 1.3 resumes with `psk_dhe_ke` only; `psk_ke` (no forward secrecy) is never
   negotiated. TLS 1.2 resumption (session ID / ticket) reuses the original master secret, so it is
   only as forward-secret as the session store / ticket-key lifetime. Client-cache tickets are single-use; server tickets are single-use with a session
@@ -108,7 +126,9 @@ one when ECH was accepted). For debugging only — never production.
   (RFC 5246 7.2.1). A server's ticket lifetime defaults to 7200 s and `WithTicketLifetime` accepts at
   most seven days (604800 s); a client clamps any advertised lifetime to seven days. With resumption
   on and no session store or ticket keys set, `Build` mints a default ticket key (STEK) that rotates on
-  that lifetime. **0-RTT is off by default** and, when enabled, is bounded by an anti-replay strategy.
+  that lifetime. A crypto provider that cannot build AES-256-GCM, the ticket cipher, issues no
+  stateless tickets and reads every offered one as unreadable, so those connections run a full
+  handshake. **0-RTT is off by default** and, when enabled, is bounded by an anti-replay strategy.
   A server `WithEarlyData` budget must be below 1 MiB and needs resumption; with explicit
   `WithSessionTicketKeys` and no session store it also needs `WithAntiReplay`, and `WithAntiReplay`
   needs a positive budget; with `Tls13.WithTicketCount(0)` it also needs a session store or ticket
@@ -151,6 +171,14 @@ These are intentional and documented — flagging them up front so they aren't m
   classical+PQ pair. The observable consequence is an extra HelloRetryRequest when the peer's selected
   group differs — verified to interop (direct and HRR) against OpenSSL 3.5+ / BoringSSL. This is *not*
   BoringSSL's multi-key_share prediction, and the corresponding BoGo cases are disabled by policy.
+- **No cryptographic-module claim.** TlsLib is not a validated module. `TlsLib.Compliance` reports
+  which validated OS module serves the primitives, from a shipped table keyed on the OS build and
+  product type, and checked against the process architecture, native machine, firmware and loaded
+  modules, and in strict mode refuses any combination the table does not mark validated. Its
+  verdict has three levels: `Compliant` when every primitive and every key-schedule derivation the
+  configuration can run is a module service, with the GCM IV disclosure attached (the library
+  builds the IV counter outside the module), `PrimitivesInModule` when a key-schedule derivation is
+  composed outside the module (HKDF, for TLS 1.3), `NotCompliant` otherwise.
 - **Augment-only custom verification** (vs the rustls/.NET "replace validation" model) — a callback can
   only tighten, never loosen.
 - **A cipher list narrows, and a host's list is read by exact name only.** A cipher list

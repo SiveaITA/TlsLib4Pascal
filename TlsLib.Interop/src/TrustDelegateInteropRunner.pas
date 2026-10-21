@@ -58,8 +58,9 @@ type
     // delegate, and a client presenter offers the certificate
     IsServer: Boolean;
     RootFile: string;
-    // os-delegate / os-anchors only: a root trusted beside the OS roots
+    // client OS modes only: a root trusted with the OS roots, or alone when HostRootsAlone is set
     HostRootFile: string;
+    HostRootsAlone: Boolean;
     // client only: dial this dotted-IPv4 peer instead of the in-process server (--connect ip:port)
     ConnectHost: string;
     ConnectPort: Word;
@@ -356,11 +357,18 @@ const
 var
   LBuilder: ITlsConfigBuilder;
   LClient: ITlsClientConfigBuilder;
-  LHostRoots: ITrustAnchorStore;
+  LRoots: TSystemTrustRoots;
 begin
-  LHostRoots := nil;
+  LRoots := TSystemTrustRoots.OsRoots;
   if ACell.HostRootFile <> '' then
-    LHostRoots := TInteropCredentials.TrustFromPem(APkix, ACell.HostRootFile);
+  begin
+    if ACell.HostRootsAlone then
+      LRoots := TSystemTrustRoots.HostRoots(
+        TInteropCredentials.TrustFromPem(APkix, ACell.HostRootFile))
+    else
+      LRoots := TSystemTrustRoots.OsAndHostRoots(
+        TInteropCredentials.TrustFromPem(APkix, ACell.HostRootFile));
+  end;
   LBuilder := TTlsPresets.Compatible(ACryptoProvider, APkix);
   LClient := LBuilder.Client;
   LClient.WithSupportedVersions(TArray<UInt16>.Create(ACell.TlsVersion));
@@ -370,16 +378,16 @@ begin
   if ACell.Anchors then
     // the OS root set and its distrust set, harvested into our own verifier
     LClient.WithServerVerification(TSystemTrust.ServerVerification(APkix,
-      TSystemTrustMode.Anchors, LHostRoots).WithRevocation(ACell.Posture).Build)
+      TSystemTrustMode.Anchors, LRoots).WithRevocation(ACell.Posture).Build)
   else if ACell.Delegate then
   begin
     // verify the server certificate through the OS trust engine against the real machine store;
     // live arms the async park the OS-native resolver decides in
     if ACell.Live then
-      TSystemTrust.WithLiveSystemTrust(LClient, ACell.Posture, LiveDeadlineMs)
+      TSystemTrust.WithLiveSystemTrust(LClient, APkix, LRoots, ACell.Posture, LiveDeadlineMs)
     else
       LClient.WithServerVerification(TSystemTrust.ServerVerification(APkix,
-        TSystemTrustMode.Delegate, LHostRoots).WithRevocation(ACell.Posture).Build);
+        TSystemTrustMode.Delegate, LRoots).WithRevocation(ACell.Posture).Build);
   end
   else
     LClient.WithServerVerification(TServerVerification.WebPki(
@@ -435,7 +443,7 @@ begin
     if ACell.Live then
     begin
       // the host resolves the async park by re-running the OS engine live (network on)
-      LResolver := TOSSystemTrust.LiveRevocationResolver(LConfig);
+      LResolver := TOSSystemTrust.LiveRevocationResolver(LConfig, nil);
       try
         LResult := TInteropPump.DriveHandshake(LEngine, LSocket,
           LResolver.ResolveVerdict, True);
@@ -527,7 +535,7 @@ begin
         if LLiveCaFile = '' then
           LLiveCaFile := ACell.ClientCaFile;
         LResolver := TOSSystemTrust.LiveRevocationResolver(
-          BuildServerConfig(LCrypto, LPkix, ACell, LLiveCaFile));
+          BuildServerConfig(LCrypto, LPkix, ACell, LLiveCaFile), nil);
         try
           LResult := TInteropPump.DriveHandshake(LEngine, LServerSocket,
             LResolver.ResolveVerdict, False);
@@ -626,8 +634,11 @@ begin
     end;
     LCell.RootFile := ArgValue('--root', '');
     LCell.HostRootFile := ArgValue('--host-root', '');
-    if (LCell.HostRootFile <> '') and (LCell.IsServer or LCell.Live) then
-      raise Exception.Create('--host-root applies to the non-live client OS modes only');
+    LCell.HostRootsAlone := HasArg('--host-roots-alone');
+    if (LCell.HostRootFile <> '') and LCell.IsServer then
+      raise Exception.Create('--host-root applies to the client OS modes only');
+    if LCell.HostRootsAlone and (LCell.HostRootFile = '') then
+      raise Exception.Create('--host-roots-alone needs --host-root');
     if (LCell.HostRootFile <> '') and not (LCell.Delegate or LCell.Anchors) then
       raise Exception.Create('--host-root needs --trust-mode os-delegate or os-anchors');
     LConnect := ArgValue('--connect', '');

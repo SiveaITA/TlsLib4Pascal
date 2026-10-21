@@ -21,7 +21,6 @@ uses
   TlpBinaryPrimitives,
   TlpCodeKeyedRegistry,
   TlpCryptoDomainTypes,
-  TlpEnumUtilities,
   TlpNegotiationTypes,
   TlpICryptoProvider,
   TlpINamedGroup,
@@ -59,6 +58,15 @@ type
     /// trades post-quantum protection for a smaller ClientHello there. Install it with
     /// WithNamedGroups.</summary>
     class function CreateClassicalRegistry(const ACryptoProvider: ICryptoProvider): INamedGroupRegistry; static;
+    /// <summary>A registry holding exactly AGroups in the given order; a repeated code keeps its
+    /// first entry and an empty array gives an empty registry. A nil group raises
+    /// EArgumentTlsLibException.</summary>
+    class function CreateRegistry(const AGroups: TArray<INamedGroup>): INamedGroupRegistry; static;
+    /// <summary>The groups ARegistry holds for APreferred, in preference order: a code the
+    /// registry lacks is dropped, so a pruned registry may sit under a wider preference list.
+    /// A repeated code repeats its group.</summary>
+    class function ResolvedGroups(const ARegistry: INamedGroupRegistry;
+      const APreferred: TArray<UInt16>): TArray<INamedGroup>; static;
   end;
 
 implementation
@@ -76,10 +84,12 @@ const
 resourcestring
   SInvalidPeerShare = 'invalid peer key share for group %s';
   SUnknownCurve = 'unknown named-group curve "%s"';
+  SNotAKemGroup = 'named group "%s" is not a standalone KEM';
   SHybridKeyNotExportable =
     'a hybrid key-exchange key has no single raw scalar to export';
   SForeignHybridKey =
     'the hybrid key-exchange private key was not produced by this group';
+  SNilNamedGroup = 'a named-group registry cannot hold a nil group';
 
 type
   // wraps a key agreement (Diffie-Hellman) as a KEM-shaped group: the ciphertext
@@ -91,8 +101,7 @@ type
     FAgreement: IKeyAgreement;
     FCode: UInt16;
   public
-    constructor Create(const ACryptoProvider: ICryptoProvider;
-      AAlgorithm: TKeyAgreementAlgorithm; ACode: UInt16);
+    constructor Create(const ACryptoProvider: ICryptoProvider; ACode: UInt16);
     function Code: UInt16;
     function Name: string;
     function Kind: TNamedGroupKind;
@@ -116,8 +125,7 @@ type
     // backend then instantiates the KEM
     class function IsCanonicalMlKem768Key(const AKey: TBytes): Boolean; static;
   public
-    constructor Create(const ACryptoProvider: ICryptoProvider;
-      AAlgorithm: TKemAlgorithm; ACode: UInt16);
+    constructor Create(const ACryptoProvider: ICryptoProvider; ACode: UInt16);
     function Code: UInt16;
     function Name: string;
     function Kind: TNamedGroupKind;
@@ -211,11 +219,13 @@ type
 
 { TKeyAgreementGroup }
 
-constructor TKeyAgreementGroup.Create(const ACryptoProvider: ICryptoProvider;
-  AAlgorithm: TKeyAgreementAlgorithm; ACode: UInt16);
+constructor TKeyAgreementGroup.Create(const ACryptoProvider: ICryptoProvider; ACode: UInt16);
 begin
   inherited Create;
-  FComposition := TNamedGroupComposition.From(AAlgorithm);
+  // the code must name a plain ECDHE group, else it is not one we can build here
+  if (not TNamedGroupCatalog.TryComposition(ACode, FComposition)) or
+    (FComposition.Kind <> TNamedGroupKind.Ecdhe) then
+    raise EArgumentTlsLibException.CreateResFmt(@SUnknownCurve, [TNamedGroupCatalog.Name(ACode)]);
   FAgreement := ACryptoProvider.Primitives.CreateKeyAgreement(FComposition.KeyAgreement);
   FCode := ACode;
 end;
@@ -276,11 +286,12 @@ end;
 
 { TKemGroup }
 
-constructor TKemGroup.Create(const ACryptoProvider: ICryptoProvider;
-  AAlgorithm: TKemAlgorithm; ACode: UInt16);
+constructor TKemGroup.Create(const ACryptoProvider: ICryptoProvider; ACode: UInt16);
 begin
   inherited Create;
-  FComposition := TNamedGroupComposition.From(AAlgorithm);
+  if (not TNamedGroupCatalog.TryComposition(ACode, FComposition)) or
+    (FComposition.Kind <> TNamedGroupKind.Kem) then
+    raise EArgumentTlsLibException.CreateResFmt(@SNotAKemGroup, [TNamedGroupCatalog.Name(ACode)]);
   FKem := ACryptoProvider.Primitives.CreateKem(FComposition.Kem);
   FCode := ACode;
 end;
@@ -556,29 +567,22 @@ end;
 
 class function TNamedGroups.CreateX25519(const ACryptoProvider: ICryptoProvider): INamedGroup;
 begin
-  Result := TKeyAgreementGroup.Create(ACryptoProvider, TKeyAgreementAlgorithm.X25519,
-    TNamedGroupCatalog.X25519);
+  Result := TKeyAgreementGroup.Create(ACryptoProvider, TNamedGroupCatalog.X25519);
 end;
 
 class function TNamedGroups.CreateNistEcdh(const ACryptoProvider: ICryptoProvider;
   const ACurveName: string): INamedGroup;
 var
   LCode: UInt16;
-  LAlg: TKeyAgreementAlgorithm;
-  LHasCode, LHasAlg: Boolean;
 begin
-  // the group name is the curve name; it must resolve to both a wire codepoint and the
-  // key-agreement enum (secp256r1 -> SECP256R1), else it is not a group we can build
-  LHasCode := TNamedGroupCatalog.TryCode(ACurveName, LCode);
-  LHasAlg := TEnumUtilities.TryGetEnumValue<TKeyAgreementAlgorithm>(ACurveName, LAlg);
-  if (not LHasCode) or (not LHasAlg) then
+  if not TNamedGroupCatalog.TryCode(ACurveName, LCode) then
     raise EArgumentTlsLibException.CreateResFmt(@SUnknownCurve, [ACurveName]);
-  Result := TKeyAgreementGroup.Create(ACryptoProvider, LAlg, LCode);
+  Result := TKeyAgreementGroup.Create(ACryptoProvider, LCode);
 end;
 
 class function TNamedGroups.CreateMlKem768(const ACryptoProvider: ICryptoProvider): INamedGroup;
 begin
-  Result := TKemGroup.Create(ACryptoProvider, TKemAlgorithm.ML_KEM_768, TNamedGroupCatalog.MlKem768);
+  Result := TKemGroup.Create(ACryptoProvider, TNamedGroupCatalog.MlKem768);
 end;
 
 class function TNamedGroups.CreateX25519MlKem768(const ACryptoProvider: ICryptoProvider): INamedGroup;
@@ -623,6 +627,33 @@ begin
     if LGroup.Kind = TNamedGroupKind.Ecdhe then
       LBuilder.Add(LGroup);
   Result := LBuilder.Build;
+end;
+
+class function TNamedGroups.CreateRegistry(const AGroups: TArray<INamedGroup>): INamedGroupRegistry;
+var
+  LBuilder: INamedGroupRegistryBuilder;
+  LGroup: INamedGroup;
+begin
+  LBuilder := TNamedGroupRegistryBuilder.Create as INamedGroupRegistryBuilder;
+  for LGroup in AGroups do
+  begin
+    if LGroup = nil then
+      raise EArgumentTlsLibException.CreateRes(@SNilNamedGroup);
+    LBuilder.Add(LGroup);
+  end;
+  Result := LBuilder.Build;
+end;
+
+class function TNamedGroups.ResolvedGroups(const ARegistry: INamedGroupRegistry;
+  const APreferred: TArray<UInt16>): TArray<INamedGroup>;
+var
+  LCode: UInt16;
+  LGroup: INamedGroup;
+begin
+  Result := nil;
+  for LCode in APreferred do
+    if ARegistry.TryGet(LCode, LGroup) then
+      TArrayUtilities.Append<INamedGroup>(Result, LGroup);
 end;
 
 end.

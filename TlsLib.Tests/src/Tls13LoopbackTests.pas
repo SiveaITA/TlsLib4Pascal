@@ -53,6 +53,7 @@ uses
   TlpTlsCredential,
   TlpCredentialResolvers,
   TlpITlsCredentialResolver,
+  TlpITlsServerCredentialSet,
   TlpTls13ClientStateMachine,
   TlpTls13ServerStateMachine,
   TlpCryptoDomainTypes,
@@ -81,6 +82,8 @@ type
     // opt-in NSS key-log sinks: nil by default (helpers skip injection); a test sets them to
     // observe which ClientHello random the exported secrets are keyed by
     FClientKeyLog, FServerKeyLog: TMockKeyLog;
+    function MakeEntry(const AHost: string;
+      const ACredential: TTlsCredential): TSniCredentialEntry;
     function NewClient: ITlsEngine;
     function NewClientForSni(const ASni, AExpectedHost: string): ITlsEngine;
     function NewClientEd448: ITlsEngine;
@@ -181,6 +184,13 @@ type
     procedure TestSniSelectsHostCredentialAmongMany;
     procedure TestUnknownSniWithoutDefaultAbortsUnrecognizedName;
     procedure TestSniResolverMatchingMatrix;
+    procedure TestSniResolverSupportsCredentialSet;
+    procedure TestCredentialSetListsDefaultThenEntriesInOrder;
+    procedure TestCredentialSetWithoutDefaultListsEntriesOnly;
+    procedure TestCredentialSetListsEveryCredentialWithoutDeduplication;
+    procedure TestCredentialSetIsAFreshArray;
+    procedure TestCredentialSetChainsAreCopies;
+    procedure TestCredentialSetOfASingleCredentialListsOne;
     procedure TestEd448ServerCredentialHandshake;
     procedure TestEd25519ServerCredentialHandshake;
   end;
@@ -188,6 +198,13 @@ type
 implementation
 
 { TTestTls13Loopback }
+
+function TTestTls13Loopback.MakeEntry(const AHost: string;
+  const ACredential: TTlsCredential): TSniCredentialEntry;
+begin
+  Result.Host := AHost;
+  Result.Credential := ACredential;
+end;
 
 function TTestTls13Loopback.NewClient: ITlsEngine;
 begin
@@ -2221,6 +2238,142 @@ begin
 
   CheckTrue(ResolveFor('unrelated.example', LGot), 'an unmatched host resolves to the default');
   CheckEqualBytes('unmatched host -> the default credential', LeafOf(LDefault), LeafOf(LGot));
+end;
+
+procedure TTestTls13Loopback.TestSniResolverSupportsCredentialSet;
+var
+  LEntries: TArray<TSniCredentialEntry>;
+  LResolver: ITlsServerCredentialResolver;
+  LSet: ITlsServerCredentialSet;
+begin
+  LEntries := TArray<TSniCredentialEntry>.Create(MakeEntry('a.example', ServerCredential));
+  LResolver := TSniCredentialResolver.ForEntries(LEntries);
+  CheckTrue(Supports(LResolver, ITlsServerCredentialSet, LSet),
+    'the built-in resolver lists its credentials');
+end;
+
+procedure TTestTls13Loopback.TestCredentialSetListsDefaultThenEntriesInOrder;
+var
+  LEntries: TArray<TSniCredentialEntry>;
+  LDefault, LFirst, LSecond: TTlsCredential;
+  LSet: ITlsServerCredentialSet;
+  LListed: TArray<TTlsCredential>;
+begin
+  LDefault := CredentialWithChain(TArray<TBytes>.Create(
+    TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'root_cert')));
+  LFirst := ServerCredential;
+  LSecond := CredentialWithChain(TArray<TBytes>.Create(
+    TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'wrongname_cert')));
+  LEntries := TArray<TSniCredentialEntry>.Create(MakeEntry('a.example', LFirst),
+    MakeEntry('*.b.example', LSecond));
+  CheckTrue(Supports(TSniCredentialResolver.Create(LEntries, LDefault) as
+    ITlsServerCredentialResolver, ITlsServerCredentialSet, LSet), 'resolver lists its set');
+  LListed := LSet.Credentials;
+  CheckEquals(3, System.Length(LListed), 'the default plus each entry');
+  CheckEqualBytes('default first', LDefault.CertificateChain[0], LListed[0].CertificateChain[0]);
+  CheckEqualBytes('first entry second', LFirst.CertificateChain[0],
+    LListed[1].CertificateChain[0]);
+  CheckEqualBytes('second entry last', LSecond.CertificateChain[0],
+    LListed[2].CertificateChain[0]);
+end;
+
+procedure TTestTls13Loopback.TestCredentialSetWithoutDefaultListsEntriesOnly;
+var
+  LEntries: TArray<TSniCredentialEntry>;
+  LSet: ITlsServerCredentialSet;
+  LListed: TArray<TTlsCredential>;
+begin
+  LEntries := TArray<TSniCredentialEntry>.Create(MakeEntry('a.example', ServerCredential));
+  CheckTrue(Supports(TSniCredentialResolver.ForEntries(LEntries), ITlsServerCredentialSet, LSet),
+    'resolver lists its set');
+  LListed := LSet.Credentials;
+  CheckEquals(1, System.Length(LListed), 'only the entry, no phantom default');
+end;
+
+procedure TTestTls13Loopback.TestCredentialSetListsEveryCredentialWithoutDeduplication;
+var
+  LEntries: TArray<TSniCredentialEntry>;
+  LShared, LOther: TTlsCredential;
+  LSet: ITlsServerCredentialSet;
+  LListed: TArray<TTlsCredential>;
+begin
+  LShared := ServerCredential;
+  LOther := CredentialWithChain(TArray<TBytes>.Create(
+    TTlsLibTestCertificates.Field('Certs/EcP256Chain.txt', 'wrongname_cert')));
+  LEntries := TArray<TSniCredentialEntry>.Create(MakeEntry('a.example', LShared),
+    MakeEntry('b.example', LOther));
+  CheckTrue(Supports(TSniCredentialResolver.Create(LEntries, LShared) as
+    ITlsServerCredentialResolver, ITlsServerCredentialSet, LSet), 'resolver lists its set');
+  LListed := LSet.Credentials;
+  CheckEquals(3, System.Length(LListed), 'the default and every entry, repeats included');
+  CheckEqualBytes('shared credential listed as the default', LShared.CertificateChain[0],
+    LListed[0].CertificateChain[0]);
+  CheckEqualBytes('the same credential listed again as the first entry',
+    LShared.CertificateChain[0], LListed[1].CertificateChain[0]);
+  CheckEqualBytes('the other entry follows', LOther.CertificateChain[0],
+    LListed[2].CertificateChain[0]);
+end;
+
+procedure TTestTls13Loopback.TestCredentialSetIsAFreshArray;
+var
+  LEntries: TArray<TSniCredentialEntry>;
+  LCredential: TTlsCredential;
+  LSet: ITlsServerCredentialSet;
+  LListed: TArray<TTlsCredential>;
+begin
+  LCredential := ServerCredential;
+  LEntries := TArray<TSniCredentialEntry>.Create(MakeEntry('a.example', LCredential));
+  CheckTrue(Supports(TSniCredentialResolver.ForEntries(LEntries), ITlsServerCredentialSet, LSet),
+    'resolver lists its set');
+  LListed := LSet.Credentials;
+  LListed[0].CertificateChain := nil;
+  LListed[0].PrivateKey := nil;
+  SetLength(LListed, 0);
+  LListed := LSet.Credentials;
+  CheckEquals(1, System.Length(LListed), 'the resolver still lists its entry');
+  CheckEquals(System.Length(LCredential.CertificateChain),
+    System.Length(LListed[0].CertificateChain), 'the chain is untouched');
+  CheckTrue(LListed[0].PrivateKey <> nil, 'the key is untouched');
+end;
+
+procedure TTestTls13Loopback.TestCredentialSetChainsAreCopies;
+var
+  LEntries: TArray<TSniCredentialEntry>;
+  LResolver: ITlsServerCredentialResolver;
+  LSet: ITlsServerCredentialSet;
+  LListed: TArray<TTlsCredential>;
+  LHello: TTlsClientHelloInfo;
+  LResolved: TTlsCredential;
+  LFirst: Byte;
+  LCredential: TTlsCredential;
+begin
+  LCredential := ServerCredential;
+  LCredential.OcspStaple := TBytes.Create($30, $03, $0A, $01, $00);
+  LEntries := TArray<TSniCredentialEntry>.Create(MakeEntry('a.example', LCredential));
+  LResolver := TSniCredentialResolver.ForEntries(LEntries);
+  CheckTrue(Supports(LResolver, ITlsServerCredentialSet, LSet), 'resolver lists its set');
+  LHello := Default(TTlsClientHelloInfo);
+  LHello.ServerName := 'a.example';
+  CheckTrue(LResolver.TryResolve(LHello, LResolved), 'the entry resolves');
+  LFirst := LResolved.CertificateChain[0][0];
+  LListed := LSet.Credentials;
+  LListed[0].CertificateChain[0][0] := LFirst xor $FF;
+  CheckTrue(LResolver.TryResolve(LHello, LResolved), 'the entry still resolves');
+  CheckEquals(LFirst, LResolved.CertificateChain[0][0], 'the listed chain was a copy');
+  LListed[0].OcspStaple[0] := $00;
+  CheckTrue(LResolver.TryResolve(LHello, LResolved), 'the entry resolves after the staple edit');
+  CheckEquals($30, LResolved.OcspStaple[0], 'the listed staple was a copy');
+end;
+
+procedure TTestTls13Loopback.TestCredentialSetOfASingleCredentialListsOne;
+var
+  LSet: ITlsServerCredentialSet;
+  LListed: TArray<TTlsCredential>;
+begin
+  CheckTrue(Supports(TSniCredentialResolver.ForCredential(ServerCredential),
+    ITlsServerCredentialSet, LSet), 'the single-credential resolver lists its set');
+  LListed := LSet.Credentials;
+  CheckEquals(1, System.Length(LListed), 'only the default');
 end;
 
 procedure TTestTls13Loopback.TestEd448ServerCredentialHandshake;

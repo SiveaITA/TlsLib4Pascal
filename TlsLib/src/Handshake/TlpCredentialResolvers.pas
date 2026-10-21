@@ -17,8 +17,10 @@ interface
 
 uses
   SysUtils,
+  TlpArrayUtilities,
   TlpTlsCredential,
   TlpITlsCredentialResolver,
+  TlpITlsServerCredentialSet,
   TlpEndpointIdentity,
   TlpServerName;
 
@@ -40,7 +42,8 @@ type
   /// machine then aborts). Immutable after construction, so concurrent use across the peers of
   /// one frozen configuration needs no lock.
   /// </summary>
-  TSniCredentialResolver = class sealed(TInterfacedObject, ITlsServerCredentialResolver)
+  TSniCredentialResolver = class sealed(TInterfacedObject, ITlsServerCredentialResolver,
+    ITlsServerCredentialSet)
   strict private
     FEntries: TArray<TSniCredentialEntry>;
     FDefault: TTlsCredential;
@@ -62,6 +65,10 @@ type
       const AEntries: TArray<TSniCredentialEntry>): ITlsServerCredentialResolver; static;
     function TryResolve(const AClientHello: TTlsClientHelloInfo;
       out ACredential: TTlsCredential): Boolean;
+    /// <summary>The default (when one was supplied) then each entry in order, in a new array, with
+    /// no deduplication. The chains and staples are copies the caller may change; the keys and
+    /// the OcspStapleCallback are shared with the resolver.</summary>
+    function Credentials: TArray<TTlsCredential>;
   end;
 
 implementation
@@ -134,6 +141,17 @@ begin
     Exit(True);
   end;
   Result := False;
+end;
+
+function TSniCredentialResolver.Credentials: TArray<TTlsCredential>;
+var
+  LI: Integer;
+begin
+  Result := nil;
+  if FHasDefault then
+    TArrayUtilities.Append<TTlsCredential>(Result, FDefault.Clone);
+  for LI := 0 to System.High(FEntries) do
+    TArrayUtilities.Append<TTlsCredential>(Result, FEntries[LI].Credential.Clone);
 end;
 
 end.

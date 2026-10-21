@@ -22,7 +22,7 @@ no platform-specific trust code.
 |---|---|
 | `SystemTrustDemo.dpr` | Program. Compiles the core, `TlsLib.Trust.System` and the Indy adapter from source via the search path. |
 | `SystemTrustDemoFormUnit.pas` / `.fmx` | The form: a URL box, a button and a log. It runs the demo off the UI thread and shows the lines it returns. No platform-specific trust code. |
-| `SystemTrustDemoRunner.pas` | Everything the demo does: the OS-verified GET, then the offline OS-delegate checks below; also the host-roots cells. |
+| `SystemTrustDemoRunner.pas` | Everything the demo does: the OS-verified GET, then the offline OS-delegate checks below; also the OS-and-host-roots cells. |
 
 ## Building it (RAD Studio, author side)
 
@@ -65,11 +65,11 @@ headless build scripts.
   closed** (rejects with `unknown_ca`/`certificate_expired`); rejection reasons are written to
   logcat under the `TlsLib` tag.
 
-## Host roots cells
+## OS and host roots cells
 
-Tap **Host roots beside OS roots** to run the host-roots cells. Each cell fetches a live site
-with the demo's own root passed beside the OS roots (the rule is in `docs/system-trust.md`,
-"Host roots beside the OS roots") and prints `PASS:`, `FAIL:` or `SKIP:` (offline) against what
+Tap **OS and host roots** to run the OS-and-host-roots cells. Each cell fetches a live site
+with the demo's own root passed with the OS roots (the rule is in `docs/system-trust.md`,
+"OS and host roots") and prints `PASS:`, `FAIL:` or `SKIP:` (offline) against what
 the cell expects. The log heading names the mode that ran: `Default = Delegate (OS engine)`, and
 on Windows and macOS also `Anchors`. Android and iOS have only the Delegate mode.
 
@@ -84,7 +84,7 @@ on Windows and macOS also `Anchors`. Android and iOS have only the Delegate mode
 | `letsencrypt.org` (Android only, wrong network-security-config pin) | ISRG Root X1, the OS root it chains to | refused |
 | `self-signed.badssl.com` (Android only, listed in the network-security-config) | its own certificate | refused (host roots do not apply to a host a `<domain-config>` names) |
 
-On a phone, a `FAIL:` on the second cell means the host root was not trusted beside the OS roots;
+On a phone, a `FAIL:` on the second cell means the host root was not trusted with the OS roots;
 a `FAIL:` on any refused cell means a final failure (expiry, name, untrusted, pin, or a domain-configured host) was rescued.
 The `letsencrypt.org` cell passes the same root the site already chains to, so the host root would
 accept it if the pin failure were not final. Both network-security-config cells print `SKIP:` off
@@ -109,7 +109,7 @@ template. `-Remove` undoes it.
 ### Android CT refuses host roots (Android 16+)
 
 To reproduce, add `<base-config><certificateTransparency enabled="true"/></base-config>` to
-`res/xml/network_security_config.xml`, rebuild, and run the host roots cells: the
+`res/xml/network_security_config.xml`, rebuild, and run the OS and host roots cells: the
 `untrusted-root.badssl.com` cell with its own root is refused (alert 48) because the private-root chain
 carries no SCTs. Remove the element again afterwards.
 

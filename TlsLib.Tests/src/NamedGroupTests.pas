@@ -48,6 +48,7 @@ type
   private
     function SecretBytes(const ASecret: ISecretBuffer): TBytes;
     function Zeros(ALength: Int32): TBytes;
+    procedure CheckNistEcdhRefused(const AName, AMsg: string);
     // full KEM round-trip: A generates, B encapsulates, A decapsulates, secrets match
     procedure CheckAgreement(const AGroup: INamedGroup; AExpectedSecretLen: Int32);
     /// <summary>Decapsulate on ABadShare must reject with a contained exception that
@@ -88,9 +89,19 @@ type
     procedure TestMlKemDecapsulateRejectsWrongLengthCiphertext;
     procedure TestMlKemBackendDecapsulationFaultIsInternalError;
     procedure TestRegistry;
+    procedure TestCreateRegistryPreservesGivenOrder;
+    procedure TestCreateRegistryLooksUpByCode;
+    procedure TestCreateRegistryKeepsFirstOfDuplicateCode;
+    procedure TestCreateRegistryEmptyArrayGivesEmptyRegistry;
+    procedure TestCreateRegistryRejectsNilGroup;
     procedure TestClassicalRegistryOmitsPostQuantum;
     procedure TestGroupKindClassifiesEcdheKemHybrid;
     procedure TestOnlyEcdheGroupsAreTls12Eligible;
+    procedure TestCatalogCompositionOfEachClassicalGroup;
+    procedure TestCatalogCompositionOfTheKemAndHybridGroups;
+    procedure TestCatalogCompositionAgreesWithTheBuiltGroups;
+    procedure TestCatalogCompositionRefusesAnUnknownCode;
+    procedure TestNistEcdhRefusesNamesThatAreNotPlainEcdhe;
     procedure TestKeyImportExportRoundTrip;
     procedure TestStaticUsageAgreesLikeEphemeral;
     procedure TestX25519ImportUnclampedScalar;
@@ -607,6 +618,68 @@ begin
   CheckFalse(LReg.TryGet($FFFF, LGroup), 'unknown code is not found');
 end;
 
+procedure TTestNamedGroups.TestCreateRegistryPreservesGivenOrder;
+var
+  LReg: INamedGroupRegistry;
+  LItems: TArray<INamedGroup>;
+begin
+  LReg := TNamedGroups.CreateRegistry(TArray<INamedGroup>.Create(
+    TNamedGroups.CreateNistEcdh(Crypto, 'secp384r1'), TNamedGroups.CreateX25519(Crypto)));
+  LItems := LReg.Items;
+  CheckEquals(2, System.Length(LItems), 'exactly the given groups');
+  CheckEquals(TNamedGroupCatalog.Secp384r1, LItems[0].Code, 'first given group first');
+  CheckEquals(TNamedGroupCatalog.X25519, LItems[1].Code, 'second given group second');
+end;
+
+procedure TTestNamedGroups.TestCreateRegistryLooksUpByCode;
+var
+  LReg: INamedGroupRegistry;
+  LGroup: INamedGroup;
+begin
+  LReg := TNamedGroups.CreateRegistry(TArray<INamedGroup>.Create(
+    TNamedGroups.CreateX25519(Crypto)));
+  CheckTrue(LReg.TryGet(TNamedGroupCatalog.X25519, LGroup), 'given code found');
+  CheckEquals('X25519', LGroup.Name, 'lookup returns the group');
+  CheckFalse(LReg.Contains(TNamedGroupCatalog.Secp256r1), 'a group not given is absent');
+end;
+
+procedure TTestNamedGroups.TestCreateRegistryKeepsFirstOfDuplicateCode;
+var
+  LReg: INamedGroupRegistry;
+  LFirst, LSecond, LFound: INamedGroup;
+begin
+  LFirst := TNamedGroups.CreateX25519(Crypto);
+  LSecond := TNamedGroups.CreateX25519(Crypto);
+  LReg := TNamedGroups.CreateRegistry(TArray<INamedGroup>.Create(LFirst, LSecond));
+  CheckEquals(1, System.Length(LReg.Items), 'one entry for the repeated code');
+  CheckTrue(LReg.TryGet(TNamedGroupCatalog.X25519, LFound), 'code present');
+  CheckTrue(LFound = LFirst, 'the first entry wins');
+end;
+
+procedure TTestNamedGroups.TestCreateRegistryEmptyArrayGivesEmptyRegistry;
+var
+  LReg: INamedGroupRegistry;
+begin
+  LReg := TNamedGroups.CreateRegistry(nil);
+  CheckEquals(0, System.Length(LReg.Items), 'no groups');
+  CheckFalse(LReg.Contains(TNamedGroupCatalog.X25519), 'nothing registered');
+end;
+
+procedure TTestNamedGroups.TestCreateRegistryRejectsNilGroup;
+var
+  LRaised: Boolean;
+begin
+  LRaised := False;
+  try
+    TNamedGroups.CreateRegistry(TArray<INamedGroup>.Create(
+      TNamedGroups.CreateX25519(Crypto), nil));
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, 'a nil group is an argument error');
+end;
+
 procedure TTestNamedGroups.TestClassicalRegistryOmitsPostQuantum;
 var
   LReg: INamedGroupRegistry;
@@ -651,6 +724,105 @@ begin
   CheckFalse(LGroup.Kind = TNamedGroupKind.Ecdhe, 'ML-KEM is not 1.2-eligible');
   CheckTrue(LReg.TryGet(TNamedGroupCatalog.Secp256r1, LGroup), 'secp256r1 present');
   CheckTrue(LGroup.Kind = TNamedGroupKind.Ecdhe, 'secp256r1 is 1.2-eligible');
+end;
+
+procedure TTestNamedGroups.TestCatalogCompositionOfEachClassicalGroup;
+var
+  LComposition: TNamedGroupComposition;
+begin
+  CheckTrue(TNamedGroupCatalog.TryComposition(TNamedGroupCatalog.X25519, LComposition),
+    'X25519 is built in');
+  CheckTrue(LComposition.Kind = TNamedGroupKind.Ecdhe, 'X25519 kind');
+  CheckTrue(LComposition.KeyAgreement = TKeyAgreementAlgorithm.X25519, 'X25519 agreement');
+  CheckTrue(TNamedGroupCatalog.TryComposition(TNamedGroupCatalog.Secp256r1, LComposition),
+    'secp256r1 is built in');
+  CheckTrue(LComposition.Kind = TNamedGroupKind.Ecdhe, 'secp256r1 kind');
+  CheckTrue(LComposition.KeyAgreement = TKeyAgreementAlgorithm.SECP256R1,
+    'secp256r1 agreement');
+  CheckTrue(TNamedGroupCatalog.TryComposition(TNamedGroupCatalog.Secp384r1, LComposition),
+    'secp384r1 is built in');
+  CheckTrue(LComposition.Kind = TNamedGroupKind.Ecdhe, 'secp384r1 kind');
+  CheckTrue(LComposition.KeyAgreement = TKeyAgreementAlgorithm.SECP384R1,
+    'secp384r1 agreement');
+  CheckTrue(TNamedGroupCatalog.TryComposition(TNamedGroupCatalog.Secp521r1, LComposition),
+    'secp521r1 is built in');
+  CheckTrue(LComposition.Kind = TNamedGroupKind.Ecdhe, 'secp521r1 kind');
+  CheckTrue(LComposition.KeyAgreement = TKeyAgreementAlgorithm.SECP521R1,
+    'secp521r1 agreement');
+end;
+
+procedure TTestNamedGroups.TestCatalogCompositionOfTheKemAndHybridGroups;
+var
+  LComposition: TNamedGroupComposition;
+begin
+  CheckTrue(TNamedGroupCatalog.TryComposition(TNamedGroupCatalog.MlKem768, LComposition),
+    'ML-KEM-768 is built in');
+  CheckTrue(LComposition.Kind = TNamedGroupKind.Kem, 'ML-KEM-768 kind');
+  CheckTrue(LComposition.Kem = TKemAlgorithm.ML_KEM_768, 'ML-KEM-768 kem');
+  CheckTrue(TNamedGroupCatalog.TryComposition(TNamedGroupCatalog.X25519MlKem768,
+    LComposition), 'X25519MLKEM768 is built in');
+  CheckTrue(LComposition.Kind = TNamedGroupKind.Hybrid, 'X25519MLKEM768 kind');
+  CheckTrue(LComposition.KeyAgreement = TKeyAgreementAlgorithm.X25519,
+    'X25519MLKEM768 agreement');
+  CheckTrue(LComposition.Kem = TKemAlgorithm.ML_KEM_768, 'X25519MLKEM768 kem');
+  CheckTrue(TNamedGroupCatalog.TryComposition(TNamedGroupCatalog.SecP256r1MlKem768,
+    LComposition), 'SecP256r1MLKEM768 is built in');
+  CheckTrue(LComposition.Kind = TNamedGroupKind.Hybrid, 'SecP256r1MLKEM768 kind');
+  CheckTrue(LComposition.KeyAgreement = TKeyAgreementAlgorithm.SECP256R1,
+    'SecP256r1MLKEM768 agreement');
+  CheckTrue(LComposition.Kem = TKemAlgorithm.ML_KEM_768, 'SecP256r1MLKEM768 kem');
+end;
+
+procedure TTestNamedGroups.TestCatalogCompositionAgreesWithTheBuiltGroups;
+var
+  LGroup: INamedGroup;
+  LComposition: TNamedGroupComposition;
+begin
+  // only the two hybrid rows are independent evidence: every other group reads its composition
+  // from the same table, while a hybrid derives its own from its legs
+  CheckEquals(7, System.Length(TNamedGroups.CreateDefaultRegistry(Crypto).Items),
+    'the default registry holds every built-in group');
+  for LGroup in TNamedGroups.CreateDefaultRegistry(Crypto).Items do
+  begin
+    CheckTrue(TNamedGroupCatalog.TryComposition(LGroup.Code, LComposition),
+      LGroup.Name + ' is in the catalog');
+    CheckTrue(LGroup.Composition.Kind = LComposition.Kind, LGroup.Name + ' kind');
+    if LComposition.Kind <> TNamedGroupKind.Kem then
+      CheckTrue(LGroup.Composition.KeyAgreement = LComposition.KeyAgreement,
+        LGroup.Name + ' agreement');
+    if LComposition.Kind <> TNamedGroupKind.Ecdhe then
+      CheckTrue(LGroup.Composition.Kem = LComposition.Kem, LGroup.Name + ' kem');
+  end;
+end;
+
+procedure TTestNamedGroups.TestCatalogCompositionRefusesAnUnknownCode;
+var
+  LComposition: TNamedGroupComposition;
+begin
+  CheckFalse(TNamedGroupCatalog.TryComposition($FFFF, LComposition),
+    'a code outside the built-in groups');
+  CheckFalse(TNamedGroupCatalog.TryComposition(0, LComposition), 'code zero');
+end;
+
+procedure TTestNamedGroups.TestNistEcdhRefusesNamesThatAreNotPlainEcdhe;
+begin
+  CheckNistEcdhRefused('ML-KEM-768', 'a KEM name is not an ECDHE group');
+  CheckNistEcdhRefused('X25519MLKEM768', 'a hybrid name is not an ECDHE group');
+  CheckNistEcdhRefused('secp999r1', 'an unknown name is not a group');
+end;
+
+procedure TTestNamedGroups.CheckNistEcdhRefused(const AName, AMsg: string);
+var
+  LRaised: Boolean;
+begin
+  LRaised := False;
+  try
+    TNamedGroups.CreateNistEcdh(Crypto, AName);
+  except
+    on E: EArgumentTlsLibException do
+      LRaised := True;
+  end;
+  CheckTrue(LRaised, AMsg);
 end;
 
 initialization

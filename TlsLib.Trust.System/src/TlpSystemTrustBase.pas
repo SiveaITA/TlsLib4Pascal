@@ -31,6 +31,7 @@ uses
   TlpITrustAnchorStore,
   TlpTrustAnchorStore,
   TlpTrustTypes,
+  TlpTlsLibExceptions,
   TlpSystemTrustExceptions;
 
 resourcestring
@@ -44,8 +45,24 @@ resourcestring
   SNoLiveRevocation =
     'this platform has no OS-native live revocation (only Windows and Apple do); keep cache-only ' +
     'trust and compose the portable live-revocation checker for a live check here';
-  SEngineCannotTrustHostRoots =
-    'this platform engine cannot trust host roots beside the OS roots';
+  SEngineCannotTrustOsAndHostRoots =
+    'this platform engine cannot trust OS and host roots together';
+  SHostRootsNeedRoots =
+    'HostRoots needs at least one root certificate (after the OS distrust list is applied)';
+  SLiveNeedsKnownRoots =
+    'the live revocation resolver cannot tell which roots the configured server verifier source ' +
+    'trusts; use the OS verifier source or a trust store, or pass the OS source it wraps';
+  SLiveNeedsServerVerification =
+    'the live revocation resolver needs a client config that verifies the server certificate; ' +
+    'this one has no trust store or OS verifier source (a PSK-only or skip-verify config)';
+  SLiveRootsOfSourceDiffers =
+    'the roots source passed to the live revocation resolver is not the OS verifier source the ' +
+    'client config uses';
+  SLiveRootsOfNeedsOsSource =
+    'the live revocation resolver reads its roots off the OS verifier source; the roots source ' +
+    'passed is not one';
+  SEngineCannotTrustHostRootsAlone =
+    'this platform engine cannot trust host roots alone (no exclusive server roots)';
 
 type
   /// <summary>
@@ -57,6 +74,10 @@ type
   /// </summary>
   TSystemTrustFetch = (CacheOnly, Live);
 
+  /// <summary>Whether host roots are trusted with the OS roots (OsAndHostRoots) or alone, so
+  /// the OS roots never vouch for a chain (HostRoots).</summary>
+  TSystemTrustRootScope = (OsAndHostRoots, HostRoots);
+
   /// <summary>What a platform chain engine can do beyond building and trusting a path. LiveFetch: it
   /// can re-evaluate with network revocation fetch on (the async park's live check). CachedRevocation:
   /// it renders a revocation outcome of its own from its cache and the handshake staple, so the inline
@@ -64,9 +85,10 @@ type
   /// revocation source. DnsIdentity: it matches a DNS host itself, so the host is withheld when the
   /// name check is off; the library matches the SAN identity (SAN-only, RFC 9525) regardless, for
   /// both DnsIdentity and chain-only engines. NativeAnchorUnion: one server evaluation trusts
-  /// ExtraAnchors beside the platform's own roots; without it the delegate retries a no-trust-anchor
+  /// ExtraAnchors with the platform's own roots; without it the delegate retries a no-trust-anchor
   /// failure with the host roots as the exclusive root. ExclusiveServerAnchors: the server evaluation
-  /// honours Anchors as its exclusive root, so host roots can be retried there.</summary>
+  /// honours Anchors as its exclusive root, so host roots can be retried there or trusted alone; a
+  /// server request with Anchors is refused on an engine without it.</summary>
   TPlatformChainCapability = (LiveFetch, CachedRevocation, DnsIdentity, NativeAnchorUnion,
     ExclusiveServerAnchors);
   TPlatformChainCapabilities = set of TPlatformChainCapability;
@@ -78,13 +100,15 @@ type
   TPlatformRevocationCheck = (None, BestEffort, RequirePositive);
 
   /// <summary>One platform chain evaluation. Chain is the peer chain (leaf first, DER). Anchors is the
-  /// exclusive trust root of a client-certificate evaluation (empty on the server path, where the OS
-  /// roots apply). Intermediates are the configured extra certificates, offered to path building as
-  /// untrusted candidates beside the presented chain. ExtraAnchors are host roots trusted beside the
-  /// OS roots on the server path (read only by an engine with the NativeAnchorUnion capability;
-  /// ignored when Anchors is set). ServerName is the server-path identity (the
-  /// engine reads AsDns or ToString as its platform requires; empty on the client path). OcspStaple is consumed as cached revocation data
-  /// where the platform can. NetworkAllowed is False inline (no socket) and True only from the
+  /// exclusive trust root: a client-certificate evaluation, a HostRoots server source, the
+  /// live re-check of a client config that trusts its store roots (WebPki), or the retry with the
+  /// host roots alone (empty on the other server paths, where the OS roots apply). Intermediates
+  /// are the configured extra certificates, offered to path building as untrusted candidates
+  /// beside the presented chain. ExtraAnchors are host roots trusted with the OS roots on the server path
+  /// (read only by an engine with the NativeAnchorUnion capability; ignored when Anchors is set).
+  /// ServerName is the server-path identity (the engine reads AsDns or ToString as its platform
+  /// requires; empty on the client path). OcspStaple is consumed as cached revocation data where
+  /// the platform can. NetworkAllowed is False inline (no socket) and True only from the
   /// off-engine-thread park. Clock nil means platform time; Android ignores it and validates at device
   /// time. DeadlineMs bounds a network fetch where the platform honours one.</summary>
   TPlatformChainRequest = record
@@ -107,9 +131,11 @@ type
 
   /// <summary>What the engine reports when the platform built a path: the revocation outcome it
   /// rendered (Indeterminate for an engine without CachedRevocation), the leaf-first path it built
-  /// (empty where the platform reports none), and the certificates the strength policy skips (the OS
-  /// anchor, or the configured client-CA anchors where the path is the presented chain). On a
-  /// rejection only Failure is meaningful.</summary>
+  /// (empty where the platform reports none), and the trust anchors whose signature and hash the
+  /// strength policy skips (the OS anchor, or the configured client-CA anchors where the path is
+  /// the presented chain); an exempt anchor's key is checked when the policy sets AnchorKeyFloors.
+  /// An engine that reports none leaves the configured client-CA anchors to be key-checked by the
+  /// delegate instead. On a rejection only Failure is meaningful.</summary>
   TPlatformChainResult = record
     Outcome: TLiveRevocationOutcome;
     Path: TArray<TBytes>;
@@ -201,6 +227,9 @@ type
     /// <summary>The certificates the platform explicitly distrusts (raw DER), read in the same
     /// Snapshot as HarvestRoots and possibly collected by that read. Default none.</summary>
     function HarvestDistrusted: TArray<TBytes>; virtual;
+    /// <summary>The platform's distrusted certificates (raw DER) read without a harvest, which
+    /// ReadDistrusted de-duplicates. Default none.</summary>
+    function CollectDistrusted: TArray<TBytes>; virtual;
     /// <summary>Human-readable source label, used in the fail-closed message.</summary>
     function SourceName: string; virtual; abstract;
     /// <summary>The PKIX provider, for subclasses that must parse (e.g. PEM).</summary>
@@ -215,14 +244,18 @@ type
     /// accumulator and returns the filtered anchors; the whole-array harvesters share it
     /// (a streaming source calls AddUnique directly instead).</summary>
     function FilterRoots(const ARaw: TArray<TBytes>): TArray<TBytes>;
+    /// <summary>ARaw with exact duplicates dropped and nothing else: distrust is matched by exact
+    /// bytes, so an entry the provider cannot parse must still be kept.</summary>
+    function DistinctDistrusted(const ARaw: TArray<TBytes>): TArray<TBytes>;
   public
     constructor Create(const APkix: IPkixProvider);
     /// <summary>Reads the source now. Fail-closed: an empty or unreadable source
     /// raises ESystemTrustUnavailableTlsLibException; a non-empty result is returned
     /// as harvested.</summary>
     function Harvest: TArray<TBytes>;
-    /// <summary>The distrusted certificates alone, read without parsing the roots. Default none.</summary>
-    function ReadDistrusted: TArray<TBytes>; virtual;
+    /// <summary>The distrusted certificates alone, read without parsing the roots and de-duplicated
+    /// like a snapshot's distrust set.</summary>
+    function ReadDistrusted: TArray<TBytes>;
     /// <summary>Harvests now and freezes the result into an immutable anchor store.</summary>
     function Snapshot: ITrustAnchorStore;
   end;
@@ -395,7 +428,7 @@ constructor TSystemRootSourceBase.Create(const APkix: IPkixProvider);
 begin
   inherited Create;
   if APkix = nil then
-    raise ESystemTrustUnavailableTlsLibException.CreateRes(@SNoProvider);
+    raise EArgumentTlsLibException.CreateRes(@SNoProvider);
   FPkix := APkix;
 end;
 
@@ -423,6 +456,22 @@ begin
   end;
 end;
 
+function TSystemRootSourceBase.DistinctDistrusted(const ARaw: TArray<TBytes>): TArray<TBytes>;
+var
+  LAcc: TSystemRootAccumulator;
+  LI: Integer;
+begin
+  Result := nil;
+  LAcc := TSystemRootAccumulator.Create;
+  try
+    for LI := 0 to Length(ARaw) - 1 do
+      LAcc.Add(ARaw[LI]);
+    Result := LAcc.ToArray;
+  finally
+    LAcc.Free;
+  end;
+end;
+
 function TSystemRootSourceBase.Harvest: TArray<TBytes>;
 begin
   Result := HarvestRoots;
@@ -436,9 +485,14 @@ begin
   Result := nil;
 end;
 
-function TSystemRootSourceBase.ReadDistrusted: TArray<TBytes>;
+function TSystemRootSourceBase.CollectDistrusted: TArray<TBytes>;
 begin
   Result := nil;
+end;
+
+function TSystemRootSourceBase.ReadDistrusted: TArray<TBytes>;
+begin
+  Result := DistinctDistrusted(CollectDistrusted);
 end;
 
 function TSystemRootSourceBase.Snapshot: ITrustAnchorStore;
@@ -446,10 +500,10 @@ var
   LRoots: TArray<TBytes>;
 begin
   // a failed harvest raises here, before any store is built; the distrust set is read after the
-  // roots so a source that collects it while harvesting has it ready, and is filtered the same way
+  // roots so a source that collects it while harvesting has it ready, and is de-duplicated
   LRoots := Harvest;
   Result := TTrustAnchorStore.Create(LRoots,
-    FilterRoots(HarvestDistrusted)) as ITrustAnchorStore;
+    DistinctDistrusted(HarvestDistrusted)) as ITrustAnchorStore;
   // a source whose every root is also distrusted would leave no anchor at all: fail closed here
   // rather than hand back a store that only ever answers unknown_ca
   if Result.AnchorCount = 0 then

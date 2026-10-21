@@ -35,6 +35,8 @@ uses
   TlpRecordProtection,
   TlpIKeySchedule,
   TlpTls12KeySchedule,
+  TlpTls12PrfLabels,
+  TlpExporterArgs,
   TlpTlsLibExceptions,
   TlsLibTestBase;
 
@@ -49,6 +51,9 @@ type
     procedure TestVerifyDataComputeAndReject;
     procedure TestExporterIsDeterministic;
     procedure TestExporterRejectsBadArgs;
+    procedure TestPrfLabelsArePinned;
+    procedure TestOnlyTheFiveLabelsAreKeyScheduleLabels;
+    procedure TestExporterRefusesEveryKeyScheduleLabel;
     procedure TestForgetKeepsMasterForExporterAndReleasesKeyBlock;
     procedure TestDeriveMasterTwiceRaises;
     procedure TestDeriveMasterAfterSetMasterRaises;
@@ -199,6 +204,54 @@ begin
   // RFC 5705 imposes no minimum label length, so an empty label is accepted
   CheckEquals(32, System.Length(LSched.ExportKeyingMaterial('', 32)),
     'an empty label is accepted for TLS 1.2');
+end;
+
+procedure TTestTls12KeySchedule.TestPrfLabelsArePinned;
+begin
+  CheckEquals('master secret', TTls12PrfLabels.MasterSecret, 'master secret');
+  CheckEquals('extended master secret', TTls12PrfLabels.ExtendedMasterSecret,
+    'extended master secret');
+  CheckEquals('key expansion', TTls12PrfLabels.KeyExpansion, 'key expansion');
+  CheckEquals('client finished', TTls12PrfLabels.ClientFinished, 'client finished');
+  CheckEquals('server finished', TTls12PrfLabels.ServerFinished, 'server finished');
+end;
+
+procedure TTestTls12KeySchedule.TestOnlyTheFiveLabelsAreKeyScheduleLabels;
+begin
+  CheckTrue(TTls12PrfLabels.IsKeyScheduleLabel(TTls12PrfLabels.MasterSecret), 'master secret');
+  CheckTrue(TTls12PrfLabels.IsKeyScheduleLabel(TTls12PrfLabels.ExtendedMasterSecret),
+    'extended master secret');
+  CheckTrue(TTls12PrfLabels.IsKeyScheduleLabel(TTls12PrfLabels.KeyExpansion), 'key expansion');
+  CheckTrue(TTls12PrfLabels.IsKeyScheduleLabel(TTls12PrfLabels.ClientFinished),
+    'client finished');
+  CheckTrue(TTls12PrfLabels.IsKeyScheduleLabel(TTls12PrfLabels.ServerFinished),
+    'server finished');
+  CheckFalse(TTls12PrfLabels.IsKeyScheduleLabel(''), 'the empty label');
+  CheckFalse(TTls12PrfLabels.IsKeyScheduleLabel('EXPORTER-test'), 'an exporter label');
+  CheckFalse(TTls12PrfLabels.IsKeyScheduleLabel('Master Secret'), 'labels are case-sensitive');
+  CheckFalse(TTls12PrfLabels.IsKeyScheduleLabel('master secret '), 'labels match exactly');
+end;
+
+procedure TTestTls12KeySchedule.TestExporterRefusesEveryKeyScheduleLabel;
+const
+  Labels: array [0 .. 4] of string = (TTls12PrfLabels.MasterSecret,
+    TTls12PrfLabels.ExtendedMasterSecret, TTls12PrfLabels.KeyExpansion,
+    TTls12PrfLabels.ClientFinished, TTls12PrfLabels.ServerFinished);
+var
+  LI: Int32;
+  LRaised: Boolean;
+begin
+  for LI := Low(Labels) to High(Labels) do
+  begin
+    LRaised := False;
+    try
+      TExporterArgs.Guard(Labels[LI], 32);
+    except
+      on EArgumentTlsLibException do
+        LRaised := True;
+    end;
+    CheckTrue(LRaised, Labels[LI]);
+  end;
 end;
 
 procedure TTestTls12KeySchedule.TestForgetKeepsMasterForExporterAndReleasesKeyBlock;

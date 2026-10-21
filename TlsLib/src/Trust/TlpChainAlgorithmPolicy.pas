@@ -32,28 +32,40 @@ type
   /// 4.5.1.2, RFC 5246 7.4.2 / 7.4.4 / 7.4.6), an MD5-signed certificate is refused
   /// outright and a SHA-1-signed one unless the policy admits it (RFC 9846 4.5.1.3), and each
   /// subject key must meet the configured minimum-strength floors. A configured trust anchor is
-  /// exempt (its self-signature is not a validated edge and its key
-  /// is the operator's trust); the leaf never is. Verdict-only: it decides accept/reject and the
-  /// alert, reading facts from the provider's certificate inspector so no ASN.1 is handled here.
+  /// exempt (its self-signature is not a validated edge and its key is the operator's trust)
+  /// unless the policy's AnchorKeyFloors holds its key to the floors; the leaf never is exempt.
+  /// It only decides accept/reject and the alert, reading facts from the provider's certificate
+  /// inspector so no ASN.1 is handled here.
   /// </summary>
   TChainAlgorithmPolicy = class sealed(TObject)
   strict private
     class function IsAnchor(const ADer: TBytes; const ARoots: TArray<TBytes>): Boolean; static;
-    class function RequiredScheme(AFamily: TCertSignatureFamily;
-      AHash: TCertSignatureHash; APssCanonical: Boolean;
-      AIssuerKeyIsPss: Boolean): UInt16; static;
     class function LegacySha1Scheme(AFamily: TCertSignatureFamily): UInt16; static;
-    class function KeyMeetsPolicy(const AFacts: TCertKeyFacts;
-      const APolicy: TCertificateStrengthPolicy): Boolean; static;
     class function CheckCertificate(const AInspector: ICertificateInspector;
       const ADer: TBytes; AIssuerKeyIsPss: Boolean;
       const APolicy: TCertificateStrengthPolicy; AFilterSchemes: Boolean;
       const AAdvertised: TArray<UInt16>; out AAlert: TTlsAlertDescription): Boolean; static;
+    class function CheckKey(const ACert: IInspectedCertificate;
+      const APolicy: TCertificateStrengthPolicy; AUnreadable: TTlsAlertDescription;
+      out AAlert: TTlsAlertDescription): Boolean; static;
+    class function CheckAnchorKey(const AInspector: ICertificateInspector;
+      const ADer: TBytes; const APolicy: TCertificateStrengthPolicy;
+      out AAlert: TTlsAlertDescription): Boolean; static;
     class function Walk(const AInspector: ICertificateInspector;
       const AChain, ARoots: TArray<TBytes>;
       const APolicy: TCertificateStrengthPolicy; AFilterSchemes: Boolean;
       const AAdvertised: TArray<UInt16>; out AAlert: TTlsAlertDescription): Boolean; static;
   public
+    /// <summary>
+    /// The one signature scheme that can have signed a certificate with this family and hash, or 0
+    /// when none can: a non-canonical RSA-PSS signature, a hash no scheme names, or a family
+    /// outside the schemes. The hash is ignored for EdDSA. A canonical RSA-PSS signature under a
+    /// PSS-restricted issuer key (AIssuerKeyIsPss) is an rsa_pss_pss_* scheme, otherwise
+    /// rsa_pss_rsae_*; ECDSA is keyed on the hash alone, whatever the issuer curve.
+    /// </summary>
+    class function RequiredScheme(AFamily: TCertSignatureFamily;
+      AHash: TCertSignatureHash; APssCanonical: Boolean;
+      AIssuerKeyIsPss: Boolean): UInt16; static;
     class function Check(const AInspector: ICertificateInspector;
       const AChain, ARoots: TArray<TBytes>;
       const APolicy: TCertificateStrengthPolicy;
@@ -66,10 +78,18 @@ type
       const AChain, ARoots: TArray<TBytes>;
       out AAlert: TTlsAlertDescription): Boolean; static;
     /// <summary>
-    /// Whether we may send AChain: no certificate other than a self-issued one (treated as a path
-    /// start, as RFC 9846 4.3.3 treats a self-signed one) is signed with MD5, or with SHA-1 the peer
-    /// did not advertise in APeerCertSchemes (RFC 9846 4.5.1.2; MD5 inferred from 4.5.1.3). A
-    /// certificate whose signature cannot be determined is not refused.
+    /// Whether every anchor's key meets the key-strength floors; True when APolicy does not set
+    /// AnchorKeyFloors or AAnchors is empty. An anchor that cannot be parsed is bad_certificate;
+    /// one whose key cannot be described or is below the floors is unsupported_certificate.
+    /// </summary>
+    class function AnchorsMeetKeyFloors(const AInspector: ICertificateInspector;
+      const AAnchors: TArray<TBytes>; const APolicy: TCertificateStrengthPolicy;
+      out AAlert: TTlsAlertDescription): Boolean; static;
+    /// <summary>
+    /// Whether we may send AChain: no certificate other than a self-signed one (verifies under its
+    /// own key, RFC 5280 3.2; treated as a path start, as RFC 9846 4.3.3 does) is signed with MD5,
+    /// or with SHA-1 the peer did not advertise in APeerCertSchemes (RFC 9846 4.5.1.2; MD5
+    /// inferred from 4.5.1.3). A certificate whose signature cannot be determined is not refused.
     /// </summary>
     class function SendableTo(const AInspector: ICertificateInspector;
       const AChain: TArray<TBytes>; const APeerCertSchemes: TArray<UInt16>): Boolean; static;
@@ -175,8 +195,8 @@ var
   LI: Int32;
   LCert: IInspectedCertificate;
   LSig: TCertSignatureFacts;
-  LSubject, LIssuer, LCommonName, LSerial: string;
   LScheme: UInt16;
+  LSendable: Boolean;
 begin
   Result := True;
   for LI := 0 to System.High(AChain) do
@@ -188,41 +208,20 @@ begin
     end;
     if not LCert.SignatureFacts(LSig) then
       Continue;
-    // self-issued is treated as a path start, as RFC 9846 4.3.3 treats self-signed
-    if LCert.PeerInfo(LSubject, LIssuer, LCommonName, LSerial) and (LSubject = LIssuer) then
-      Continue;
+    LSendable := True;
     case LSig.Hash.Standing of
       TCertSignatureHashStanding.Forbidden:
-        Exit(False);
+        LSendable := False;
       TCertSignatureHashStanding.Deprecated:
         begin
           LScheme := LegacySha1Scheme(LSig.Family);
-          if (LScheme = 0) or
-            not (TArrayUtilities.Contains<UInt16>(APeerCertSchemes, LScheme)) then
-            Exit(False);
+          LSendable := (LScheme <> 0) and
+            (TArrayUtilities.Contains<UInt16>(APeerCertSchemes, LScheme));
         end;
     end;
-  end;
-end;
-
-class function TChainAlgorithmPolicy.KeyMeetsPolicy(const AFacts: TCertKeyFacts;
-  const APolicy: TCertificateStrengthPolicy): Boolean;
-begin
-  case AFacts.Kind of
-    TSignatureKeyKind.Rsa:
-      Result := (AFacts.Bits >= APolicy.MinRsaModulusBits) and
-        ((APolicy.MaxRsaModulusBits = 0) or (AFacts.Bits <= APolicy.MaxRsaModulusBits));
-    TSignatureKeyKind.Ecdsa:
-      // an empty allowlist admits any curve the provider recognises (a code of 0 is unknown)
-      if System.Length(APolicy.AllowedEcCurves) = 0 then
-        Result := AFacts.EcNamedGroup <> 0
-      else
-        Result := TArrayUtilities.Contains<UInt16>(APolicy.AllowedEcCurves,
-          AFacts.EcNamedGroup);
-    TSignatureKeyKind.Ed25519, TSignatureKeyKind.Ed448:
-      Result := APolicy.AllowEdDsa;
-  else
-    Result := False;
+    // a self-signed certificate (verifies under its own key, RFC 5280 3.2) starts the path
+    if not LSendable and (LCert.IsSelfSigned <> TCertAnswer.Yes) then
+      Exit(False);
   end;
 end;
 
@@ -234,7 +233,6 @@ class function TChainAlgorithmPolicy.CheckCertificate(
 var
   LCert: IInspectedCertificate;
   LSig: TCertSignatureFacts;
-  LKey: TCertKeyFacts;
   LRequired: UInt16;
   LStanding: TCertSignatureHashStanding;
   LAdmitted: Boolean;
@@ -273,16 +271,56 @@ begin
       Exit(False);
     end;
   end;
-  if not LCert.KeyFacts(LKey) then
+  Result := CheckKey(LCert, APolicy, TTlsAlertDescription.BadCertificate, AAlert);
+end;
+
+class function TChainAlgorithmPolicy.CheckKey(const ACert: IInspectedCertificate;
+  const APolicy: TCertificateStrengthPolicy; AUnreadable: TTlsAlertDescription;
+  out AAlert: TTlsAlertDescription): Boolean;
+var
+  LKey: TCertKeyFacts;
+begin
+  if not ACert.KeyFacts(LKey) then
   begin
-    AAlert := TTlsAlertDescription.BadCertificate;
+    AAlert := AUnreadable;
     Exit(False);
   end;
-  if not KeyMeetsPolicy(LKey, APolicy) then
+  if not APolicy.AdmitsKey(LKey) then
   begin
     AAlert := TTlsAlertDescription.UnsupportedCertificate;
     Exit(False);
   end;
+  Result := True;
+end;
+
+class function TChainAlgorithmPolicy.CheckAnchorKey(const AInspector: ICertificateInspector;
+  const ADer: TBytes; const APolicy: TCertificateStrengthPolicy;
+  out AAlert: TTlsAlertDescription): Boolean;
+var
+  LCert: IInspectedCertificate;
+begin
+  try
+    LCert := AInspector.Parse(ADer);
+  except
+    AAlert := TTlsAlertDescription.BadCertificate;
+    Exit(False);
+  end;
+  // a key of a kind the inspector cannot describe is as unusable as a weak one
+  Result := CheckKey(LCert, APolicy, TTlsAlertDescription.UnsupportedCertificate, AAlert);
+end;
+
+class function TChainAlgorithmPolicy.AnchorsMeetKeyFloors(const AInspector: ICertificateInspector;
+  const AAnchors: TArray<TBytes>; const APolicy: TCertificateStrengthPolicy;
+  out AAlert: TTlsAlertDescription): Boolean;
+var
+  LI: Int32;
+begin
+  AAlert := TTlsAlertDescription.BadCertificate;
+  if not APolicy.AnchorKeyFloors then
+    Exit(True);
+  for LI := 0 to System.High(AAnchors) do
+    if not CheckAnchorKey(AInspector, AAnchors[LI], APolicy, AAlert) then
+      Exit(False);
   Result := True;
 end;
 
@@ -313,9 +351,15 @@ begin
   AAlert := TTlsAlertDescription.BadCertificate;
   for LI := 0 to System.Length(AChain) - 1 do
   begin
-    // a configured trust anchor is not a validated edge (RFC 9846 4.3.3); the leaf never is
+    // a configured trust anchor is not a validated edge (RFC 9846 4.3.3), so at most its key is
+    // held to the floors; the leaf is always checked in full
     if (LI > 0) and IsAnchor(AChain[LI], ARoots) then
+    begin
+      if APolicy.AnchorKeyFloors and
+        not CheckAnchorKey(AInspector, AChain[LI], APolicy, AAlert) then
+        Exit(False);
       Continue;
+    end;
     // the signature on this certificate was made by its issuer (the next element); a PSS-restricted
     // issuer key means a rsa_pss_pss_* signature. A missing issuer resolves conservatively to False.
     LIssuerKeyIsPss := (LI + 1 < System.Length(AChain)) and

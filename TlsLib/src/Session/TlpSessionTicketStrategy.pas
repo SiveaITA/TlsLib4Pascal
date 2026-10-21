@@ -80,13 +80,24 @@ type
     function Consume(const ATicket: TBytes): Boolean;
   end;
 
-  /// <summary>Selects the server's ticket strategy: a configured store upgrades the
-  /// stateless STEK default to true single-use handles.</summary>
+  /// <summary>Selects the server's ticket strategy: in TLS 1.3 a configured store upgrades the
+  /// stateless STEK default to true single-use handles; TLS 1.2 tickets are always stateless
+  /// (the store there serves session-id resumption).</summary>
   TSessionTicketStrategies = class sealed(TObject)
+  public const
+    /// <summary>The AEAD that seals a stateless ticket.</summary>
+    TicketAead = TAeadAlgorithm.AES_256_GCM;
+  strict private
+    class function StoreHoldsTickets(AVersion: UInt16;
+      const AStore: ISessionStore): Boolean; static;
   public
-    /// <summary>The store strategy when AStore is set, else the STEK strategy when AKeys
-    /// is set, else nil (resumption disabled).</summary>
-    class function ForServer(const ACryptoProvider: ICryptoProvider;
+    /// <summary>Whether a server negotiating AVersion seals its tickets with AKeys: the keys
+    /// are set and either the version is not TLS 1.3 or no store is configured.</summary>
+    class function SealsWithKeys(AVersion: UInt16; const AKeys: ISessionTicketKeyManager;
+      const AStore: ISessionStore): Boolean; static;
+    /// <summary>The STEK strategy when SealsWithKeys, else the store strategy when AStore holds
+    /// this version's tickets, else nil (no tickets).</summary>
+    class function ForServer(AVersion: UInt16; const ACryptoProvider: ICryptoProvider;
       const AKeys: ISessionTicketKeyManager;
       const AStore: ISessionStore): ISessionTicketStrategy; static;
   end;
@@ -395,13 +406,14 @@ begin
     if System.Length(LPlain) > MaxSerializedSessionLength then
       Exit;
     LNonce := FCrypto.Primitives.GetRandom.GenerateBytes(TicketNonceLength);
-    LAead := FCrypto.Primitives.CreateAead(TAeadAlgorithm.AES_256_GCM);
     try
+      LAead := FCrypto.Primitives.CreateAead(TSessionTicketStrategies.TicketAead);
       LAead.Init(LKey);
       // the key name is authenticated as associated data (it is not secret)
       LCipher := TAeadUtilities.Seal(LAead, LNonce, LKeyName, LPlain);
     except
-      // a custom manager that hands over an unusable key must not fault the handshake; decline to seal
+      // a provider without the ticket AEAD, or a manager handing over an unusable key, must not
+      // fault the handshake; decline to seal
       on E: EBaseTlsLibException do
         Exit;
     end;
@@ -434,7 +446,13 @@ begin
   ASession := nil;
   Result := False;
   LNameLen := FKeys.KeyNameLength;
-  LAead := FCrypto.Primitives.CreateAead(TAeadAlgorithm.AES_256_GCM);
+  try
+    LAead := FCrypto.Primitives.CreateAead(TSessionTicketStrategies.TicketAead);
+  except
+    // a provider without the ticket AEAD reads every ticket as unreadable -> full handshake
+    on E: EBaseTlsLibException do
+      Exit;
+  end;
   // key_name || nonce || ciphertext+tag; reject anything shorter than the framing
   if System.Length(ATicket) < LNameLen + TicketNonceLength + LAead.TagSize then
     Exit;
@@ -472,15 +490,27 @@ end;
 
 { TSessionTicketStrategies }
 
-class function TSessionTicketStrategies.ForServer(const ACryptoProvider: ICryptoProvider;
-  const AKeys: ISessionTicketKeyManager;
+class function TSessionTicketStrategies.StoreHoldsTickets(AVersion: UInt16;
+  const AStore: ISessionStore): Boolean;
+begin
+  // a TLS 1.2 store keys session-id resumption; only TLS 1.3 turns it into ticket handles
+  Result := (AStore <> nil) and (AVersion = TlsWireVersionTls13);
+end;
+
+class function TSessionTicketStrategies.SealsWithKeys(AVersion: UInt16;
+  const AKeys: ISessionTicketKeyManager; const AStore: ISessionStore): Boolean;
+begin
+  Result := (AKeys <> nil) and not StoreHoldsTickets(AVersion, AStore);
+end;
+
+class function TSessionTicketStrategies.ForServer(AVersion: UInt16;
+  const ACryptoProvider: ICryptoProvider; const AKeys: ISessionTicketKeyManager;
   const AStore: ISessionStore): ISessionTicketStrategy;
 begin
-  // a configured store upgrades the stateless STEK default to stateful single-use handles
-  if AStore <> nil then
-    Result := TStoreTicketStrategy.Create(AStore)
-  else if AKeys <> nil then
+  if SealsWithKeys(AVersion, AKeys, AStore) then
     Result := TStekTicketStrategy.Create(ACryptoProvider, AKeys)
+  else if StoreHoldsTickets(AVersion, AStore) then
+    Result := TStoreTicketStrategy.Create(AStore)
   else
     Result := nil;
 end;

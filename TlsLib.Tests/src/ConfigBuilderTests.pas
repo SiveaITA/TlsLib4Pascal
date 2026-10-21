@@ -52,13 +52,16 @@ uses
   TlpINegotiation,
   TlpNegotiationTypes,
   TlpCipherSuiteRegistry,
+  MockNamedGroups,
   TlpNegotiationPolicy,
   TlpSignatureSchemeRegistry,
   TlpINamedGroup,
   TlpNamedGroups,
   TlpTlsCredential,
   TlpTrustPolicy,
+  TlpClientPskPath,
   TlpITlsConfig,
+  TlpITlsServerCredentialSet,
   TlpICertificateCompression,
   TlpICertificateCompressionCache,
   TlpInMemoryCertificateCompressionCache,
@@ -110,6 +113,8 @@ type
     // the EcP256 leaf paired with a foreign private key from ImportKeys.txt (never its own key),
     // so the key does not own the leaf
     function CredentialWithForeignKey(const AKeyField: string): TTlsCredential;
+    // the dual-version suites with the first one's hash altered, held by a host registry
+    function NonCatalogSuiteRegistry: ICipherSuiteRegistry;
     function BuildEchConfigList(AConfigId: Byte; const APublicName: string;
       out APrivateKey: ISecretBuffer): TBytes; overload;
     function BuildEchConfigList(AConfigId: Byte; const APublicName: string;
@@ -132,6 +137,10 @@ type
       const ANames: TArray<TBytes>): string;
     function HardWebPkiServer: IServerVerification;
     function HardWebPkiClient: IClientVerification;
+    // the message of the Build refusal for a server with these client-CA anchors, '' when it builds
+    function ClientAnchorBuildMessage(AUseSource, AFloors: Boolean;
+      const AStore: ITrustAnchorStore): string;
+    function WeakClientAnchor: TBytes;
     function ClientBuildNeedsTls13(const AFacet: ITls13ClientConfigFacet): Boolean;
     function ServerBuildNeedsTls13(const AFacet: ITls13ServerConfigFacet): Boolean;
     /// <summary>Whether Build is refused as invalid operation with AReason in its message.</summary>
@@ -308,6 +317,11 @@ type
     procedure TestPskOnlyClientOfferingTls12IsRefused;
     procedure TestPskOnlyClientWithPskOptionalIsRefused;
     procedure TestPskOnlyTls13ClientBuilds;
+    procedure TestRequiresPskNeedsAKeyAndTheFlag;
+    procedure TestCertificatePathTls13OnlyFollowsTheExternalKeys;
+    procedure TestCertificatePathTls12OnlyFollowsTheTls12Keys;
+    procedure TestCertificatePathBothVersionsNeedBothKeysRequired;
+    procedure TestCertificatePathNoVersionOffered;
     procedure TestServerConfigRequiresCredential;
     procedure TestServerClientAuthRequiresTrustStore;
     // an empty trust store is not a trust source: it must be refused (with a distinct message),
@@ -323,6 +337,14 @@ type
     procedure TestServerClientAuthVerifierSourceWithEmptyStoreIsRefused;
     procedure TestServerClientAuthVerifierSourceWithAnchorsBuilds;
     procedure TestServerClientAuthVerifierSourceWithEmptyStoreAndRealRootBuilds;
+    procedure TestServerWebPkiRefusesAWeakClientAnchorWithFloorsOn;
+    procedure TestServerVerifierSourceRefusesAWeakClientAnchorWithFloorsOn;
+    procedure TestServerBuildsAWeakClientAnchorWithFloorsOff;
+    procedure TestServerBuildsAStrongClientAnchorWithFloorsOn;
+    procedure TestServerBuildsWhenTheWeakClientAnchorIsDistrustedBesideAStrongOne;
+    procedure TestServerRefusesAClientAnchorWithAnUndescribableKey;
+    procedure TestServerMalformedClientAnchorIsReportedBeforeTheFloors;
+    procedure TestClientBuildsWithAWeakRootWhenFloorsAreOn;
     procedure TestServerVerifierSourceWithoutPeerAuthIsRefused;
     procedure TestServerTrustInputsWithoutPeerAuthAreRefused;
     procedure TestMtlsServerWithSuppliedTicketKeysRequiresScope;
@@ -366,6 +388,14 @@ type
     procedure TestServerCredentialWithMismatchedKeyRejected;
     procedure TestServerCredentialWithWrongKeyFamilyRejected;
     procedure TestIncompleteCredentialsAreRefusedAtBuild;
+    procedure TestMalformedLeafCredentialIsRefusedAtBuild;
+    // a host registry skips the default registry's own catalog check, so Build repeats it
+    procedure TestServerCustomSuiteRegistryWithNonCatalogRecordRefused;
+    procedure TestClientCustomSuiteRegistryWithNonCatalogRecordRefused;
+    procedure TestClientCustomSuiteRegistryOfCatalogRecordsBuilds;
+    procedure TestCustomSuiteRegistryWithNonCatalogRecordInListRefused;
+    procedure TestCustomSuiteRegistryWithNonCatalogRecordBesideTls12PskRefused;
+    procedure TestCustomSuiteRegistryOfCatalogRecordsBuilds;
     procedure TestMalformedTrustAnchorIsRefusedAtBuild;
     procedure TestSniCredentialWithMismatchedKeyNamesHost;
     procedure TestClientCredentialWithMismatchedKeyRejected;
@@ -373,6 +403,8 @@ type
     // RFC 9846 4.7.1: a server MUST NOT advertise a ticket lifetime over 604800 seconds
     procedure TestTicketLifetimeAboveCapIsRejected;
     procedure TestTicketLifetimeAtCapIsAccepted;
+    procedure TestPublishedLimitsKeepTheirValues;
+    procedure TestServerConfigCarriesTheDefaultTicketLifetime;
     procedure TestResumptionScopeAboveCapIsRejected;
     procedure TestResumptionScopeAtCapIsAccepted;
     procedure TestClientResumptionScopeAboveCapIsRejected;
@@ -478,6 +510,7 @@ type
     procedure TestServerCompressorsBuildWithOnlyAnSniCredential;
     procedure TestServerCompressorsBuildWithOnlyACredentialResolver;
     procedure TestTicketCountZeroOnTls13OnlyWithNothingSharedStillBuilds;
+    procedure TestComposedCredentialResolverListsDefaultAndSniCredentials;
   end;
 
 implementation
@@ -2671,7 +2704,8 @@ begin
     .Tls12.WithNonEmsResumption(TNonEmsResumption.Resume), 'resumption is off'),
     'a non-EMS resumption mode');
   // restating a default is not a setting
-  CheckTrue(NewServerBuilder.WithResumption(False).WithTicketLifetime(7200)
+  CheckTrue(NewServerBuilder.WithResumption(False)
+    .WithTicketLifetime(TTlsConfigBuilder.DefaultTicketLifetimeSeconds)
     .Tls13.WithTicketCount(2).Build <> nil, 'the default ticket settings build with resumption off');
   // controls: nothing supplied builds, and the same settings build with resumption on
   CheckTrue(NewClientBuilder.WithResumption(False).Build <> nil,
@@ -3236,6 +3270,107 @@ begin
         TTlsLibTestCertificates.EcP256RootStore))).Build).Build;
   CheckEquals(1, System.Length(LConfig.TrustStore.RootCertificates),
     'the union carries the one real root; the empty store contributes none');
+end;
+
+function TTestConfigBuilder.WeakClientAnchor: TBytes;
+begin
+  Result := TTlsLibTestCertificates.Field('Certs/Rsa2048Chain.txt', 'root_cert');
+end;
+
+function TTestConfigBuilder.ClientAnchorBuildMessage(AUseSource, AFloors: Boolean;
+  const AStore: ITrustAnchorStore): string;
+var
+  LStrength: TCertificateStrengthPolicy;
+  LVerification: IClientVerification;
+begin
+  LStrength := TCertificateStrengthPolicy.Defaults;
+  LStrength.MinRsaModulusBits := 3072;
+  LStrength.AnchorKeyFloors := AFloors;
+  if AUseSource then
+    LVerification := TClientVerification.VerifierSource(
+      TAcceptingClientVerifierSource.Create as IClientCertificateVerifierSource, AStore)
+      .WithMinimumStrength(LStrength).Build
+  else
+    LVerification := TClientVerification.WebPki(AStore).WithMinimumStrength(LStrength).Build;
+  Result := '';
+  try
+    TTlsPresets.Compatible(Crypto, Pkix).Server
+      .WithCredential(ServerCredential)
+      .WithPeerAuth(TClientAuthMode.Required)
+      .WithClientVerification(LVerification).Build;
+  except
+    on E: EInvalidOperationTlsLibException do
+      Result := E.Message;
+  end;
+end;
+
+procedure TTestConfigBuilder.TestServerWebPkiRefusesAWeakClientAnchorWithFloorsOn;
+begin
+  CheckTrue(Pos('AnchorKeyFloors', ClientAnchorBuildMessage(False, True,
+    TTrustAnchorStore.Create(TArray<TBytes>.Create(WeakClientAnchor)) as ITrustAnchorStore)) > 0,
+    'an RSA-2048 client-CA anchor is below a 3072-bit floor');
+end;
+
+procedure TTestConfigBuilder.TestServerVerifierSourceRefusesAWeakClientAnchorWithFloorsOn;
+begin
+  CheckTrue(Pos('AnchorKeyFloors', ClientAnchorBuildMessage(True, True,
+    TTrustAnchorStore.Create(TArray<TBytes>.Create(WeakClientAnchor)) as ITrustAnchorStore)) > 0,
+    'the source consumes the same anchors, so it is refused the same way');
+end;
+
+procedure TTestConfigBuilder.TestServerBuildsAWeakClientAnchorWithFloorsOff;
+begin
+  CheckEquals('', ClientAnchorBuildMessage(False, False,
+    TTrustAnchorStore.Create(TArray<TBytes>.Create(WeakClientAnchor)) as ITrustAnchorStore),
+    'the anchor is exempt while the flag is off');
+end;
+
+procedure TTestConfigBuilder.TestServerBuildsAStrongClientAnchorWithFloorsOn;
+begin
+  CheckEquals('', ClientAnchorBuildMessage(False, True, TTlsLibTestCertificates.EcP256RootStore),
+    'a P-256 anchor meets the floors');
+end;
+
+procedure TTestConfigBuilder.TestServerBuildsWhenTheWeakClientAnchorIsDistrustedBesideAStrongOne;
+var
+  LStore: ITrustAnchorStore;
+begin
+  LStore := TTrustAnchorStore.Create(TArray<TBytes>.Create(WeakClientAnchor,
+    TTlsLibTestCertificates.EcP256RootStore.RootCertificates[0]),
+    TArray<TBytes>.Create(WeakClientAnchor)) as ITrustAnchorStore;
+  CheckEquals('', ClientAnchorBuildMessage(False, True, LStore),
+    'a distrusted root is not an anchor, so the floors do not see it');
+end;
+
+procedure TTestConfigBuilder.TestServerRefusesAClientAnchorWithAnUndescribableKey;
+begin
+  CheckTrue(Pos('AnchorKeyFloors', ClientAnchorBuildMessage(False, True,
+    TTrustAnchorStore.Create(TArray<TBytes>.Create(TTlsLibTestCertificates.Field(
+    'Certs/DsaRoot.txt', 'root_cert'))) as ITrustAnchorStore)) > 0,
+    'a DSA anchor key has no floor to meet');
+end;
+
+procedure TTestConfigBuilder.TestServerMalformedClientAnchorIsReportedBeforeTheFloors;
+var
+  LMessage: string;
+begin
+  LMessage := ClientAnchorBuildMessage(False, True, TTrustAnchorStore.Create(
+    TArray<TBytes>.Create(TBytes.Create(1, 2, 3))) as ITrustAnchorStore);
+  CheckTrue(Pos('anchor 0 of trust store 0', LMessage) > 0,
+    'an unparseable anchor gets the malformed-anchor error; got: ' + LMessage);
+end;
+
+procedure TTestConfigBuilder.TestClientBuildsWithAWeakRootWhenFloorsAreOn;
+var
+  LStrength: TCertificateStrengthPolicy;
+begin
+  LStrength := TCertificateStrengthPolicy.Defaults;
+  LStrength.MinRsaModulusBits := 3072;
+  LStrength.AnchorKeyFloors := True;
+  CheckTrue(TTlsPresets.Compatible(Crypto, Pkix).Client.WithServerVerification(
+    TServerVerification.WebPki(TTrustAnchorStore.Create(TArray<TBytes>.Create(WeakClientAnchor))
+    as ITrustAnchorStore).WithMinimumStrength(LStrength).Build).Build <> nil,
+    'a client holds each path to the floors at the handshake, not its roots at Build');
 end;
 
 function TTestConfigBuilder.HardWebPkiServer: IServerVerification;
@@ -4132,6 +4267,135 @@ begin
   CheckTrue(LRaised, 'a client credential with a key but no chain is refused');
 end;
 
+procedure TTestConfigBuilder.TestMalformedLeafCredentialIsRefusedAtBuild;
+var
+  LCredential: TTlsCredential;
+  LBuilder: ITlsConfigBuilder;
+  LMessage: string;
+begin
+  LCredential := ServerCredential;
+  LCredential.CertificateChain := TArray<TBytes>.Create(
+    TArray<Byte>.Create($30, $03, $01, $01, $00));
+  LBuilder := TTlsConfigBuilder.CreateFromProfile(Crypto, Pkix, DefaultProfile);
+  LMessage := '';
+  try
+    LBuilder.Server.WithCredential(LCredential).Build;
+  except
+    on E: EInvalidOperationTlsLibException do
+      LMessage := E.Message;
+  end;
+  CheckTrue(Pos('cannot be parsed', LMessage) > 0, 'a leaf that does not parse is named as such');
+end;
+
+function TTestConfigBuilder.NonCatalogSuiteRegistry: ICipherSuiteRegistry;
+var
+  LSuites: TArray<TTlsCipherSuite>;
+begin
+  LSuites := TCipherSuiteRegistry.CreateDualVersion(Crypto).Items;
+  LSuites[0].Common.Hash := THashAlgorithm.SHA_384;
+  Result := TFakeSuiteRegistry.Create(LSuites) as ICipherSuiteRegistry;
+end;
+
+procedure TTestConfigBuilder.TestServerCustomSuiteRegistryWithNonCatalogRecordRefused;
+var
+  LRegistry: ICipherSuiteRegistry;
+  LMessage: string;
+begin
+  LRegistry := NonCatalogSuiteRegistry;
+  LMessage := '';
+  try
+    NewServerBuilder.WithCipherSuites(LRegistry).Build;
+  except
+    on E: EArgumentTlsLibException do
+      LMessage := E.Message;
+  end;
+  CheckTrue(Pos('differs from the catalog', LMessage) > 0,
+    'a host registry holding a record the catalog defines otherwise is refused');
+  CheckTrue(Pos('0x' + IntToHex(LRegistry.Items[0].Common.Code, 4), LMessage) > 0,
+    'the refusal names the record');
+end;
+
+procedure TTestConfigBuilder.TestClientCustomSuiteRegistryWithNonCatalogRecordRefused;
+var
+  LRegistry: ICipherSuiteRegistry;
+  LMessage: string;
+begin
+  LRegistry := NonCatalogSuiteRegistry;
+  LMessage := '';
+  try
+    NewClientBuilder.WithCipherSuites(LRegistry).Build;
+  except
+    on E: EArgumentTlsLibException do
+      LMessage := E.Message;
+  end;
+  CheckTrue(Pos('differs from the catalog', LMessage) > 0,
+    'a host registry holding a record the catalog defines otherwise is refused');
+  CheckTrue(Pos('0x' + IntToHex(LRegistry.Items[0].Common.Code, 4), LMessage) > 0,
+    'the refusal names the record');
+end;
+
+procedure TTestConfigBuilder.TestClientCustomSuiteRegistryOfCatalogRecordsBuilds;
+begin
+  CheckNotNull(NewClientBuilder.WithCipherSuites(TFakeSuiteRegistry.Create(
+    TCipherSuiteRegistry.CreateDualVersion(Crypto).Items) as ICipherSuiteRegistry).Build,
+    'the refusal case''s suites with the record as the catalog defines it build');
+end;
+
+procedure TTestConfigBuilder.TestCustomSuiteRegistryWithNonCatalogRecordInListRefused;
+var
+  LRegistry: ICipherSuiteRegistry;
+  LMessage: string;
+begin
+  LRegistry := NonCatalogSuiteRegistry;
+  LMessage := '';
+  try
+    NewServerBuilder.WithCipherSuites(LRegistry).WithCipherSuiteList(
+      TArray<UInt16>.Create(LRegistry.Items[0].Common.Code)).Build;
+  except
+    on E: EArgumentTlsLibException do
+      LMessage := E.Message;
+  end;
+  CheckTrue(Pos('differs from the catalog', LMessage) > 0,
+    'a list over a host registry holding such a record is refused');
+end;
+
+procedure TTestConfigBuilder.TestCustomSuiteRegistryWithNonCatalogRecordBesideTls12PskRefused;
+var
+  LPsk: TTls12Psk;
+  LMessage: string;
+begin
+  LPsk.Identity := TBytes.Create($61, $62);
+  LPsk.Secret := TSecretBuffer.From(TBytes.Create($00, $11, $22, $33, $44, $55, $66, $77,
+    $88, $99, $AA, $BB, $CC, $DD, $EE, $FF));
+  LMessage := '';
+  try
+    NewServerBuilder.WithSupportedVersions(TArray<UInt16>.Create(TlsWireVersionTls12))
+      .WithCipherSuites(NonCatalogSuiteRegistry).Tls12.WithPreSharedKeys(
+      TArray<TTls12Psk>.Create(LPsk)).Build;
+  except
+    on E: EArgumentTlsLibException do
+      LMessage := E.Message;
+  end;
+  CheckTrue(Pos('differs from the catalog', LMessage) > 0,
+    'the suites joined for a TLS 1.2 PSK are checked too');
+end;
+
+procedure TTestConfigBuilder.TestCustomSuiteRegistryOfCatalogRecordsBuilds;
+var
+  LSuites: TArray<TTlsCipherSuite>;
+  LUnknown: TTlsCipherSuite;
+  LConfig: ITlsServerConfig;
+begin
+  LSuites := TCipherSuiteRegistry.CreateDualVersion(Crypto).Items;
+  LUnknown := LSuites[0];
+  LUnknown.Common.Code := $C013;
+  TArrayUtilities.Append<TTlsCipherSuite>(LSuites, LUnknown);
+  LConfig := NewServerBuilder.WithCipherSuites(
+    TFakeSuiteRegistry.Create(LSuites) as ICipherSuiteRegistry).Build;
+  CheckEquals(System.Length(LSuites), System.Length(LConfig.CipherSuites.Items),
+    'catalog records and a code the catalog does not know pass through');
+end;
+
 procedure TTestConfigBuilder.TestMalformedTrustAnchorIsRefusedAtBuild;
 var
   LBuilder: ITlsConfigBuilder;
@@ -4233,6 +4497,20 @@ begin
   CheckNotNull(LConfig, 'the boundary ticket lifetime (604800) is accepted');
 end;
 
+procedure TTestConfigBuilder.TestPublishedLimitsKeepTheirValues;
+begin
+  CheckEquals(7200, Integer(TTlsConfigBuilder.DefaultTicketLifetimeSeconds),
+    'default ticket lifetime');
+  CheckEquals(32, Integer(TTlsConfigBuilder.MaxResumptionScopeLength), 'longest scope');
+end;
+
+procedure TTestConfigBuilder.TestServerConfigCarriesTheDefaultTicketLifetime;
+begin
+  CheckEquals(TTlsConfigBuilder.DefaultTicketLifetimeSeconds,
+    TTlsPresets.Compatible(Crypto, Pkix).Server.WithCredential(ServerCredential).Build
+    .TicketLifetimeSeconds, 'a server config that never set a lifetime carries the default');
+end;
+
 procedure TTestConfigBuilder.TestResumptionScopeAboveCapIsRejected;
 var
   LServer: ITlsServerConfigBuilder;
@@ -4241,7 +4519,7 @@ var
 begin
   LServer := TTlsPresets.Compatible(Crypto, Pkix).Server;
   LScope := nil;
-  SetLength(LScope, 33); // one over the 32-byte cap
+  SetLength(LScope, TTlsConfigBuilder.MaxResumptionScopeLength + 1);
   LRaised := False;
   try
     LServer.WithResumptionScope(LScope);
@@ -4258,8 +4536,8 @@ var
   LScope: TBytes;
 begin
   LScope := nil;
-  SetLength(LScope, 32); // the boundary value is legal
-  FillChar(LScope[0], 32, $5C);
+  SetLength(LScope, TTlsConfigBuilder.MaxResumptionScopeLength);
+  FillChar(LScope[0], System.Length(LScope), $5C);
   LConfig := TTlsPresets.Compatible(Crypto, Pkix).Server
     .WithCredential(ServerCredential)
     .WithResumptionScope(LScope)
@@ -4276,7 +4554,7 @@ var
 begin
   LClient := TTlsPresets.Compatible(Crypto, Pkix).Client;
   LScope := nil;
-  SetLength(LScope, 33); // one over the 32-byte cap
+  SetLength(LScope, TTlsConfigBuilder.MaxResumptionScopeLength + 1);
   LRaised := False;
   try
     LClient.WithResumptionScope(LScope);
@@ -4293,8 +4571,8 @@ var
   LScope: TBytes;
 begin
   LScope := nil;
-  SetLength(LScope, 32); // the boundary value is legal
-  FillChar(LScope[0], 32, $5C);
+  SetLength(LScope, TTlsConfigBuilder.MaxResumptionScopeLength);
+  FillChar(LScope[0], System.Length(LScope), $5C);
   LConfig := TTlsPresets.Compatible(Crypto, Pkix).Client
     .WithServerVerification(
       TServerVerification.WebPki(TTlsLibTestCertificates.EcP256RootStore).Build)
@@ -5432,11 +5710,68 @@ begin
     'compressors on a server holding only a credential resolver');
 end;
 
+procedure TTestConfigBuilder.TestComposedCredentialResolverListsDefaultAndSniCredentials;
+var
+  LCredential: TTlsCredential;
+  LConfig: ITlsServerConfig;
+  LSet: ITlsServerCredentialSet;
+begin
+  LCredential := ServerCredential;
+  LConfig := NewPskOnlyServerBuilder.WithCredential(LCredential)
+    .WithSniCredential('localhost', LCredential).Tls13.Build;
+  CheckTrue(Supports(LConfig.CredentialResolver, ITlsServerCredentialSet, LSet),
+    'the composed resolver lists its credentials');
+  CheckEquals(2, System.Length(LSet.Credentials),
+    'the default and the identical SNI credential are both listed');
+end;
+
 procedure TTestConfigBuilder.TestTicketCountZeroOnTls13OnlyWithNothingSharedStillBuilds;
 begin
   // documented, not refused: count 0 issues no tickets, so nothing resumes without shared state
   CheckNotNull(NewServerBuilder.Tls13.WithTicketCount(0).Build,
     'count 0 on a TLS 1.3-only server with resumption on and nothing shared');
+end;
+
+procedure TTestConfigBuilder.TestRequiresPskNeedsAKeyAndTheFlag;
+begin
+  CheckTrue(TClientPskPath.RequiresPsk(1, True), 'a key and the flag');
+  CheckFalse(TClientPskPath.RequiresPsk(1, False), 'a key, flag clear');
+  CheckFalse(TClientPskPath.RequiresPsk(0, True), 'flag with no key');
+  CheckFalse(TClientPskPath.RequiresPsk(0, False), 'neither');
+end;
+
+procedure TTestConfigBuilder.TestCertificatePathTls13OnlyFollowsTheExternalKeys;
+begin
+  CheckTrue(TClientPskPath.HasCertificatePath(True, False, 0, False, 0, False), 'no key');
+  CheckTrue(TClientPskPath.HasCertificatePath(True, False, 1, False, 0, False), 'optional key');
+  CheckTrue(TClientPskPath.HasCertificatePath(True, False, 0, True, 0, False), 'flag, no key');
+  CheckFalse(TClientPskPath.HasCertificatePath(True, False, 1, True, 0, False), 'required key');
+  CheckTrue(TClientPskPath.HasCertificatePath(True, False, 0, False, 1, True),
+    'a required TLS 1.2 key does not bind TLS 1.3');
+end;
+
+procedure TTestConfigBuilder.TestCertificatePathTls12OnlyFollowsTheTls12Keys;
+begin
+  CheckTrue(TClientPskPath.HasCertificatePath(False, True, 0, False, 0, False), 'no key');
+  CheckTrue(TClientPskPath.HasCertificatePath(False, True, 0, False, 1, False), 'optional key');
+  CheckFalse(TClientPskPath.HasCertificatePath(False, True, 0, False, 1, True), 'required key');
+  CheckTrue(TClientPskPath.HasCertificatePath(False, True, 1, True, 0, False),
+    'a required external key does not bind TLS 1.2');
+end;
+
+procedure TTestConfigBuilder.TestCertificatePathBothVersionsNeedBothKeysRequired;
+begin
+  CheckTrue(TClientPskPath.HasCertificatePath(True, True, 1, True, 1, False),
+    'TLS 1.2 key optional');
+  CheckTrue(TClientPskPath.HasCertificatePath(True, True, 1, False, 1, True),
+    'external key optional');
+  CheckFalse(TClientPskPath.HasCertificatePath(True, True, 1, True, 1, True), 'both required');
+end;
+
+procedure TTestConfigBuilder.TestCertificatePathNoVersionOffered;
+begin
+  CheckFalse(TClientPskPath.HasCertificatePath(False, False, 0, False, 0, False),
+    'no version, no path');
 end;
 
 initialization

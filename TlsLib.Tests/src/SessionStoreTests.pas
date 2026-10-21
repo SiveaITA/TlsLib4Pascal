@@ -30,6 +30,7 @@ uses
   TlpTlsVersion,
   TlpIClock,
   MockClock,
+  MockCryptoProvider,
   MockSessionStores,
   TlpICryptoProvider,
   TlpAeadUtilities,
@@ -55,8 +56,13 @@ type
     function MakeTls12Session(const ATag: TBytes; ALifetime: UInt32;
       AIssuedMillis: UInt64): IResumableSession; overload;
     function Tag(AValue: Byte; ALength: Int32): TBytes;
+    function NewKeys: ISessionTicketKeyManager;
+    function NewStore: ISessionStore;
     function SealedTls12WithGroupAndScheme(
       const AStrategy: ISessionTicketStrategy): IResumableSession;
+    // whether sealing / opening a ticket lets AFault out when the ticket AEAD raises it
+    function SealRaisedFrom(AFault: ExceptClass): Boolean;
+    function OpenRaisedFrom(AFault: ExceptClass): Boolean;
   published
     procedure TestCacheStoreAndTakeSingleUse;
     procedure TestCacheKeyedByServerAndSni;
@@ -73,6 +79,15 @@ type
     procedure TestKxHintBounded;
     procedure TestStorePutTakeSingleUse;
     procedure TestStorePeekDoesNotRemove;
+    procedure TestTicketsAreSealedWithKeysWhenNoStoreIsSet;
+    procedure TestTls13StoreOverridesTicketKeys;
+    procedure TestTls12TicketsAreSealedWithKeysBesideAStore;
+    procedure TestOnlyTls13LetsAStoreOverrideTheKeys;
+    procedure TestNoKeysMeansNoKeySealing;
+    procedure TestTls13StoreAloneHoldsTickets;
+    procedure TestTls12StoreAloneIssuesNoTickets;
+    procedure TestNoStrategyWithoutKeysOrStore;
+    procedure TestTicketAeadIsAes256Gcm;
     procedure TestStoreTicketStrategyConsumeIsSingleUse;
     procedure TestStekTicketStrategyConsumeIsAlwaysTrue;
     procedure TestStorePutWithId;
@@ -102,6 +117,12 @@ type
     procedure TestStekOpenWithUnbindableKeyFallsBack;
     procedure TestStekSealOpenRoundTripTls13;
     procedure TestStekSealOpenRoundTripTls12;
+    procedure TestStekSealDeclinesWhenProviderLacksTicketAead;
+    procedure TestStekOpenUnreadableWhenProviderLacksTicketAead;
+    procedure TestStekSealDeclinesWhenTicketAeadRaisesATlsLibError;
+    procedure TestStekOpenUnreadableWhenTicketAeadRaisesATlsLibError;
+    procedure TestStekSealLetsAPlainExceptionThrough;
+    procedure TestStekOpenLetsAPlainExceptionThrough;
     procedure TestStekSealOpenCarriesTls12Group;
     procedure TestStekSealOpenCarriesTls12PeerSignatureScheme;
     procedure TestLargestSealedTicketIsTheCachedLimit;
@@ -488,6 +509,103 @@ begin
   CheckFalse(LStore.Peek(Tag($99, 8), LSeen), 'an unknown handle is absent');
   CheckTrue(LStore.Take(LHandle, LTaken), 'the session is still takeable');
   CheckFalse(LStore.Peek(LHandle, LSeen), 'once taken it is gone');
+end;
+
+function TTestSessionStore.NewKeys: ISessionTicketKeyManager;
+begin
+  Result := TStekTicketKeyManager.Create(Crypto.Primitives.GetRandom) as ISessionTicketKeyManager;
+end;
+
+function TTestSessionStore.NewStore: ISessionStore;
+begin
+  Result := TInMemorySessionStore.Create(Crypto.Primitives.GetRandom) as ISessionStore;
+end;
+
+procedure TTestSessionStore.TestTicketsAreSealedWithKeysWhenNoStoreIsSet;
+begin
+  CheckTrue(TSessionTicketStrategies.SealsWithKeys(TlsWireVersionTls13, NewKeys, nil),
+    'TLS 1.3 with keys and no store');
+  CheckTrue(TSessionTicketStrategies.SealsWithKeys(TlsWireVersionTls12, NewKeys, nil),
+    'TLS 1.2 with keys and no store');
+end;
+
+procedure TTestSessionStore.TestTls13StoreOverridesTicketKeys;
+var
+  LStore: ISessionStore;
+  LStrategy: ISessionTicketStrategy;
+  LSeen: IResumableSession;
+begin
+  LStore := NewStore;
+  CheckFalse(TSessionTicketStrategies.SealsWithKeys(TlsWireVersionTls13, NewKeys, LStore),
+    'a TLS 1.3 store wins over the keys');
+  LStrategy := TSessionTicketStrategies.ForServer(TlsWireVersionTls13, Crypto, NewKeys, LStore);
+  CheckTrue(LStore.Peek(LStrategy.Seal(MakeSession(Tag($61, 8))), LSeen),
+    'the TLS 1.3 ticket is a handle into the store');
+end;
+
+procedure TTestSessionStore.TestTls12TicketsAreSealedWithKeysBesideAStore;
+var
+  LStore: ISessionStore;
+  LStrategy: ISessionTicketStrategy;
+  LTicket: TBytes;
+  LSeen: IResumableSession;
+begin
+  LStore := NewStore;
+  CheckTrue(TSessionTicketStrategies.SealsWithKeys(TlsWireVersionTls12, NewKeys, LStore),
+    'TLS 1.2 keeps sealing with the keys beside a store');
+  LStrategy := TSessionTicketStrategies.ForServer(TlsWireVersionTls12, Crypto, NewKeys, LStore);
+  LTicket := LStrategy.Seal(MakeTls12Session(Tag($62, 48)));
+  CheckFalse(LStore.Peek(LTicket, LSeen), 'the TLS 1.2 ticket is not a store handle');
+  CheckTrue(LStrategy.Open(LTicket, LSeen), 'it opens from the keys');
+end;
+
+procedure TTestSessionStore.TestOnlyTls13LetsAStoreOverrideTheKeys;
+begin
+  CheckTrue(TSessionTicketStrategies.SealsWithKeys($0301, NewKeys, NewStore),
+    'a version that is not TLS 1.3 never hands tickets to a store');
+end;
+
+procedure TTestSessionStore.TestNoKeysMeansNoKeySealing;
+begin
+  CheckFalse(TSessionTicketStrategies.SealsWithKeys(TlsWireVersionTls13, nil, nil),
+    'TLS 1.3 with no keys and no store');
+  CheckFalse(TSessionTicketStrategies.SealsWithKeys(TlsWireVersionTls12, nil, NewStore),
+    'TLS 1.2 with a store but no keys');
+  CheckFalse(TSessionTicketStrategies.SealsWithKeys(TlsWireVersionTls13, nil, NewStore),
+    'TLS 1.3 with a store but no keys');
+end;
+
+procedure TTestSessionStore.TestTls13StoreAloneHoldsTickets;
+var
+  LStore: ISessionStore;
+  LStrategy: ISessionTicketStrategy;
+  LSeen: IResumableSession;
+begin
+  LStore := NewStore;
+  LStrategy := TSessionTicketStrategies.ForServer(TlsWireVersionTls13, Crypto, nil, LStore);
+  CheckTrue(LStrategy <> nil, 'a TLS 1.3 store alone is enough');
+  CheckTrue(LStore.Peek(LStrategy.Seal(MakeSession(Tag($63, 8))), LSeen),
+    'the ticket is a handle into the store');
+end;
+
+procedure TTestSessionStore.TestTls12StoreAloneIssuesNoTickets;
+begin
+  CheckTrue(TSessionTicketStrategies.ForServer(TlsWireVersionTls12, Crypto, nil, NewStore) = nil,
+    'a TLS 1.2 store serves session ids, not tickets');
+end;
+
+procedure TTestSessionStore.TestNoStrategyWithoutKeysOrStore;
+begin
+  CheckTrue(TSessionTicketStrategies.ForServer(TlsWireVersionTls13, Crypto, nil, nil) = nil,
+    'no TLS 1.3 strategy');
+  CheckTrue(TSessionTicketStrategies.ForServer(TlsWireVersionTls12, Crypto, nil, nil) = nil,
+    'no TLS 1.2 strategy');
+end;
+
+procedure TTestSessionStore.TestTicketAeadIsAes256Gcm;
+begin
+  CheckTrue(TSessionTicketStrategies.TicketAead = TAeadAlgorithm.AES_256_GCM,
+    'tickets are sealed with AES-256-GCM');
 end;
 
 procedure TTestSessionStore.TestStoreTicketStrategyConsumeIsSingleUse;
@@ -1095,6 +1213,109 @@ begin
   CheckEquals(0, System.Length(L12.SessionId), 'the session id is not carried in a STEK ticket');
   CheckEquals(0, System.Length(L12.SessionTicket),
     'the session ticket is not carried in a STEK ticket');
+end;
+
+procedure TTestSessionStore.TestStekSealDeclinesWhenProviderLacksTicketAead;
+var
+  LStrategy: ISessionTicketStrategy;
+begin
+  LStrategy := TStekTicketStrategy.Create(TMissingAeadProvider.Create(Crypto,
+    TAeadAlgorithm.AES_256_GCM) as ICryptoProvider,
+    TStekTicketKeyManager.Create(Crypto.Primitives.GetRandom) as ISessionTicketKeyManager);
+  CheckEquals(0, System.Length(LStrategy.Seal(MakeTls12Session(Tag($01, 4)))),
+    'no ticket is sealed');
+end;
+
+procedure TTestSessionStore.TestStekOpenUnreadableWhenProviderLacksTicketAead;
+var
+  LKeys: ISessionTicketKeyManager;
+  LHealthy, LLacking: ISessionTicketStrategy;
+  LTicket: TBytes;
+  LOpened: IResumableSession;
+begin
+  LKeys := TStekTicketKeyManager.Create(Crypto.Primitives.GetRandom);
+  LHealthy := TStekTicketStrategy.Create(Crypto, LKeys);
+  LLacking := TStekTicketStrategy.Create(TMissingAeadProvider.Create(Crypto,
+    TAeadAlgorithm.AES_256_GCM) as ICryptoProvider, LKeys);
+  LTicket := LHealthy.Seal(MakeTls12Session(Tag($01, 4)));
+  CheckTrue(System.Length(LTicket) > 0, 'a healthy provider sealed the ticket');
+  CheckFalse(LLacking.Open(LTicket, LOpened), 'the ticket is unreadable');
+  CheckTrue(LOpened = nil, 'no session is returned');
+end;
+
+procedure TTestSessionStore.TestStekSealDeclinesWhenTicketAeadRaisesATlsLibError;
+var
+  LStrategy: ISessionTicketStrategy;
+begin
+  LStrategy := TStekTicketStrategy.Create(TMissingAeadProvider.CreateFault(Crypto,
+    TAeadAlgorithm.AES_256_GCM, EBaseTlsLibException) as ICryptoProvider,
+    TStekTicketKeyManager.Create(Crypto.Primitives.GetRandom) as ISessionTicketKeyManager);
+  CheckEquals(0, System.Length(LStrategy.Seal(MakeTls12Session(Tag($01, 4)))),
+    'no ticket is sealed');
+end;
+
+procedure TTestSessionStore.TestStekOpenUnreadableWhenTicketAeadRaisesATlsLibError;
+var
+  LKeys: ISessionTicketKeyManager;
+  LHealthy, LFaulting: ISessionTicketStrategy;
+  LTicket: TBytes;
+  LOpened: IResumableSession;
+begin
+  LKeys := TStekTicketKeyManager.Create(Crypto.Primitives.GetRandom);
+  LHealthy := TStekTicketStrategy.Create(Crypto, LKeys);
+  LFaulting := TStekTicketStrategy.Create(TMissingAeadProvider.CreateFault(Crypto,
+    TAeadAlgorithm.AES_256_GCM, EBaseTlsLibException) as ICryptoProvider, LKeys);
+  LTicket := LHealthy.Seal(MakeTls12Session(Tag($01, 4)));
+  CheckTrue(System.Length(LTicket) > 0, 'a healthy provider sealed the ticket');
+  CheckFalse(LFaulting.Open(LTicket, LOpened), 'the ticket is unreadable');
+  CheckTrue(LOpened = nil, 'no session is returned');
+end;
+
+function TTestSessionStore.SealRaisedFrom(AFault: ExceptClass): Boolean;
+var
+  LStrategy: ISessionTicketStrategy;
+begin
+  Result := False;
+  LStrategy := TStekTicketStrategy.Create(TMissingAeadProvider.CreateFault(Crypto,
+    TAeadAlgorithm.AES_256_GCM, AFault) as ICryptoProvider,
+    TStekTicketKeyManager.Create(Crypto.Primitives.GetRandom) as ISessionTicketKeyManager);
+  try
+    LStrategy.Seal(MakeTls12Session(Tag($01, 4)));
+  except
+    on E: Exception do
+      Result := E.ClassType = AFault;
+  end;
+end;
+
+function TTestSessionStore.OpenRaisedFrom(AFault: ExceptClass): Boolean;
+var
+  LKeys: ISessionTicketKeyManager;
+  LHealthy, LStrategy: ISessionTicketStrategy;
+  LTicket: TBytes;
+  LOpened: IResumableSession;
+begin
+  Result := False;
+  LKeys := TStekTicketKeyManager.Create(Crypto.Primitives.GetRandom);
+  LHealthy := TStekTicketStrategy.Create(Crypto, LKeys);
+  LTicket := LHealthy.Seal(MakeTls12Session(Tag($01, 4)));
+  LStrategy := TStekTicketStrategy.Create(TMissingAeadProvider.CreateFault(Crypto,
+    TAeadAlgorithm.AES_256_GCM, AFault) as ICryptoProvider, LKeys);
+  try
+    LStrategy.Open(LTicket, LOpened);
+  except
+    on E: Exception do
+      Result := E.ClassType = AFault;
+  end;
+end;
+
+procedure TTestSessionStore.TestStekSealLetsAPlainExceptionThrough;
+begin
+  CheckTrue(SealRaisedFrom(Exception), 'a provider programming fault is not a missing AEAD');
+end;
+
+procedure TTestSessionStore.TestStekOpenLetsAPlainExceptionThrough;
+begin
+  CheckTrue(OpenRaisedFrom(Exception), 'a provider programming fault is not a missing AEAD');
 end;
 
 function TTestSessionStore.SealedTls12WithGroupAndScheme(

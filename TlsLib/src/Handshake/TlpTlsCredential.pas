@@ -17,14 +17,25 @@ interface
 
 uses
   SysUtils,
+  TlpArrayUtilities,
   TlpTlsVersion,
   TlpISigningKey,
   TlpImportedCredential,
   TlpSecretBuffer,
   TlpICryptoProvider,
-  TlpIPkixProvider;
+  TlpIPkixProvider,
+  TlpPkixDomainTypes,
+  TlpCryptoDomainTypes;
 
 type
+  /// <summary>Whether a credential can sign a handshake as presented. Consistent when it can;
+  /// otherwise the first fault found: no certificate, no key, a leaf whose keyUsage forbids
+  /// digitalSignature (RFC 5280 4.2.1.3), an RSA key over an id-RSASSA-PSS leaf (RFC 9846
+  /// 4.3.3), a key that cannot export its public half, a leaf that is not a well-formed
+  /// certificate, or a key that is not the leaf's.</summary>
+  TCredentialConsistency = (Consistent, ChainEmpty, KeyMissing, LeafCannotSign, LeafKeyRsaPss,
+    KeyNotExportable, LeafMalformed, KeyLeafMismatch);
+
   /// <summary>Supplies a server's pre-fetched stapled OCSP response (DER) for its leaf
   /// certificate, invoked per handshake when the client offered status_request. Returns
   /// an empty result to decline stapling. In-band only: it must not perform network I/O.</summary>
@@ -51,6 +62,14 @@ type
     /// when a callback is set (it refreshes an expiring staple), else the static OcspStaple;
     /// empty declines stapling.</summary>
     function CurrentOcspStaple: TBytes;
+    /// <summary>A copy that owns its certificate chain and staple bytes; the signing key and the
+    /// staple callback are shared with this credential.</summary>
+    function Clone: TTlsCredential;
+    /// <summary>Whether this credential can sign a handshake as presented, judged by
+    /// ACertificates without a signing operation. The leaf and the key's public half are
+    /// compared by key value, so equal keys that differ in encoding match. Never raises on a
+    /// malformed leaf; a key that cannot export its public half fails closed.</summary>
+    function Consistency(const ACertificates: ICertificateInspector): TCredentialConsistency;
     /// <summary>A credential from a certificate chain (a PEM block/bundle, a single DER
     /// certificate or a PKCS#7 bundle, leaf first) and a private key (PKCS#8, PKCS#1 or SEC1, DER
     /// or PEM; an encrypted key is decrypted under the empty passphrase), each loaded and
@@ -98,7 +117,7 @@ type
   /// when the client sent none; the arrays are the client's offers verbatim as IANA wire
   /// codepoints (SignatureSchemes, CipherSuites, SupportedGroups) or protocol-name octets (Alpn).
   /// CertificateSignatureSchemes is the client's signature_algorithms_cert, else its
-  /// signature_algorithms; a chain with a certificate (other than a self-issued one) signed with
+  /// signature_algorithms; a chain with a certificate (other than a self-signed one) signed with
   /// MD5, or with SHA-1 not listed here, is refused (RFC 9846 4.5.1.2; MD5 inferred from 4.5.1.3).
   /// ProtocolVersion is the version of the server machine performing the lookup.</summary>
   TTlsClientHelloInfo = record
@@ -125,6 +144,56 @@ begin
     Result := OcspStapleCallback
   else
     Result := OcspStaple;
+end;
+
+function TTlsCredential.Clone: TTlsCredential;
+begin
+  Result := Self;
+  Result.CertificateChain := TArrayUtilities.DeepCopy<Byte>(CertificateChain);
+  Result.OcspStaple := System.Copy(OcspStaple);
+end;
+
+function TTlsCredential.Consistency(
+  const ACertificates: ICertificateInspector): TCredentialConsistency;
+var
+  LLeaf, LKeyPublicKeyInfo: TBytes;
+  LSchemes: TArray<TSignatureScheme>;
+begin
+  Result := TCredentialConsistency.Consistent;
+  if System.Length(CertificateChain) = 0 then
+  begin
+    Result := TCredentialConsistency.ChainEmpty;
+    Exit;
+  end;
+  if PrivateKey = nil then
+  begin
+    Result := TCredentialConsistency.KeyMissing;
+    Exit;
+  end;
+  LLeaf := CertificateChain[0];
+  // only a definite No refuses; an absent or unreadable keyUsage passes
+  if ACertificates.KeyUsagePermits(LLeaf, TCertKeyUsage.DigitalSignature) = TCertAnswer.No then
+  begin
+    Result := TCredentialConsistency.LeafCannotSign;
+    Exit;
+  end;
+  // an id-RSASSA-PSS leaf pairs only with rsa_pss_pss_*, which is not offered, key match or not
+  LSchemes := PrivateKey.CapableSchemes;
+  if (System.Length(LSchemes) > 0) and (LSchemes[0].KeyKind = TSignatureKeyKind.Rsa) and
+    (ACertificates.KeyIsRsaPss(LLeaf) = TCertAnswer.Yes) then
+  begin
+    Result := TCredentialConsistency.LeafKeyRsaPss;
+    Exit;
+  end;
+  // value-compare the key's public half with the leaf's, which also catches a mis-ordered chain
+  LKeyPublicKeyInfo := PrivateKey.PublicKeyInfo;
+  if System.Length(LKeyPublicKeyInfo) = 0 then
+    Result := TCredentialConsistency.KeyNotExportable
+  else if not ACertificates.IsWellFormed(LLeaf) then
+    Result := TCredentialConsistency.LeafMalformed
+  else if ACertificates.SamePublicKey(ACertificates.PublicKeyInfo(LLeaf), LKeyPublicKeyInfo) <>
+    TCertAnswer.Yes then
+    Result := TCredentialConsistency.KeyLeafMismatch;
 end;
 
 class function TTlsCredential.Load(const ACrypto: ICryptoProvider;

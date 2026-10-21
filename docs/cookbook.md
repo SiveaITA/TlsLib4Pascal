@@ -1,6 +1,6 @@
 # Cookbook
 
-**TlsLib4Pascal docs** · [Home](README.md) · [Getting started](getting-started.md) · Cookbook · [Verification](certificate-verification.md) · [System trust](system-trust.md) · [Compression](certificate-compression.md) · [ECH](ech.md) · [Security model](security-model.md)
+**TlsLib4Pascal docs** · [Home](README.md) · [Getting started](getting-started.md) · Cookbook · [Verification](certificate-verification.md) · [System trust](system-trust.md) · [Compression](certificate-compression.md) · [ECH](ech.md) · [Compliance](compliance.md) · [Security model](security-model.md)
 
 Task-oriented recipes. Each is self-contained — copy one without reading the rest. Throughout, `Crypto`
 is an `ICryptoProvider` and `Pkix` an `IPkixProvider` (`TDefaultCryptoProvider.Create as ICryptoProvider`
@@ -36,6 +36,7 @@ Read [Getting started](getting-started.md) first.
 - [Cap the inbound record size](#cap-the-inbound-record-size)
 - [Turn off GREASE](#turn-off-grease)
 - [Use the OS-native crypto overlay](#use-the-os-native-crypto-overlay)
+- [Run under a FIPS or CNSA policy](#run-under-a-fips-or-cnsa-policy)
 - [The dangerous surface (dev only)](#the-dangerous-surface-dev-only)
 
 ---
@@ -157,7 +158,12 @@ end;
 never on a resumed or PSK handshake), concurrently across connections that share the config, so it
 must be thread-safe and must not do network I/O.
 
-A chain with a certificate (other than a self-issued one) signed with MD5, or with SHA-1 the client
+The built-in SNI resolver and `WithSniCredential` expose their credentials through
+`ITlsServerCredentialSet` (unit `TlpITlsServerCredentialSet`); a host resolver need not implement
+it. The set hands every credential, private key handle included, to any code that holds the frozen
+config.
+
+A chain with a certificate (other than a self-signed one) signed with MD5, or with SHA-1 the client
 did not advertise, is refused with `handshake_failure` (RFC 9846 4.5.1.2; MD5 inferred from 4.5.1.3), independent of
 `AllowedDeprecatedHashes`; a SHA-256 chain is still sent. `AClientHello.CertificateSignatureSchemes`
 lists what the client advertised, so a resolver can pick another chain. A client credential in that
@@ -217,6 +223,7 @@ LConfig := TTlsPresets.Compatible(Crypto, Pkix).Server
 
 The registries behind those lists are replaceable as a whole: `WithNamedGroups` (the groups the
 config can use), `WithSignatureSchemes` and `WithCipherSuites` take a registry, while
+`TNamedGroups.CreateRegistry` builds a registry from the groups you list, and
 `WithPreferredGroups` orders the groups (a code the registry lacks is skipped; an empty list, or
 a list with no registered group, is refused at `Build`; a repeated group is refused by `WithPreferredGroups`). A server
 acknowledges a client's `server_name` with an empty extension by default; `WithServerNameAcknowledgement(False)`
@@ -256,14 +263,25 @@ The short version — the full treatment is in
   TArray<TBytes>.Create(caPemA, caPemB)).Build)
 
 // the OS root store (needs the TlsLib.Trust.System package)
-//   uses TlpSystemTrustFacade;
-//   .WithServerVerification(TSystemTrust.ServerVerification(Pkix).Build)
+//   uses TlpSystemTrustFacade, TlpOSSystemTrust;   // TSystemTrustMode, TSystemTrustRoots
+//   .WithServerVerification(TSystemTrust.ServerVerification(Pkix, TSystemTrustMode.Default,
+//     TSystemTrustRoots.OsRoots).Build)
 
 // the OS root store plus my private CA (a chain the OS rejects only for lack of a root is
 // judged against my CA; any other OS failure stays final)
-//   uses TlpSystemTrustFacade, TlpOSSystemTrust, TlpTrustAnchorStore, TlpITrustAnchorStore;   // TSystemTrustMode, TTrustAnchorStore, ITrustAnchorStore
+//   uses TlpSystemTrustFacade, TlpOSSystemTrust, TlpTrustAnchorStore, TlpITrustAnchorStore;
+//   // TSystemTrustMode, TSystemTrustRoots, TTrustAnchorStore, ITrustAnchorStore
 //   .WithServerVerification(TSystemTrust.ServerVerification(Pkix, TSystemTrustMode.Default,
-//     TTrustAnchorStore.Create(Pkix.Certificates.LoadChain(LoadFile('my-ca.pem'))) as ITrustAnchorStore).Build)
+//     TSystemTrustRoots.OsAndHostRoots(TTrustAnchorStore.Create(
+//     Pkix.Certificates.LoadChain(LoadFile('my-ca.pem'))) as ITrustAnchorStore)).Build)
+
+// private PKI only, through the OS engine: my CA is the only root, so no public root vouches
+// (a chain to a public root fails with unknown_ca; the OS distrust list still applies)
+//   uses TlpSystemTrustFacade, TlpOSSystemTrust, TlpTrustAnchorStore, TlpITrustAnchorStore;
+//   // TSystemTrustMode, TSystemTrustRoots, TTrustAnchorStore, ITrustAnchorStore
+//   .WithServerVerification(TSystemTrust.ServerVerification(Pkix, TSystemTrustMode.Default,
+//     TSystemTrustRoots.HostRoots(TTrustAnchorStore.Create(
+//     Pkix.Certificates.LoadChain(LoadFile('my-ca.pem'))) as ITrustAnchorStore)).Build)
 
 // a fixed offline root bundle (needs TlsLib.Trust.Bundle)
 //   uses TlpBundleTrust;
@@ -766,7 +784,8 @@ TLS client, on every compiler and OS. Configure it with a `TSocketHttpFetcherSet
 ```pascal
 LSettings := TSocketHttpFetcherSettings.Defaults;
 LSettings.TlsConfig := TTlsPresets.Compatible(Crypto, Pkix).Client
-  .WithServerVerification(TSystemTrust.ServerVerification(Pkix).Build).Build;
+  .WithServerVerification(TSystemTrust.ServerVerification(Pkix, TSystemTrustMode.Default,
+    TSystemTrustRoots.OsRoots).Build).Build;
 LFetcher := TSocketHttpFetcher.Create(LSettings);
 ```
 
@@ -994,13 +1013,47 @@ TSystemCryptoStrictness.RequireNamedGroups(Crypto, [TNamedGroupCatalog.X25519]);
 ```
 
 Where a native backend exists, the composed provider also implements `ICryptoBackendReport` (unit
-`TlpICryptoBackendReport`), which says per primitive whether the OS or the portable code serves it.
+`TlpICryptoBackendReport`), which says per primitive whether the OS or the portable code serves it;
+signing and verification are reported separately, per scheme and per key or verifier.
 `TSystemCryptoStrictness` can narrow a registry to the natively served
-entries (`NativeNamedGroups`, `NativeCipherSuites`, `NativeSignatureSchemes`) or require them
+entries (`NativeNamedGroups`, `NativeCipherSuites`, `NativeSignatureSchemes`, which keeps a scheme
+only when both signing and verification are OS-served) or require them
 (`RequireNamedGroups`, `RequireCipherSuites`, `RequireSignatureSchemes` raise
 `ESystemCryptoRequirementTlsLibException` listing what is missing). A narrowed signature registry
 governs what the endpoint advertises and accepts; a server's own signatures follow its credential
 key, so a server accepts a narrowed registry only together with `WithPeerAuth`.
+
+## Run under a FIPS or CNSA policy
+
+The optional `TlsLib.Compliance` package holds the negotiated cryptography to the OS cryptographic
+module and refuses what the rules do not allow. `Strict` raises when the platform is not a
+validated build; `Relaxed` reports instead. The rules must lie within `Fips140_3` or `Cnsa1`.
+Load the credential through `Policy.Crypto`, and build through `TComplianceTls` so the frozen
+config is checked by `Admit`; key agreement through group objects and chain verification through a
+verifier source are enforced by nothing else. What this claims, and what it does not, is in
+[compliance.md](compliance.md).
+
+```pascal
+uses TlpDefaultCryptoProvider, TlpDefaultPkixProvider, TlpICryptoProvider, TlpIPkixProvider,
+  TlpOSCryptoProvider, TlpITlsConfig, TlpComplianceTypes, TlpCompliancePresets,
+  TlpICompliancePolicy, TlpCompliancePolicy, TlpOSModuleAttestation, TlpOSSystemTrust,
+  TlpComplianceTls;
+
+var
+  Policy: ICompliancePolicy;
+  Client: ITlsClientConfig;
+begin
+  Policy := TCompliancePolicy.Create(TCompliancePresets.Cnsa1,
+    TOSCryptoProvider.Compose(TDefaultCryptoProvider.Create as ICryptoProvider),
+    TDefaultPkixProvider.Create as IPkixProvider, TOSModuleAttestation.Current,
+    TComplianceEnforcement.Strict);
+  Client := TComplianceTls.BuildClient(Policy,
+    TComplianceTls.Client(Policy, TSystemTrustRoots.OsRoots));
+end;
+```
+
+The full sample, servers, private CAs, per-handshake credential resolvers and resumption are in
+[compliance.md](compliance.md#use-it).
 
 ## The dangerous surface (dev only)
 
