@@ -58,31 +58,29 @@ type
 const
   // clock ids are kernel ABI, from each OS's <time.h>; the monotonic candidates are tried in
   // order and the first the kernel accepts is kept (CLOCK_BOOTTIME counts suspend, but a
-  // pre-2.6.39 Linux kernel refuses it)
-{$IF DEFINED(TLSLIB_MACOS) OR DEFINED(TLSLIB_IOS)}
-  ClockRealtime = 0;
-  // Darwin's CLOCK_MONOTONIC keeps counting while the system sleeps
-  MonotonicClocks: array [0 .. 0] of TClockChoice = ((Id: 6; Name: 'CLOCK_MONOTONIC'));
-{$ELSEIF DEFINED(NETBSD) OR DEFINED(OPENBSD)}
-  ClockRealtime = 0;
-  MonotonicClocks: array [0 .. 0] of TClockChoice = ((Id: 3; Name: 'CLOCK_MONOTONIC'));
-{$ELSEIF DEFINED(TLSLIB_BSD)}
-  ClockRealtime = 0;
-  MonotonicClocks: array [0 .. 0] of TClockChoice = ((Id: 4; Name: 'CLOCK_MONOTONIC'));
-{$ELSEIF DEFINED(TLSLIB_SOLARIS)}
+  // pre-2.6.39 Linux kernel refuses it); only CLOCK_BOOTTIME and the Darwin and OpenBSD
+  // CLOCK_MONOTONIC are known to count suspend
+{$IFDEF TLSLIB_SOLARIS}
   ClockRealtime = 3;
-  MonotonicClocks: array [0 .. 0] of TClockChoice = ((Id: 4; Name: 'CLOCK_MONOTONIC'));
 {$ELSE}
   ClockRealtime = 0;
+{$ENDIF}
+{$IF DEFINED(TLSLIB_MACOS) OR DEFINED(TLSLIB_IOS)}
+  MonotonicClocks: array [0 .. 0] of TClockChoice = ((Id: 6; Name: 'CLOCK_MONOTONIC'));
+{$ELSEIF DEFINED(TLSLIB_NETBSD) OR DEFINED(TLSLIB_OPENBSD)}
+  MonotonicClocks: array [0 .. 0] of TClockChoice = ((Id: 3; Name: 'CLOCK_MONOTONIC'));
+{$ELSEIF DEFINED(TLSLIB_FREEBSD) OR DEFINED(TLSLIB_DRAGONFLY) OR DEFINED(TLSLIB_SOLARIS)}
+  MonotonicClocks: array [0 .. 0] of TClockChoice = ((Id: 4; Name: 'CLOCK_MONOTONIC'));
+{$ELSE}
   MonotonicClocks: array [0 .. 1] of TClockChoice = ((Id: 7; Name: 'CLOCK_BOOTTIME'),
     (Id: 1; Name: 'CLOCK_MONOTONIC'));
 {$IFEND}
-{$IFDEF NETBSD}
-  // the plain name is the 32-bit time_t compat entry point; this one is the current ABI
+{$IF DEFINED(TLSLIB_NETBSD) AND DEFINED(CPU64)}
+  // the plain name is the 32-bit time_t entry point; a 64-bit CPU uses the current ABI
   ClockGetTimeSymbol = '__clock_gettime50';
 {$ELSE}
   ClockGetTimeSymbol = 'clock_gettime';
-{$ENDIF}
+{$IFEND}
 
 { TPosixSystemTime }
 
