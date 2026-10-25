@@ -15,6 +15,11 @@ unit InteropSocket;
 {$MODE DELPHI}
 {$ENDIF FPC}
 
+// these systems start a socket address with a length byte
+{$IF DEFINED(NETBSD) OR DEFINED(OPENBSD) OR DEFINED(DRAGONFLY)}
+  {$DEFINE ADDR_NEEDS_LEN}
+{$IFEND}
+
 interface
 
 uses
@@ -106,8 +111,21 @@ begin
   Result := Pos(':', AHost) > 0;
 end;
 
+type
+{$IFDEF ADDR_NEEDS_LEN}
+  TSockAddrV4 = packed record
+    sin_len: UInt8;
+    sin_family: UInt8;
+    sin_port: UInt16;
+    sin_addr: TInAddr;
+    sin_zero: array [0 .. 7] of Byte;
+  end;
+{$ELSE}
+  TSockAddrV4 = TInetSockAddr;
+{$ENDIF}
+
 function MakeSockAddr(const AHost: string; APort: Word;
-  out AAddr: TInetSockAddr): Boolean;
+  out AAddr: TSockAddrV4): Boolean;
 var
   LNetAddr: TInAddr;
 begin
@@ -117,19 +135,46 @@ begin
   if not Result then
     Exit;
   FillChar(AAddr, SizeOf(AAddr), 0);
+{$IFDEF ADDR_NEEDS_LEN}
+  AAddr.sin_len := SizeOf(AAddr);
+{$ENDIF}
   AAddr.sin_family := AF_INET;
   AAddr.sin_port := htons(APort);
   AAddr.sin_addr := LNetAddr;
 end;
 
+type
+{$IFDEF ADDR_NEEDS_LEN}
+  TSockAddrV6 = packed record
+    sin6_len: UInt8;
+    sin6_family: UInt8;
+    sin6_port: UInt16;
+    sin6_flowinfo: UInt32;
+    sin6_addr: Tin6_addr;
+    sin6_scope_id: UInt32;
+  end;
+{$ELSE}
+  TSockAddrV6 = TInetSockAddr6;
+{$ENDIF}
+
+  TConnectAddr6 = record
+    Addr: TSockAddrV6;
+{$IFDEF SOLARIS}
+    SrcId: UInt32;
+{$ENDIF}
+  end;
+
 function ConnectIpv6(const AHost: string; APort: Word): TSocketHandle;
 var
-  LAddr: TInetSockAddr6;
+  LAddr: TConnectAddr6;
 begin
   FillChar(LAddr, SizeOf(LAddr), 0);
-  LAddr.sin6_family := AF_INET6;
-  LAddr.sin6_port := htons(APort);
-  LAddr.sin6_addr := StrToHostAddr6(AHost);
+{$IFDEF ADDR_NEEDS_LEN}
+  LAddr.Addr.sin6_len := SizeOf(LAddr.Addr);
+{$ENDIF}
+  LAddr.Addr.sin6_family := AF_INET6;
+  LAddr.Addr.sin6_port := htons(APort);
+  LAddr.Addr.sin6_addr := StrToHostAddr6(AHost);
   Result := fpSocket(AF_INET6, SOCK_STREAM, 0);
   if Result < 0 then
     raise EInteropSocket.CreateRes(@SSocketCreate);
@@ -152,7 +197,7 @@ class function TInteropSocket.Connect(const AHost: string;
   APort: Word): TInteropSocket;
 var
   LHandle: TSocketHandle;
-  LAddr: TInetSockAddr;
+  LAddr: TSockAddrV4;
 begin
   // the BoGo runner may listen on the IPv6 loopback (-ipv6); dial ::1 in that case
   if IsIpv6(AHost) then
@@ -244,8 +289,8 @@ class function TInteropListener.Bind(const AHost: string;
   APort: Word): TInteropListener;
 var
   LHandle: TSocketHandle;
-  LAddr: TInetSockAddr;
-  LBound: TInetSockAddr;
+  LAddr: TSockAddrV4;
+  LBound: TSockAddrV4;
   LLen: TSockLen;
   LReuse: LongInt;
 begin
@@ -286,7 +331,7 @@ end;
 function TInteropListener.Accept: TInteropSocket;
 var
   LPeer: TSocketHandle;
-  LAddr: TInetSockAddr;
+  LAddr: TSockAddrV4;
   LLen: TSockLen;
 begin
   LLen := SizeOf(LAddr);

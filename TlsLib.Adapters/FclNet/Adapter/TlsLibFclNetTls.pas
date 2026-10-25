@@ -161,6 +161,12 @@ type
     // unit-private: FlushTlsLibFclNetConfigCache clears them
     FServerConfigMemo: ITlsServerConfigMemo;
     FClientConfigMemo: ITlsClientConfigMemo;
+{$IF FPC_FULLVERSION >= 30203}
+  protected
+    // fcl-net declares these abstract from 3.2.3
+    function GetLastSSLErrorString: string; override;
+    function GetLastSSLErrorCode: Integer; override;
+{$IFEND}
   public
     class constructor Create;
     constructor Create; override;
@@ -402,6 +408,19 @@ begin
   FConnection := nil;
   inherited Destroy;
 end;
+
+{$IF FPC_FULLVERSION >= 30203}
+function TTlsLibSocketHandler.GetLastSSLErrorString: string;
+begin
+  Result := FLastErrorDesc;
+end;
+
+function TTlsLibSocketHandler.GetLastSSLErrorCode: Integer;
+begin
+  // no numeric code; the text is in GetLastSSLErrorString
+  Result := 0;
+end;
+{$IFEND}
 
 function TTlsLibSocketHandler.CreateCertGenerator: TX509Certificate;
 begin

@@ -21,3 +21,5 @@ else
   fi
   ci_build_prebuilt
 fi
+
+bash "$CI_ROOT/vm-interop.sh"
